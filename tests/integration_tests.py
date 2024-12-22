@@ -477,7 +477,7 @@ def run_tests(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("output_dir")
+    parser.add_argument("--output_dir", default="./output/integration_tests_output")
     parser.add_argument("--config_dir", default="./train_configs")
     parser.add_argument(
         "--test",

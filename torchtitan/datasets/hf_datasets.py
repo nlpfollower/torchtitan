@@ -37,7 +37,7 @@ class DatasetConfig:
     text_processor: Callable
 
 
-# Add your dataset here here - more information at docs/datasets.md
+# Add your dataset here - more information at docs/datasets.md
 DATASETS = {
     "c4": DatasetConfig(
         path="allenai/c4",
