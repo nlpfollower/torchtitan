@@ -13,6 +13,7 @@ import torch.distributed.checkpoint as DCP
 
 from torchtitan.logging import init_logger, logger
 from torchtitan.models.llama.model import precompute_freqs_cis
+import pydevd_pycharm
 
 
 @torch.inference_mode()
@@ -138,6 +139,7 @@ def convert_llama_weights(input_dir, output_dir, max_seq_len: int):
 
 
 if __name__ == "__main__":
+    pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     init_logger()
     parser = argparse.ArgumentParser(description="Convert Llama weights to DCP format.")
     parser.add_argument(

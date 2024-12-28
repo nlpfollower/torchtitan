@@ -8,6 +8,7 @@ import os
 import time
 from datetime import timedelta
 
+import pydevd_pycharm
 import torch
 
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -15,11 +16,12 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan import utils
 from torchtitan.checkpoint import CheckpointManager, TrainState
 from torchtitan.config_manager import JobConfig
-from torchtitan.datasets import build_hf_data_loader, build_tokenizer
+from torchtitan.datasets import build_hf_data_loader, build_tokenizer, build_custom_data_loader
 from torchtitan.float8 import Float8Handler
 from torchtitan.logging import init_logger, logger
 from torchtitan.metrics import build_device_memory_monitor, build_metric_logger
 from torchtitan.models import model_name_to_cls, model_name_to_tokenizer, models_config
+from torchtitan.objective import Objective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.parallelisms import (
     models_parallelize_fns,
@@ -82,15 +84,29 @@ def main(job_config: JobConfig):
     tokenizer_type = model_name_to_tokenizer[model_name]
     tokenizer = build_tokenizer(tokenizer_type, job_config.model.tokenizer_path)
     # build dataloader
-    data_loader = build_hf_data_loader(
-        job_config.training.dataset,
-        job_config.training.dataset_path,
-        tokenizer,
-        job_config.training.batch_size,
-        job_config.training.seq_len,
-        dp_degree,
-        dp_rank,
-    )
+    if job_config.training.dataset_type == "huggingface":
+        data_loader = build_hf_data_loader(
+            job_config.training.dataset,
+            job_config.training.dataset_path,
+            tokenizer,
+            job_config.training.batch_size,
+            job_config.training.seq_len,
+            dp_degree,
+            dp_rank,
+        )
+    elif job_config.training.dataset_type == "custom":
+        data_loader = build_custom_data_loader(
+            job_config.training.dataset_path,
+            job_config.training.dataset,
+            "dev",  # or use a config option for split
+            tokenizer,
+            job_config.training.batch_size,
+            job_config.training.seq_len,
+            dp_degree,
+            dp_rank,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset type: {job_config.training.dataset_type}")
 
     # build model (using meta init)
     model_cls = model_name_to_cls[model_name]
@@ -125,10 +141,7 @@ def main(job_config: JobConfig):
     )
 
     # loss function to be shared by Pipeline Parallel and SPMD training
-    def loss_fn(pred, labels):
-        return torch.nn.functional.cross_entropy(
-            pred.flatten(0, 1).float(), labels.flatten(0, 1)
-        )
+    loss_fn = Objective.get_loss_function(job_config.training.loss_function)
 
     # TODO: compiling loss function causes CUDA errors, turning off for now
     # if job_config.training.compile:
@@ -422,6 +435,7 @@ def main(job_config: JobConfig):
 
 
 if __name__ == "__main__":
+    pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     config = JobConfig()
     config.parse_args()
     main(config)
