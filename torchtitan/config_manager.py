@@ -206,6 +206,14 @@ class JobConfig:
 
         # training configs
         self.parser.add_argument(
+            "--training.dataset_type",
+            type=str,
+            default="huggingface",
+            choices=["huggingface", "custom"],
+            help="Type of dataset to use (huggingface or custom)",
+        )
+
+        self.parser.add_argument(
             "--training.dataset", type=str, default="c4_mini", help="Dataset to use"
         )
         self.parser.add_argument(
@@ -220,6 +228,12 @@ class JobConfig:
         )
         self.parser.add_argument(
             "--training.seq_len", type=int, default=2048, help="Sequence length"
+        )
+        self.parser.add_argument(
+            "--training.loss_function",
+            type=str,
+            default="default",
+            help="Loss function to use for training",
         )
         self.parser.add_argument(
             "--training.warmup_steps",

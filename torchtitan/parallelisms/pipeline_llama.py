@@ -86,6 +86,7 @@ def pipeline_llama_manual_split(
                 drop_layers = True
             if drop_layers:
                 del model.layers[name]
+        logger.info(f"[PP rank={pp_rank}] Stage idx={stage_idx} has these layers: {list(model.layers.keys())}")
 
         if not is_last:
             model.norm = None

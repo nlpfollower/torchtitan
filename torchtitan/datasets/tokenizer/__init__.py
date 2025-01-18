@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.datasets.tokenizer.tiktoken import TikTokenizer
+from llama_models.llama3.api import Tokenizer as LlamaTokenizer
 from torchtitan.datasets.tokenizer.tokenizer import Tokenizer
 
 from torchtitan.logging import logger
@@ -12,7 +13,9 @@ from torchtitan.logging import logger
 
 def build_tokenizer(tokenizer_type: str, tokenizer_path: str) -> Tokenizer:
     logger.info(f"Building {tokenizer_type} tokenizer locally from {tokenizer_path}")
-    if tokenizer_type == "tiktoken":
+    if tokenizer_type == "llama":
+        return LlamaTokenizer(tokenizer_path)
+    elif tokenizer_type == "tiktoken":
         return TikTokenizer(tokenizer_path)
     else:
         raise ValueError(f"Unknown tokenizer type: {tokenizer_type}")

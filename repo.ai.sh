@@ -1,0 +1,1 @@
+repomix --include "torchtitan/**,train_configs/**,scripts/**,docs/**,**.md,train.py,multinode_trainer.slurm,run_llama_train.sh" --ignore "torchtitan/models/llama_multimodal/**,torchtitan/datasets/mmlu/**" --style xml -o repo.ai.txt

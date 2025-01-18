@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import sys
+from datetime import datetime
 import logging
 import os
 import subprocess
@@ -414,55 +416,44 @@ def build_test_list():
     return integration_tests_flavors
 
 
-def _run_cmd(cmd):
-    return subprocess.run(
-        [cmd],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        shell=True,
-    )
-
-
 def run_test(test_flavor: OverrideDefinitions, full_path: str, output_dir: str):
-    # run_test supports sequence of tests.
     test_name = test_flavor.test_name
-    dump_folder_arg = f"--job.dump_folder {output_dir}/{test_name}"
+    dump_folder = f"{output_dir}/{test_name}"
+    dump_folder_arg = f"--job.dump_folder {dump_folder}"
     model_flavor_arg = f"--model.flavor {test_flavor.model_flavor}"
     all_ranks = ",".join(map(str, range(test_flavor.ngpu)))
+    os.makedirs(dump_folder, exist_ok=True)
 
     for idx, override_arg in enumerate(test_flavor.override_args):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = f"{dump_folder}/test_log_{timestamp}.txt"
+
         cmd = f"CONFIG_FILE={full_path} NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} ./run_llama_train.sh"
-        # dump compile trace for debugging purpose
-        cmd = f'TORCH_TRACE="{output_dir}/{test_name}/compile_trace" ' + cmd
+        cmd = f'TORCH_TRACE="{dump_folder}/compile_trace" ' + cmd
         if test_name == "fsdp2_memory_estimation":
-            cmd = (
-                f"CONFIG_FILE={full_path} NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} "
-                "./scripts/estimate/run_memory_estimation.sh"
-            )
-        cmd += " " + dump_folder_arg
-        cmd += " " + model_flavor_arg
+            cmd = f"CONFIG_FILE={full_path} NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} ./scripts/estimate/run_memory_estimation.sh"
+        cmd += f" {dump_folder_arg} {model_flavor_arg}"
         if override_arg:
             cmd += " " + " ".join(override_arg)
-        logger.info(
-            f"=====Integration test, flavor : {test_flavor.test_descr}, command : {cmd}====="
-        )
 
-        # save checkpoint (idx == 0) and load it for generation (idx == 1)
+        print(f"=====Integration test, flavor : {test_flavor.test_descr}, command : {cmd}=====")
+
         if test_name == "test_generate" and idx == 1:
-            cmd = (
-                f"CONFIG_FILE={full_path} NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} "
-                f"CHECKPOINT_DIR={output_dir}/{test_name}/checkpoint/step-10 "
-                "PROMPT='What is the meaning of life?' "
-                f"./scripts/generate/run_llama_generate.sh --out > {output_dir}/{test_name}/generated_output.json"
-            )
+            cmd = f"CONFIG_FILE={full_path} NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} CHECKPOINT_DIR={dump_folder}/checkpoint/step-10 PROMPT='What is the meaning of life?' ./scripts/generate/run_llama_generate.sh --out > {dump_folder}/generated_output.json"
 
-        result = _run_cmd(cmd)
-        logger.info(result.stdout)
-        if result.returncode != 0:
-            raise Exception(
-                f"Integration test failed, flavor : {test_flavor.test_descr}, command : {cmd}"
-            )
+        with open(log_file, 'w', buffering=1) as log:
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                       bufsize=1, universal_newlines=True)
+            for line in iter(process.stdout.readline, ''):
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log.write(line)
+            process.wait()
+
+        if process.returncode != 0:
+            raise Exception(f"Integration test failed, flavor : {test_flavor.test_descr}, command : {cmd}")
+
+        print(f"Test log saved to: {log_file}")
 
 
 def run_tests(args):
@@ -489,7 +480,7 @@ def run_tests(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("output_dir")
+    parser.add_argument("--output_dir", default="./outputs/integration_tests_output")
     parser.add_argument("--config_dir", default="./train_configs")
     parser.add_argument(
         "--test",
@@ -501,8 +492,6 @@ def main():
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-    if os.listdir(args.output_dir):
-        raise RuntimeError("Please provide an empty output directory.")
     run_tests(args)
 
 

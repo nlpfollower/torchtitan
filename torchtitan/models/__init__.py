@@ -13,5 +13,5 @@ models_config = {
 model_name_to_cls = {"llama3": Transformer}
 
 model_name_to_tokenizer = {
-    "llama3": "tiktoken",
+    "llama3": "llama",
 }
