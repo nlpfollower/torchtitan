@@ -405,3 +405,14 @@ def clip_grad_norm_(
 
     torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
     return total_norm
+
+
+def gather_dtensor(dtensor):
+    if not isinstance(dtensor, torch.distributed._tensor.DTensor):
+        return dtensor
+
+    # Get the full tensor on rank 0
+    if dist.get_rank() == 0:
+        return dtensor.full_tensor()
+    else:
+        return None

@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from multiprocessing import get_context
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Optional
 
 import torch
 import torch.distributed as dist
@@ -402,24 +402,30 @@ class CheckpointManager:
             sync_func()
             self.staging = False
 
-    def load(self, step: int = -1) -> bool:
+    def load(self, step: int = -1, checkpoint_path: Optional[str] = None) -> bool:
         if not self.enable_checkpoint:
             return False
         if not os.path.isdir(self.folder):
             return False
-        if step != -1 and not os.path.isdir(self._create_checkpoint_id(step)):
-            return False
 
-        if step == -1:
-            step_counts = []
-            for filename in os.listdir(self.folder):
-                match = re.search(r"step-(\d+)", filename)
-                metadata_probe = os.path.join(self.folder, filename, ".metadata")
-                if match and os.path.isfile(metadata_probe):
-                    step_counts.append(int(match.group(1)))
-            if not step_counts:
+        if checkpoint_path is not None:
+            checkpoint_id = checkpoint_path
+            step = 0
+        else:
+            if step != -1 and not os.path.isdir(self._create_checkpoint_id(step)):
                 return False
-            step = max(step_counts)
+
+            if step == -1:
+                step_counts = []
+                for filename in os.listdir(self.folder):
+                    match = re.search(r"step-(\d+)", filename)
+                    metadata_probe = os.path.join(self.folder, filename, ".metadata")
+                    if match and os.path.isfile(metadata_probe):
+                        step_counts.append(int(match.group(1)))
+                if not step_counts:
+                    return False
+                step = max(step_counts)
+            checkpoint_id = self._create_checkpoint_id(step)
 
         # We won't have optimizer states to load, if we are loading a seed checkpoint
         states = {"model": self.states["model"]} if step == 0 else self.states
@@ -436,7 +442,7 @@ class CheckpointManager:
         begin = time.monotonic()
         dcp.load(
             states,
-            checkpoint_id=self._create_checkpoint_id(step),
+            checkpoint_id=checkpoint_id,
         )
         logger.info(
             f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."

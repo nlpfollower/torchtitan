@@ -23,15 +23,16 @@
 #SBATCH --partition=train
 
 
-nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
-nodes_array=($nodes)
-head_node=${nodes_array[0]}
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+#nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+#nodes_array=($nodes)
+#head_node=${nodes_array[0]}
+#head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+head_node_ip="ip-here"
 
 echo Node IP: $head_node_ip
 export LOGLEVEL=INFO
 # Enable for A100
-export FI_PROVIDER="efa"
+#export FI_PROVIDER="efa"
 # Ensure that P2P is available
 # export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
@@ -54,10 +55,16 @@ export NCCL_BUFFSIZE=2097152
 #export TORCH_DIST_INIT_BARRIER=1
 export FI_EFA_SET_CUDA_SYNC_MEMOPS=0
 
-CONFIG_FILE=${CONFIG_FILE:-"./train_configs/llama3_8b.toml"}
+CONFIG_FILE=${CONFIG_FILE:-"./train_configs/llama3_70b.toml"}
 
-dcgmi profile --pause
+#dcgmi profile --pause
+
+overrides=""
+if [ $# -ne 0 ]; then
+    overrides="$*"
+fi
+
 # adjust sbatch --ntasks and sbatch --nodes above and --nnodes below
 # to your specific node count, and update target launch file.
-srun torchrun --nnodes 4 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" ./train.py --job.config_file ${CONFIG_FILE}
-dcgmi profile --resume
+torchrun --nnodes 2 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" ./train.py --job.config_file ${CONFIG_FILE} $overrides
+#dcgmi profile --resume

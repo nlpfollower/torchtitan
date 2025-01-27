@@ -299,6 +299,35 @@ class JobConfig:
             help="Whether to apply loss parallel when sequence parallel is enabled",
         )
         self.parser.add_argument(
+            "--reference_model.enabled",
+            action="store_true",
+            help="Enable the float16 reference model for training objectives"
+        )
+        self.parser.add_argument(
+            "--reference_model.checkpoint_path",
+            type=str,
+            default=None,
+            help="Path to the reference model checkpoint"
+        )
+        self.parser.add_argument(
+            "--reference_model.data_parallel_shard_degree",
+            type=int,
+            default=1,
+            help="Data parallel (FSDP) shard degree for the reference model"
+        )
+        self.parser.add_argument(
+            "--reference_model.tensor_parallel_degree",
+            type=int,
+            default=1,
+            help="Tensor Parallelism degree for the reference model"
+        )
+        self.parser.add_argument(
+            "--reference_model.pipeline_parallel_degree",
+            type=int,
+            default=1,
+            help="Pipeline Parallelism degree for the reference model"
+        )
+        self.parser.add_argument(
             "--experimental.enable_async_tensor_parallel",
             action="store_true",
             help="Whether to apply async tensor parallel (currently only effective when compile is enabled)",

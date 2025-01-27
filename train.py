@@ -15,12 +15,14 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan import utils
 from torchtitan.checkpoint import CheckpointManager, TrainState
+from torchtitan.checksum import combine_checksums, finite_field_add, checksum_model
 from torchtitan.config_manager import JobConfig
 from torchtitan.datasets import build_hf_data_loader, build_tokenizer, build_custom_data_loader
 from torchtitan.float8 import Float8Handler
 from torchtitan.logging import init_logger, logger
 from torchtitan.metrics import build_device_memory_monitor, build_metric_logger
 from torchtitan.models import model_name_to_cls, model_name_to_tokenizer, models_config
+from torchtitan.models.reference_model import build_reference_model
 from torchtitan.objective import Objective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.parallelisms import (
@@ -42,7 +44,7 @@ def main(job_config: JobConfig):
     logger.info(f"rank {rank} and local rank {local_rank}")
     if rank == 0:
         print("Hello from rank 0")
-        # pydevd_pycharm.settrace('ip address', port=6789, stdoutToServer=True, stderrToServer=True)
+        # pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
 
     if job_config.job.print_args:
         logger.info(f"Running with args: {job_config.to_dict()}")
@@ -194,6 +196,9 @@ def main(job_config: JobConfig):
 
         model_parts = [model]
 
+    real_checksum, real_param_checksums = checksum_model(model)
+    if rank == 0:
+        logger.info(f"Real model checksum (before load): {real_checksum}")
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
         f"{device_type.upper()} memory usage for model: "
@@ -227,6 +232,33 @@ def main(job_config: JobConfig):
 
     checkpoint.load(step=job_config.checkpoint.load_step)
     metric_logger = build_metric_logger(job_config, parallel_dims)
+
+    if job_config.reference_model.enabled:
+        reference_model = build_reference_model(job_config, world_mesh, parallel_dims, optimizers, lr_schedulers)
+
+        if os.environ.get('DEBUG_REFERENCE_MODEL', '0') == '1':
+            logger.info("Running reference model debug...")
+            try:
+                total_checksum, param_checksums = checksum_model(reference_model)
+                real_checksum, real_param_checksums = checksum_model(model)
+
+                if rank == 0:
+                    logger.info(f"Real model checksum: {real_checksum}")
+                    logger.info(f"Reference model checksum: {total_checksum}")
+
+                # Get the first sample from the dataset
+                test_batch = next(iter(data_loader))
+                test_input_ids, _ = test_batch
+                test_input_ids = test_input_ids.to(device_type)
+
+                # Run the reference model
+                with torch.no_grad():
+                    reference_output = reference_model(test_input_ids)
+
+                logger.info(f"Reference model output shape: {reference_output.shape}")
+                logger.info(f"Reference model output sample: {reference_output[0, :5, :5]}")
+            except Exception as e:
+                logger.error(f"Error in reference model debug: {str(e)}")
 
     # plot losses loaded from checkpoint (if any) to TensorBoard
     # NOTE: Loss info after the last log step before checkpoint saving will not be ploted.
@@ -300,6 +332,10 @@ def main(job_config: JobConfig):
                 if parallel_dims.cp_enabled
                 else None
             )
+
+            if job_config.reference_model.enabled:
+                with torch.no_grad():
+                    reference_output = reference_model(input_ids)
 
             if parallel_dims.pp_enabled:
                 # Pipeline Parallel forward / backward inside step() call
@@ -452,7 +488,7 @@ def main(job_config: JobConfig):
 
 
 if __name__ == "__main__":
-    pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    # pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     config = JobConfig()
     config.parse_args()
     main(config)
