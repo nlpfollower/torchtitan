@@ -44,7 +44,10 @@ def main(job_config: JobConfig):
     logger.info(f"rank {rank} and local rank {local_rank}")
     if rank == 0:
         print("Hello from rank 0")
-        # pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
+        pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    if rank == 4:
+        print("Hello from rank 0")
+        pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
 
     if job_config.job.print_args:
         logger.info(f"Running with args: {job_config.to_dict()}")
@@ -196,9 +199,6 @@ def main(job_config: JobConfig):
 
         model_parts = [model]
 
-    real_checksum, real_param_checksums = checksum_model(model)
-    if rank == 0:
-        logger.info(f"Real model checksum (before load): {real_checksum}")
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
         f"{device_type.upper()} memory usage for model: "
@@ -239,8 +239,8 @@ def main(job_config: JobConfig):
         if os.environ.get('DEBUG_REFERENCE_MODEL', '0') == '1':
             logger.info("Running reference model debug...")
             try:
-                total_checksum, param_checksums = checksum_model(reference_model)
-                real_checksum, real_param_checksums = checksum_model(model)
+                real_checksum, real_param_checksums = checksum_model(model, world_mesh)
+                total_checksum, param_checksums = checksum_model(reference_model, world_mesh)
 
                 if rank == 0:
                     logger.info(f"Real model checksum: {real_checksum}")

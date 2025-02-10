@@ -13,6 +13,9 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention.flex_attention import BlockMask
+
+from torchtitan.models.llama.attention_utils import sdpa_or_flex_attention
 from torchtitan.models.norms import build_norm
 
 
@@ -33,6 +36,7 @@ class ModelArgs:
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
     norm_type: str = "rmsnorm"
+    attention_type: str = "sdpa"
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -155,6 +159,7 @@ class Attention(nn.Module):
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = model_args.dim // model_args.n_heads
 
+        self._attention_call = sdpa_or_flex_attention(model_args.attention_type)
         self.wq = nn.Linear(
             model_args.dim, model_args.n_heads * self.head_dim, bias=False
         )
@@ -173,6 +178,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
+        mask = None,
     ):
         """
         Forward pass of the attention module.
@@ -206,7 +212,7 @@ class Attention(nn.Module):
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         # we use casual mask for training
-        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
+        output = self._attention_call(xq, xk, xv, mask=mask)
         output = output.transpose(
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
@@ -308,6 +314,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
+        mask = None,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -320,7 +327,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -424,7 +431,7 @@ class Transformer(nn.Module):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor):
+    def forward(self, tokens: torch.Tensor, mask = None):
         """
         Perform a forward pass through the Transformer model.
 
@@ -439,7 +446,7 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h, self.freqs_cis, mask)
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h

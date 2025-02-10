@@ -14,6 +14,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Sequence
 
+import pydevd_pycharm
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -479,6 +481,7 @@ def run_tests(args):
 
 
 def main():
+    # pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", default="./outputs/integration_tests_output")
     parser.add_argument("--config_dir", default="./train_configs")

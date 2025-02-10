@@ -1,0 +1,48 @@
+from typing import Union, Callable, Optional
+
+import torch
+from torch import nn
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask as create_block_causal_mask_flex,
+    flex_attention,
+)
+
+flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+
+# We cannot do nested compile, but flex attention only has perf benefits
+# when compiled. To insulate it from the compiler, we wrap it with
+# compiler.disable so that it can be used regardless of whether the model
+# is compiled or not, and flex attention always remains compiled.
+@torch.compiler.disable(recursive=False)
+def compile_friendly_flex_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_mask: BlockMask,
+) -> torch.Tensor:
+    return flex_attention_compiled(q, k, v, block_mask=block_mask)
+
+_MaskType = Union[torch.Tensor, BlockMask]
+
+def sdpa_or_flex_attention(attention_type: str) -> Callable:
+    def _attention_call(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: Optional[_MaskType] = None,
+    ) -> torch.Tensor:
+        if isinstance(mask, BlockMask) or attention_type == "flex":
+            return compile_friendly_flex_attention(q, k, v, block_mask=mask)
+        else:
+            # Support for 2D mask in SDPA
+            if mask is not None:
+                if mask.dim() == 2:
+                    mask = mask.unsqueeze(0).unsqueeze(0)
+                elif mask.dim() == 3:
+                    mask = mask.unsqueeze(1)
+                return nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            else:
+                return nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    return _attention_call

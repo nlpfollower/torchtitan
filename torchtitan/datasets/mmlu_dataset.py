@@ -73,7 +73,7 @@ class MMLUDataset(Dataset):
 
         llm_input = self.chat_format.encode_dialog_prompt(messages)
         answer_token = self.tokenizer.encode(answer, bos=False, eos=False)[0]
-        eot_token = self.tokenizer.special_tokens["<|eot_id|>"]
+        eot_token = self.tokenizer.special_tokens["<|end_of_text|>"]
 
         full_sequence = llm_input.tokens + [answer_token, eot_token]
         attention_mask = [1] * len(full_sequence)

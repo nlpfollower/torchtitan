@@ -1,7 +1,9 @@
 from enum import Enum
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
+from aiohttp.web_routedef import static
 
 from torchtitan.datasets import build_tokenizer
 
@@ -16,6 +18,7 @@ class Objective:
         else:
             raise ValueError(f"Unsupported loss function: {loss_type}")
 
+    @staticmethod
     def default_loss(pred, labels):
         return torch.nn.functional.cross_entropy(
             pred.flatten(0, 1).float(), labels.flatten(0, 1)
@@ -35,20 +38,26 @@ class Objective:
             reduction="mean"  # or "sum" if you want control over scaling
         )
 
-        if debug:
-            # For debugging, pick out only valid positions
-            valid_positions = shifted_labels != -100
-            valid_logits = shifted_logits[valid_positions]
-            valid_labels = shifted_labels[valid_positions]
-
-            # Get the predicted token IDs
-            _, predicted_tokens = torch.max(valid_logits, dim=-1)
-
-            # Decode the predicted tokens
-            tok = build_tokenizer("llama", "models/Llama3.2-3B-Instruct/tokenizer.model")
-            decoded_tokens = tok.decode(predicted_tokens.tolist())
-            decoded_labels = tok.decode(valid_labels.tolist())
-            print(f"Predicted: {decoded_tokens}")
-            print(f"Labels: {decoded_labels}")
-
         return loss
+
+class ReferenceObjective:
+    @staticmethod
+    def get_loss_function(loss_type):
+        if loss_type == "dpo":
+            return ReferenceObjective.dpo_loss
+        else:
+            raise ValueError(f"Unsupported loss function: {loss_type}")
+
+    @staticmethod
+    def dpo_loss(policy_chosen_logps: torch.Tensor, policy_rejected_logps: torch.Tensor,
+                 reference_chosen_logps: torch.Tensor, reference_rejected_logps: torch.Tensor,
+                 beta: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pi_logratios = policy_chosen_logps - policy_rejected_logps
+        ref_logratios = reference_chosen_logps - reference_rejected_logps
+
+        logits = pi_logratios - ref_logratios
+        losses = -F.logsigmoid(beta * logits)
+        chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
+        rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
+
+        return losses, chosen_rewards, rejected_rewards

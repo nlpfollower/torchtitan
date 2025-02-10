@@ -407,12 +407,38 @@ def clip_grad_norm_(
     return total_norm
 
 
-def gather_dtensor(dtensor):
+def is_fully_replicated(dtensor):
+    """Check if a DTensor is fully replicated across all ranks."""
+    if not isinstance(dtensor, torch.distributed._tensor.DTensor):
+        return True
+    return all(isinstance(p, torch.distributed._tensor.Replicate) for p in dtensor.placements)
+
+
+def gather_dtensor(dtensor, world_mesh):
+    """Gather a DTensor's data across ranks, handling replicated tensors properly."""
     if not isinstance(dtensor, torch.distributed._tensor.DTensor):
         return dtensor
 
-    # Get the full tensor on rank 0
-    if dist.get_rank() == 0:
-        return dtensor.full_tensor()
-    else:
-        return None
+    # If the tensor is fully replicated, just return the local tensor
+    if is_fully_replicated(dtensor):
+        return dtensor.to_local()
+
+    local_tensor = dtensor.to_local()
+    device_mesh = dtensor.device_mesh
+
+    # Focus on 'tp' and 'dp_shard' dimensions
+    relevant_dims = ['tp', 'dp_shard']
+    for mesh_dim_name in relevant_dims:
+        dp_mesh_dim_name = mesh_dim_name
+        if mesh_dim_name == 'dp_shard':
+            dp_mesh_dim_name = 'dp_shard_cp'
+
+        if dp_mesh_dim_name in device_mesh.mesh_dim_names and mesh_dim_name in world_mesh.mesh_dim_names:
+            world_mesh_size = world_mesh[mesh_dim_name].size()
+            if world_mesh_size > 1:
+                group = world_mesh[mesh_dim_name].get_group()
+                gather_list = [torch.zeros_like(local_tensor) for _ in range(world_mesh_size)]
+                torch.distributed.all_gather(gather_list, local_tensor, group=group)
+                local_tensor = torch.cat(gather_list, dim=0)  # Always concatenate along dim 0 for simplicity
+
+    return local_tensor

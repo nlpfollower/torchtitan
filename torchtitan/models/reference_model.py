@@ -2,6 +2,10 @@ import os
 
 import torch
 from torch.distributed.tensor import DeviceMesh
+from torch.optim import Adam
+from torch.optim.lr_scheduler import LambdaLR
+from torchdata.nodes import Stateful
+
 from torchtitan.models import model_name_to_cls, models_config
 from torchtitan.parallelisms import models_parallelize_fns, ParallelDims, models_pipelining_fns
 from torchtitan.checkpoint import CheckpointManager, ModelWrapper
@@ -15,12 +19,12 @@ class ReferenceModel(nn.Module):
         self.model_parts = nn.ModuleList(model_parts)
         self.pp_schedule = pp_schedule
 
-    def forward(self, x):
+    def forward(self, x, mask):
         if self.pp_schedule:
             return self.pp_schedule(x)
         else:
             for part in self.model_parts:
-                x = part(x)
+                x = part(x, mask)
             return x
 
     def generate(self, input_ids, max_new_tokens, temperature=1.0, top_k=None, seed=None):
@@ -29,7 +33,7 @@ class ReferenceModel(nn.Module):
     def generate_next_token(self, x, temperature=1.0, top_k=None, rng=None):
         return generate_next_token(self, x, temperature=temperature, top_k=top_k, rng=rng)
 
-def build_reference_model(job_config, world_mesh, parallel_dims, optimizers, lr_schedulers):
+def build_reference_model(job_config, world_mesh, parallel_dims, tokenizer):
     device_type, _ = get_device_info()
     device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
 
@@ -52,6 +56,9 @@ def build_reference_model(job_config, world_mesh, parallel_dims, optimizers, lr_
     model_cls = model_name_to_cls[job_config.model.name]
     model_config = models_config[job_config.model.name][job_config.model.flavor]
     model_config.norm_type = job_config.model.norm_type
+    model_config.vocab_size = tokenizer.n_words
+    model_config.max_seq_len = job_config.training.seq_len
+    model_config.attention_type = job_config.model.attention
 
     # Build the reference model
     with torch.device("meta"):
@@ -74,6 +81,9 @@ def build_reference_model(job_config, world_mesh, parallel_dims, optimizers, lr_
         reference_model.to_empty(device=device)
         reference_model_parts = [reference_model]
 
+    optimizers = MinimalOptimizersContainer(reference_model)
+    lr_schedulers = MinimalSchedulersContainer(optimizers.optimizers[0])
+
         # Load the checkpoint
     checkpoint = CheckpointManager(
         dataloader=None,
@@ -86,3 +96,20 @@ def build_reference_model(job_config, world_mesh, parallel_dims, optimizers, lr_
     checkpoint.load(step=0, checkpoint_path=job_config.reference_model.checkpoint_path)
 
     return ReferenceModel(reference_model_parts, pp_schedule if reference_parallel_dims.pp_enabled else None)
+
+class MinimalOptimizersContainer(Stateful):
+    def __init__(self, model):
+        self.optimizers = [Adam(model.parameters())]
+
+    def state_dict(self):
+        return {"optimizer_0": self.optimizers[0].state_dict()}
+
+    def load_state_dict(self, state_dict):
+        self.optimizers[0].load_state_dict(state_dict["optimizer_0"])
+
+class MinimalSchedulersContainer:
+    def __init__(self, optimizer):
+        self.schedulers = [LambdaLR(optimizer, lr_lambda=lambda _: 1)]
+
+    def get_lr_scheduler_state(self):
+        return {"lr_scheduler": self.schedulers[0]}
