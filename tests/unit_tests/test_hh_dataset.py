@@ -12,7 +12,8 @@ from llama_models.llama3.api import RawMessage, ChatFormat, ToolPromptFormat
 from torch.nn.attention.flex_attention import create_block_mask
 
 from torchtitan.checkpoint import CheckpointManager, ModelWrapper
-from torchtitan.datasets.hh_dataset import HHDataset, build_hh_data_loader, packed_document_causal_mask
+from torchtitan.datasets.hh_dataset import HHDataset, build_hh_data_loader
+from torchtitan.models.llama.attention_utils import packed_document_causal_mask
 from torchtitan.datasets.tokenizer import build_tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.logging import logger, init_logger

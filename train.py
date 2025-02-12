@@ -22,8 +22,9 @@ from torchtitan.float8 import Float8Handler
 from torchtitan.logging import init_logger, logger
 from torchtitan.metrics import build_device_memory_monitor, build_metric_logger
 from torchtitan.models import model_name_to_cls, model_name_to_tokenizer, models_config
+from torchtitan.models.llama.attention_utils import packed_document_causal_mask
 from torchtitan.models.reference_model import build_reference_model
-from torchtitan.objective import Objective
+from torchtitan.objective import Objective, ReferenceObjective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.parallelisms import (
     models_parallelize_fns,
@@ -155,7 +156,10 @@ def main(job_config: JobConfig):
     )
 
     # loss function to be shared by Pipeline Parallel and SPMD training
-    loss_fn = Objective.get_loss_function(job_config.training.loss_function)
+    if job_config.reference_model.enabled:
+        loss_fn = ReferenceObjective.get_loss_function(job_config.training.loss_function)
+    else:
+        loss_fn = Objective.get_loss_function(job_config.training.loss_function)
 
     # TODO: compiling loss function causes CUDA errors, turning off for now
     # if job_config.training.compile:
@@ -253,10 +257,10 @@ def main(job_config: JobConfig):
 
                 # Run the reference model
                 with torch.no_grad():
-                    reference_output = reference_model(test_input_ids)
+                    reference_logits = reference_model(test_input_ids)
 
-                logger.info(f"Reference model output shape: {reference_output.shape}")
-                logger.info(f"Reference model output sample: {reference_output[0, :5, :5]}")
+                logger.info(f"Reference model output shape: {reference_logits.shape}")
+                logger.info(f"Reference model output sample: {reference_logits[0, :5, :5]}")
             except Exception as e:
                 logger.error(f"Error in reference model debug: {str(e)}")
 
@@ -309,10 +313,17 @@ def main(job_config: JobConfig):
                 # get batch
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
-                input_ids, labels = batch
             except StopIteration:
                 logger.warning("DataLoader has exhausted its data. Ending training.")
                 break
+
+            input_ids, labels = batch['input_ids'], batch['labels']
+            attention_mask = None
+            document_ids = None
+            if job_config.training.use_block_attention_mask and 'document_ids' in batch:
+                document_ids = batch['document_ids']
+                attention_mask = packed_document_causal_mask(document_ids).to(device)
+
             ntokens_since_last_log += labels.numel()
             data_loading_times.append(time.perf_counter() - data_load_start)
 
@@ -335,7 +346,7 @@ def main(job_config: JobConfig):
 
             if job_config.reference_model.enabled:
                 with torch.no_grad():
-                    reference_output = reference_model(input_ids)
+                    reference_logits = reference_model(input_ids, attention_mask)
 
             if parallel_dims.pp_enabled:
                 # Pipeline Parallel forward / backward inside step() call
@@ -359,11 +370,14 @@ def main(job_config: JobConfig):
             else:
                 # Non-PP forward / backward
                 with train_context(optional_context_parallel_ctx):
-                    pred = model(input_ids)
-                    loss = loss_fn(pred, labels)
+                    logits = model(input_ids, attention_mask)
+                    if job_config.reference_model.enabled:
+                        loss = loss_fn(logits, reference_logits, labels, document_ids)
+                    else:
+                        loss = loss_fn(logits, labels)
                     # pred.shape=(bs, seq_len, vocab_size)
                     # need to free to before bwd to avoid peaking memory
-                    del pred
+                    del logits
                     loss.backward()
 
             # clip gradients

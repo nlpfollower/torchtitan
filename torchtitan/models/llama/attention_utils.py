@@ -5,10 +5,30 @@ from torch import nn
 from torch.nn.attention.flex_attention import (
     BlockMask,
     create_block_mask as create_block_causal_mask_flex,
-    flex_attention,
+    flex_attention, create_block_mask,
 )
 
 flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+
+def packed_document_causal_mask(document_ids: torch.Tensor):
+    batch_size, max_seq_len = document_ids.shape
+    device = document_ids.device
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+        document_mask = document_ids[b, q_idx] == document_ids[b, kv_idx]
+        non_padding = document_ids[b, q_idx] != -1
+        return causal_mask & document_mask & non_padding
+
+    return create_block_mask(
+        mask_mod,
+        batch_size,
+        None,
+        max_seq_len,
+        max_seq_len,
+        device=device,
+    )
+
 
 # We cannot do nested compile, but flex attention only has perf benefits
 # when compiled. To insulate it from the compiler, we wrap it with

@@ -299,6 +299,11 @@ class JobConfig:
             help="Whether to apply loss parallel when sequence parallel is enabled",
         )
         self.parser.add_argument(
+            "--training.use_block_attention_mask",
+            action="store_true",
+            help="Whether to use block attention masking for datasets that support it"
+        )
+        self.parser.add_argument(
             "--reference_model.enabled",
             action="store_true",
             help="Enable the float16 reference model for training objectives"

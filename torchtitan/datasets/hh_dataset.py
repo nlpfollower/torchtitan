@@ -2,32 +2,12 @@ import re
 
 import torch
 from llama_models.llama3.api import ChatFormat, ToolPromptFormat, RawMessage, Role
-from torch.nn.attention.flex_attention import create_block_mask
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from typing import List, Dict, Any, Tuple, Iterator
 from datasets import load_dataset
 from torchtitan.datasets.tokenizer import Tokenizer
 from collections import defaultdict
 from tqdm import tqdm
-
-def packed_document_causal_mask(document_ids: torch.Tensor):
-    batch_size, max_seq_len = document_ids.shape
-    device = document_ids.device
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        causal_mask = q_idx >= kv_idx
-        document_mask = document_ids[b, q_idx] == document_ids[b, kv_idx]
-        non_padding = document_ids[b, q_idx] != -1
-        return causal_mask & document_mask & non_padding
-
-    return create_block_mask(
-        mask_mod,
-        batch_size,
-        None,
-        max_seq_len,
-        max_seq_len,
-        device=device,
-    )
 
 def extract_anthropic_prompt(prompt_and_response: str) -> str:
     """Extract the anthropic prompt from a prompt and response pair."""
@@ -199,7 +179,7 @@ def build_hh_data_loader(
     batch_size: int,
     seq_len: int = 2048,
     split: str = "train",
-    num_workers: int = 4,
+    num_workers: int = 0,
     cache_dir: str = None,
 ) -> DataLoader:
     dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size, cache_dir=cache_dir)

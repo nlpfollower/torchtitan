@@ -1,12 +1,14 @@
 from typing import List
 
 import torch
+from click.core import batch
 from datasets import Dataset
 from datasets.distributed import split_dataset_by_node
 from torch.utils.data import DataLoader, IterableDataset
 from torchdata.nodes import Stateful
 
 from torchtitan.datasets.hf_datasets import DPAwareDataLoader
+from torchtitan.datasets.hh_dataset import build_hh_data_loader, HHDataset
 from torchtitan.datasets.mmlu_dataset import MMLUDataset
 from torchtitan.datasets.tokenizer import Tokenizer
 from torchtitan.logging import logger
@@ -57,20 +59,20 @@ def build_custom_data_loader(
     seq_len: int,
     world_size: int,
     rank: int,
-    num_workers: int = 4,
+    num_workers: int = 0,
     shuffle: bool = False,
     infinite: bool = True,
-) -> DPAwareDataLoader:
+) -> DataLoader:
     if dataset == "mmlu":
         dataset = MMLUDataset(data_dir, split, tokenizer)
+    elif dataset == "hh":
+        dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size)
     else:
         raise ValueError(f"Unsupported custom dataset: {dataset}")
 
-    # Wrap the dataset in CustomIterableDataset for rank-based splitting
-    iterable_dataset = CustomIterableDataset(dataset, seq_len, world_size, rank)
-
-    return DPAwareDataLoader(
-        rank,
-        iterable_dataset,
-        batch_size=batch_size,
+    return DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=num_workers,
+        shuffle=shuffle,
     )
