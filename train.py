@@ -33,7 +33,7 @@ from torchtitan.parallelisms import (
     ParallelDims,
 )
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
-from torchtitan.utils import device_module, device_type
+from torchtitan.utils import device_module, device_type, set_default_dtype
 
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
@@ -137,7 +137,7 @@ def main(job_config: JobConfig):
     model_config.max_seq_len = job_config.training.seq_len
 
     logger.info(f"Building {model_name} {job_config.model.flavor} with {model_config}")
-    with torch.device("meta"):
+    with set_default_dtype(torch.bfloat16), torch.device("meta"):
         model = model_cls.from_model_args(model_config)
 
     # a no-op hander if float8 is not enabled
