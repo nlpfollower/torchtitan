@@ -45,10 +45,10 @@ def main(job_config: JobConfig):
     logger.info(f"rank {rank} and local rank {local_rank}")
     if rank == 0:
         print("Hello from rank 0")
-        pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
-    if rank == 4:
-        print("Hello from rank 0")
-        pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
+        pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
+    # if rank == 4:
+    #     print("Hello from rank 0")
+    #     pydevd_pycharm.settrace('localhost', port=6794, stdoutToServer=True, stderrToServer=True)
 
     if job_config.job.print_args:
         logger.info(f"Running with args: {job_config.to_dict()}")
