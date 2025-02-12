@@ -58,7 +58,6 @@ def build_reference_model(job_config, world_mesh, parallel_dims, tokenizer):
     model_config.norm_type = job_config.model.norm_type
     model_config.vocab_size = tokenizer.n_words
     model_config.max_seq_len = job_config.training.seq_len
-    model_config.attention_type = job_config.model.attention
 
     # Build the reference model
     with torch.device("meta"):

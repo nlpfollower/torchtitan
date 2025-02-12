@@ -45,14 +45,14 @@ def compile_friendly_flex_attention(
 
 _MaskType = Union[torch.Tensor, BlockMask]
 
-def sdpa_or_flex_attention(attention_type: str) -> Callable:
+def sdpa_or_flex_attention() -> Callable:
     def _attention_call(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         mask: Optional[_MaskType] = None,
     ) -> torch.Tensor:
-        if isinstance(mask, BlockMask) or attention_type == "flex":
+        if isinstance(mask, BlockMask):
             return compile_friendly_flex_attention(q, k, v, block_mask=mask)
         else:
             # Support for 2D mask in SDPA

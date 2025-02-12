@@ -36,7 +36,6 @@ class ModelArgs:
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
     norm_type: str = "rmsnorm"
-    attention_type: str = "sdpa"
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -159,7 +158,7 @@ class Attention(nn.Module):
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = model_args.dim // model_args.n_heads
 
-        self._attention_call = sdpa_or_flex_attention(model_args.attention_type)
+        self._attention_call = sdpa_or_flex_attention()
         self.wq = nn.Linear(
             model_args.dim, model_args.n_heads * self.head_dim, bias=False
         )

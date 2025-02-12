@@ -34,8 +34,12 @@ class HHDataset(IterableDataset):
         current_sample = {"input_ids": [], "labels": [], "document_ids": []}
         current_length = 0
         current_doc_id = 0
+        curr = 0
 
         for row in tqdm(dataset, desc='Processing HH'):
+            if curr > 10000:
+                break
+            curr += 1
             prompt_tokens, chosen_tokens, rejected_tokens = self.process_row(row)
             sample = self.process_sample(prompt_tokens, chosen_tokens, rejected_tokens)
 

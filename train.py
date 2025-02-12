@@ -10,6 +10,7 @@ from datetime import timedelta
 
 import pydevd_pycharm
 import torch
+from lxml.html.diff import token
 
 from torch.distributed.elastic.multiprocessing.errors import record
 
@@ -113,12 +114,13 @@ def main(job_config: JobConfig):
         data_loader = build_custom_data_loader(
             job_config.training.dataset_path,
             job_config.training.dataset,
-            "dev",  # or use a config option for split
+            "train",  # or use a config option for split
             tokenizer,
             job_config.training.batch_size,
             job_config.training.seq_len,
-            dp_degree,
+            world_size,
             dp_rank,
+            device_type
         )
     else:
         raise ValueError(f"Unsupported dataset type: {job_config.training.dataset_type}")
@@ -238,7 +240,7 @@ def main(job_config: JobConfig):
     metric_logger = build_metric_logger(job_config, parallel_dims)
 
     if job_config.reference_model.enabled:
-        reference_model = build_reference_model(job_config, world_mesh, parallel_dims, optimizers, lr_schedulers)
+        reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
 
         if os.environ.get('DEBUG_REFERENCE_MODEL', '0') == '1':
             logger.info("Running reference model debug...")
@@ -321,7 +323,7 @@ def main(job_config: JobConfig):
             attention_mask = None
             document_ids = None
             if job_config.training.use_block_attention_mask and 'document_ids' in batch:
-                document_ids = batch['document_ids']
+                document_ids = batch['document_ids'].to(device_type)
                 attention_mask = packed_document_causal_mask(document_ids).to(device)
 
             ntokens_since_last_log += labels.numel()
