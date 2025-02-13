@@ -1,7 +1,9 @@
 import os
 import random
+import sys
+import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pydevd_pycharm
@@ -46,8 +48,8 @@ def create_job_config():
     job_config = JobConfig()
     job_config.parse_args([])
     job_config.model.name = "llama3"
-    job_config.model.flavor = "8B"
-    job_config.model.tokenizer_path = "models/Llama3.1-8B-Instruct/tokenizer.model"
+    job_config.model.flavor = "3B"
+    job_config.model.tokenizer_path = "models/Llama3.2-3B-Instruct/tokenizer.model"
     job_config.job.dump_folder = "outputs"
     job_config.checkpoint.folder = "checkpoint"
     job_config.checkpoint.enable_checkpoint = True
@@ -236,9 +238,13 @@ def compare_masked_and_individual_passes(reference_model, masked_logits, input_i
             chosen_input = sample_input_ids[chosen_mask]
             rejected_input = sample_input_ids[rejected_mask]
 
+            start = time.perf_counter_ns()
             with torch.no_grad():
                 chosen_logits = reference_model(chosen_input.unsqueeze(0), None)[0]
+                torch.cuda.synchronize()
                 rejected_logits = reference_model(rejected_input.unsqueeze(0), None)[0] if rejected_mask.any() else None
+                torch.cuda.synchronize()
+            individual_time = (time.perf_counter_ns() - start) / 1e6  # ms
 
             masked_chosen = masked_logits[b, chosen_mask]
             masked_rejected = masked_logits[b, rejected_mask] if rejected_mask.any() else None
@@ -270,11 +276,46 @@ def compare_masked_and_individual_passes(reference_model, masked_logits, input_i
                 "rejected_max_diff": max_diff_rejected,
                 "rejected_mean_diff": mean_diff_rejected,
                 "rejected_mismatches": mismatch_rejected,
-                "total_tokens": total_tokens
+                "total_tokens": total_tokens,
+                "individual_time": individual_time
             }
 
 
+def create_document_causal_mask(document_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Creates a causal attention mask that respects document boundaries.
+
+    Args:
+        document_ids: (batch_size, seq_len) tensor of document IDs, with -1 for padding
+
+    Returns:
+        (batch_size, 1, seq_len, seq_len) boolean tensor where True allows attention
+    """
+    batch_size, seq_len = document_ids.shape
+    device = document_ids.device
+
+    # Create causal mask (lower triangular)
+    causal = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+
+    # Create document matching mask
+    # Expand dims for broadcasting: (batch, 1, seq_len) -> (batch, seq_len, seq_len)
+    doc_ids_q = document_ids.unsqueeze(2)  # (batch, seq_len, 1)
+    doc_ids_k = document_ids.unsqueeze(1)  # (batch, 1, seq_len)
+    doc_match = (doc_ids_q == doc_ids_k)
+
+    # Create padding mask
+    non_padding = document_ids.unsqueeze(-1) != -1  # (batch, seq_len, 1)
+
+    # Combine all masks
+    mask = causal & doc_match & non_padding
+
+    # Add singleton head dimension
+    return mask.unsqueeze(1)
+
 def test_advanced_document_causal_mask(num_samples: int, max_seq_length: int, batch_size: int):
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)  # Disable the math kernel to ensure flash is used
+
     device, device_type = setup_environment()
     job_config = create_job_config()
     job_config.model.attention = "sdpa"
@@ -295,27 +336,51 @@ def test_advanced_document_causal_mask(num_samples: int, max_seq_length: int, ba
     input_ids = batch['input_ids'].to(device)
     labels = batch['labels'].to(device)
     document_ids = batch['document_ids'].to(device)
-    attention_mask = packed_document_causal_mask(document_ids).to(device)
+    attention_mask = create_document_causal_mask(document_ids).to(device)
 
+    visualize_attention_mask(
+        attention_mask,
+        batch_idx=0,
+        save_path="attention_mask.png",
+        title="Document Causal Mask"
+    )
+
+    # Warmup pass
+    with torch.no_grad():
+        _ = reference_model(input_ids, attention_mask)
+        _ = reference_model(input_ids[0:1], None)  # Single sample without mask
+    torch.cuda.synchronize()
+
+    # Measure masked forward pass
+    start = time.perf_counter_ns()
     with torch.no_grad():
         masked_logits = reference_model(input_ids, attention_mask)
+    torch.cuda.synchronize()
+    masked_time = (time.perf_counter_ns() - start) / 1e6  # Convert to milliseconds
 
     comparison_results = compare_masked_and_individual_passes(
         reference_model, masked_logits, input_ids, document_ids, labels, device
     )
 
+    total_individual_time = 0
     for result in comparison_results:
         logger.info(f"Batch {result['batch'] + 1}, Sample {result['sample'] + 1}:")
         logger.info(f"  Chosen  - Max diff: {result['chosen_max_diff']:.6f}, Mean diff: {result['chosen_mean_diff']:.6f}, Mismatches: {result['chosen_mismatches']}")
         logger.info(f"  Rejected - Max diff: {result['rejected_max_diff']:.6f}, Mean diff: {result['rejected_mean_diff']:.6f}, Mismatches: {result['rejected_mismatches']}")
 
+        total_individual_time += result['individual_time']
         total_diff += result['chosen_mean_diff'] + result['rejected_mean_diff']
         max_diff = max(max_diff, result['chosen_max_diff'], result['rejected_max_diff'])
         num_mismatches += result['chosen_mismatches'] + result['rejected_mismatches']
         total_tokens += result['total_tokens']
         samples_processed += 1
-
     avg_diff = total_diff / (2 * samples_processed)
+
+    logger.info("\nPerformance Summary:")
+    logger.info(f"Masked batch forward time: {masked_time:.2f}ms")
+    logger.info(f"Total individual passes time: {total_individual_time:.2f}ms")
+
+    logger.info("\nAccuracy Summary:")
     logger.info(f"Test completed. Average difference: {avg_diff:.6f}, Max difference: {max_diff:.6f}")
     logger.info(f"Total token prediction mismatches: {num_mismatches}")
     logger.info(f"Total tokens processed: {total_tokens}")
@@ -539,12 +604,75 @@ def test_hh_dataset():
         dist.destroy_process_group()
 
 
+def visualize_attention_mask(
+        mask: torch.Tensor,
+        batch_idx: int = 0,
+        save_path: Optional[str] = None,
+        title: str = "Attention Mask"
+) -> None:
+    """
+    Visualizes a boolean attention mask.
+
+    Args:
+        mask: Bool tensor of shape (batch_size, 1, seq_len, seq_len)
+        batch_idx: Which batch to visualize
+        save_path: Where to save the plot. If None, displays it
+        title: Title for the plot
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    # Extract the mask for the specified batch
+    mask_slice = mask[batch_idx, 0].cpu()  # Shape: (seq_len, seq_len)
+    seq_len = mask_slice.shape[0]
+
+    # Create the figure
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Custom two-color scheme: red (masked) to blue (attended)
+    colors = ['#ffcccc', '#99ccff']
+    cmap = mcolors.LinearSegmentedColormap.from_list("custom", colors, N=2)
+
+    # Plot the mask
+    im = ax.imshow(mask_slice, cmap=cmap)
+    ax.set_title(title)
+    ax.set_xlabel("Key position")
+    ax.set_ylabel("Query position")
+
+    # Add colorbar with clear labels
+    cbar = plt.colorbar(im, ax=ax, ticks=[0.25, 0.75])
+    cbar.ax.set_yticklabels(['Masked (False)', 'Attended (True)'])
+
+    # Add position labels if sequence length is manageable
+    if seq_len <= 32:
+        ax.set_xticks(range(seq_len))
+        ax.set_yticks(range(seq_len))
+        ax.set_xticklabels([f'K{i}' for i in range(seq_len)])
+        ax.set_yticklabels([f'Q{i}' for i in range(seq_len)])
+        ax.tick_params(axis='both', which='major', labelsize=8)
+
+        # Add grid
+        ax.set_xticks(np.arange(-0.5, seq_len, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, seq_len, 1), minor=True)
+        ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Visualization saved to {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
 if __name__ == "__main__":
-    pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    # pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     init_logger()
     logger.info("Starting HH dataset tests")
-    test_advanced_document_causal_mask(num_samples=50, max_seq_length=8192, batch_size=2)
-    test_sdpa_mask_equivalence()
-    test_hh_mask_advanced()
-    test_hh_mask()
-    test_hh_dataset()
+    test_advanced_document_causal_mask(num_samples=50, max_seq_length=8192, batch_size=4)
+    # test_sdpa_mask_equivalence()
+    # test_hh_mask_advanced()
+    # test_hh_mask()
+    # test_hh_dataset()
