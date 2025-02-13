@@ -10,7 +10,7 @@ from torchtitan.models.reference_model import build_reference_model
 from torchtitan.parallelisms import ParallelDims
 from torchtitan.utils import get_device_info, set_determinism
 from torchtitan.logging import logger, init_logger
-from torchtitan.models.llama.attention_utils import packed_document_causal_mask
+from torchtitan.models.llama.attention_utils import create_block_document_causal_mask
 from torchtitan.objective import ReferenceObjective
 import torch.nn.functional as F
 
@@ -61,7 +61,7 @@ def test_dpo_objective(max_seq_length: int, batch_size: int):
     input_ids = batch['input_ids'].to(device)
     labels = batch['labels'].to(device)
     document_ids = batch['document_ids'].to(device)
-    attention_mask = packed_document_causal_mask(document_ids).to(device)
+    attention_mask = create_block_document_causal_mask(document_ids).to(device)
 
     # Forward pass for "policy" model
     with torch.no_grad():

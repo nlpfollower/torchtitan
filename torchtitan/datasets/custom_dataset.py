@@ -83,6 +83,7 @@ class DistributedDataLoader(DataLoader):
                     input_ids = batch['input_ids'].to(self.device_type)
                     labels = batch['labels'].to(self.device_type)
                     document_ids = batch.get('document_ids')
+                    attention_mask = batch.get('attention_mask')
                     if document_ids is not None:
                         document_ids = document_ids.to(self.device_type)
                 except StopIteration:
@@ -91,16 +92,18 @@ class DistributedDataLoader(DataLoader):
                 input_ids = torch.empty((self.batch_size, self.seq_len), dtype=torch.long).to(self.device_type)
                 labels = torch.empty_like(input_ids).to(self.device_type)
                 document_ids = torch.empty_like(input_ids).to(self.device_type)
+                attention_mask = torch.empty((self.batch_size, 1, self.seq_len, self.seq_len), dtype=torch.bool).to(self.device_type)
 
             broadcast(input_ids, src=0)
             broadcast(labels, src=0)
-            if document_ids is not None:
-                broadcast(document_ids, src=0)
+            broadcast(document_ids, src=0)
+            broadcast(attention_mask, src=0)
 
             yield {
                 'input_ids': input_ids,
                 'labels': labels,
-                'document_ids': document_ids
+                'document_ids': document_ids,
+                'attention_mask': attention_mask
             }
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:

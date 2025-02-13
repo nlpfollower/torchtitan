@@ -9,6 +9,9 @@ from torchtitan.datasets.tokenizer import Tokenizer
 from collections import defaultdict
 from tqdm import tqdm
 
+from torchtitan.models.llama.attention_utils import create_document_causal_mask
+
+
 def extract_anthropic_prompt(prompt_and_response: str) -> str:
     """Extract the anthropic prompt from a prompt and response pair."""
     search_term = '\n\nAssistant:'
@@ -162,6 +165,7 @@ class HHDataset(IterableDataset):
             key: torch.tensor([sample[key] for sample in samples], dtype=torch.long)
             for key in ['input_ids', 'labels', 'document_ids']
         }
+        batch['attention_mask'] = create_document_causal_mask(batch['document_ids'])
 
         return batch
 
@@ -169,7 +173,8 @@ class HHDataset(IterableDataset):
         return {
             "input_ids": [self.tokenizer.pad_id] * self.seq_len,
             "labels": [-100] * self.seq_len,
-            "document_ids": [-1] * self.seq_len
+            "document_ids": [-1] * self.seq_len,
+            "attention_mask": None
         }
 
     def __len__(self):

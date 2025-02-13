@@ -15,7 +15,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 from torchtitan.checkpoint import CheckpointManager, ModelWrapper
 from torchtitan.datasets.hh_dataset import HHDataset, build_hh_data_loader
-from torchtitan.models.llama.attention_utils import packed_document_causal_mask
+from torchtitan.models.llama.attention_utils import create_block_document_causal_mask
 from torchtitan.datasets.tokenizer import build_tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.logging import logger, init_logger
@@ -198,12 +198,6 @@ def test_sdpa_mask_equivalence():
 
     logger.info("SDPA mask equivalence test completed. Check the detailed comparisons above.")
 
-def create_document_causal_mask(document_ids: torch.Tensor) -> torch.Tensor:
-    seq_len = document_ids.size(0)
-    mask = (document_ids.unsqueeze(1) == document_ids.unsqueeze(0)).tril()
-    return mask
-
-
 def pack_samples(samples: List[Tuple[List[int], List[int], List[int]]]) -> Tuple[
     torch.Tensor, torch.Tensor]:
     all_tokens = []
@@ -281,37 +275,6 @@ def compare_masked_and_individual_passes(reference_model, masked_logits, input_i
             }
 
 
-def create_document_causal_mask(document_ids: torch.Tensor) -> torch.Tensor:
-    """
-    Creates a causal attention mask that respects document boundaries.
-
-    Args:
-        document_ids: (batch_size, seq_len) tensor of document IDs, with -1 for padding
-
-    Returns:
-        (batch_size, 1, seq_len, seq_len) boolean tensor where True allows attention
-    """
-    batch_size, seq_len = document_ids.shape
-    device = document_ids.device
-
-    # Create causal mask (lower triangular)
-    causal = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
-
-    # Create document matching mask
-    # Expand dims for broadcasting: (batch, 1, seq_len) -> (batch, seq_len, seq_len)
-    doc_ids_q = document_ids.unsqueeze(2)  # (batch, seq_len, 1)
-    doc_ids_k = document_ids.unsqueeze(1)  # (batch, 1, seq_len)
-    doc_match = (doc_ids_q == doc_ids_k)
-
-    # Create padding mask
-    non_padding = document_ids.unsqueeze(-1) != -1  # (batch, seq_len, 1)
-
-    # Combine all masks
-    mask = causal & doc_match & non_padding
-
-    # Add singleton head dimension
-    return mask.unsqueeze(1)
-
 def test_advanced_document_causal_mask(num_samples: int, max_seq_length: int, batch_size: int):
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)  # Disable the math kernel to ensure flash is used
@@ -336,7 +299,7 @@ def test_advanced_document_causal_mask(num_samples: int, max_seq_length: int, ba
     input_ids = batch['input_ids'].to(device)
     labels = batch['labels'].to(device)
     document_ids = batch['document_ids'].to(device)
-    attention_mask = create_document_causal_mask(document_ids).to(device)
+    attention_mask = batch['attention_mask'].to(device)
 
     visualize_attention_mask(
         attention_mask,

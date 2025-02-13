@@ -10,7 +10,7 @@ from torch.nn.attention.flex_attention import (
 
 flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
 
-def packed_document_causal_mask(document_ids: torch.Tensor):
+def create_block_document_causal_mask(document_ids: torch.Tensor):
     batch_size, max_seq_len = document_ids.shape
     device = document_ids.device
 
@@ -29,6 +29,36 @@ def packed_document_causal_mask(document_ids: torch.Tensor):
         device=device,
     )
 
+def create_document_causal_mask(document_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Creates a causal attention mask that respects document boundaries.
+
+    Args:
+        document_ids: (batch_size, seq_len) tensor of document IDs, with -1 for padding
+
+    Returns:
+        (batch_size, 1, seq_len, seq_len) boolean tensor where True allows attention
+    """
+    batch_size, seq_len = document_ids.shape
+    device = document_ids.device
+
+    # Create causal mask (lower triangular)
+    causal = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+
+    # Create document matching mask
+    # Expand dims for broadcasting: (batch, 1, seq_len) -> (batch, seq_len, seq_len)
+    doc_ids_q = document_ids.unsqueeze(2)  # (batch, seq_len, 1)
+    doc_ids_k = document_ids.unsqueeze(1)  # (batch, 1, seq_len)
+    doc_match = (doc_ids_q == doc_ids_k)
+
+    # Create padding mask
+    non_padding = document_ids.unsqueeze(-1) != -1  # (batch, seq_len, 1)
+
+    # Combine all masks
+    mask = causal & doc_match & non_padding
+
+    # Add singleton head dimension
+    return mask.unsqueeze(1)
 
 # We cannot do nested compile, but flex attention only has perf benefits
 # when compiled. To insulate it from the compiler, we wrap it with

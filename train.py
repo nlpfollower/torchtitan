@@ -23,7 +23,7 @@ from torchtitan.float8 import Float8Handler
 from torchtitan.logging import init_logger, logger
 from torchtitan.metrics import build_device_memory_monitor, build_metric_logger
 from torchtitan.models import model_name_to_cls, model_name_to_tokenizer, models_config
-from torchtitan.models.llama.attention_utils import packed_document_causal_mask
+from torchtitan.models.llama.attention_utils import create_block_document_causal_mask
 from torchtitan.models.reference_model import build_reference_model
 from torchtitan.objective import Objective, ReferenceObjective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
@@ -137,7 +137,8 @@ def main(job_config: JobConfig):
     model_config.max_seq_len = job_config.training.seq_len
 
     logger.info(f"Building {model_name} {job_config.model.flavor} with {model_config}")
-    with set_default_dtype(torch.bfloat16), torch.device("meta"):
+    # with set_default_dtype(torch.bfloat16), torch.device("meta"):
+    with torch.device("meta"):
         model = model_cls.from_model_args(model_config)
 
     # a no-op hander if float8 is not enabled
@@ -324,7 +325,7 @@ def main(job_config: JobConfig):
             document_ids = None
             if job_config.training.use_block_attention_mask and 'document_ids' in batch:
                 document_ids = batch['document_ids'].to(device_type)
-                attention_mask = packed_document_causal_mask(document_ids).to(device)
+                attention_mask = batch['attention_mask'].to(device_type)
 
             ntokens_since_last_log += labels.numel()
             data_loading_times.append(time.perf_counter() - data_load_start)
