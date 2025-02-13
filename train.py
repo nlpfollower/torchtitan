@@ -47,9 +47,9 @@ def main(job_config: JobConfig):
     if rank == 0:
         print("Hello from rank 0")
         pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
-    # if rank == 4:
-    #     print("Hello from rank 0")
-    #     pydevd_pycharm.settrace('localhost', port=6794, stdoutToServer=True, stderrToServer=True)
+    if rank == 1:
+        print("Hello from rank 1")
+        pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
 
     if job_config.job.print_args:
         logger.info(f"Running with args: {job_config.to_dict()}")
@@ -317,7 +317,8 @@ def main(job_config: JobConfig):
         f"(warmup {job_config.training.warmup_steps})"
     )
     eval_components = {
-        'model_parts': model_parts,
+        'model': model,
+        'reference_model': reference_model,
         'eval_data_loader': eval_data_loader,
         'parallel_dims': parallel_dims,
         'pp_schedule': pp_schedule if parallel_dims.pp_enabled else None,
@@ -358,7 +359,7 @@ def main(job_config: JobConfig):
 
             # Evaluation step
             if job_config.evaluation.enabled and train_state.step % job_config.evaluation.interval == 0:
-                evaluate(model_parts, job_config, train_state.step, metric_logger)
+                evaluate(eval_components, job_config, train_state.step, metric_logger)
 
             # apply context parallelism if cp is enabled
             optional_context_parallel_ctx = (
@@ -533,7 +534,8 @@ def main(job_config: JobConfig):
 def evaluate(eval_components, job_config, current_step, metric_logger):
     logger.info(f"Starting evaluation at step {current_step}")
 
-    model_parts = eval_components['model_parts']
+    model = eval_components['model']
+    reference_model = eval_components['reference_model']
     eval_data_loader = eval_components['eval_data_loader']
     parallel_dims = eval_components['parallel_dims']
     pp_schedule = eval_components['pp_schedule']
@@ -541,52 +543,48 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     device_type = eval_components['device_type']
     world_mesh = eval_components['world_mesh']
 
-    # Set models to eval mode
-    for model in model_parts:
-        model.eval()
+    model.eval()
 
     eval_losses = []
     eval_perplexities = []
 
     eval_iterator = iter(eval_data_loader)
 
-    with torch.no_grad():
-        for _ in range(job_config.evaluation.num_samples):
-            try:
-                eval_batch = next(eval_iterator)
-            except StopIteration:
-                logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
-                eval_iterator = iter(eval_data_loader)
-                eval_batch = next(eval_iterator)
+    for _ in range(job_config.evaluation.num_samples):
+        try:
+            eval_batch = next(eval_iterator)
+        except StopIteration:
+            logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
+            eval_iterator = iter(eval_data_loader)
+            eval_batch = next(eval_iterator)
 
-            input_ids, labels = eval_batch['input_ids'], eval_batch['labels']
-            input_ids = input_ids.to(device_type)
-            labels = labels.to(device_type)
+        input_ids, labels = eval_batch['input_ids'].to(device_type), eval_batch['labels'].to(device_type)
+        attention_mask = eval_batch.get('attention_mask')
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device_type)
+        document_ids = eval_batch.get('document_ids')
+        if document_ids is not None:
+            document_ids = document_ids.to(device_type)
 
-            # Forward pass
+        with torch.no_grad():
             if parallel_dims.pp_enabled:
-                outputs = pp_schedule.forward(input_ids)
+                outputs = pp_schedule.forward(input_ids, attention_mask)
             else:
-                outputs = model_parts[0](input_ids)
+                outputs = model(input_ids, attention_mask)
 
-            # Calculate loss
-            loss = loss_fn(outputs.logits, labels)
-            eval_losses.append(loss.item())
+            reference_logits = reference_model(input_ids, attention_mask)
+            loss = loss_fn(outputs.logits, reference_logits, labels, document_ids)
 
-            # Calculate perplexity
-            perplexity = torch.exp(loss)
-            eval_perplexities.append(perplexity.item())
+        eval_losses.append(loss.item())
+        eval_perplexities.append(torch.exp(loss).item())
 
-    # Calculate average metrics
     avg_loss = sum(eval_losses) / len(eval_losses)
     avg_perplexity = sum(eval_perplexities) / len(eval_perplexities)
 
-    # Aggregate metrics across all processes if using distributed training
     if parallel_dims.dp_enabled:
         avg_loss = utils.dist_mean(avg_loss, world_mesh["dp"])
         avg_perplexity = utils.dist_mean(avg_perplexity, world_mesh["dp"])
 
-    # Log metrics
     logger.info(f"Evaluation at step {current_step}: Loss: {avg_loss:.4f}, Perplexity: {avg_perplexity:.4f}")
 
     metrics = {
@@ -595,12 +593,9 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     }
     metric_logger.log(metrics, step=current_step)
 
-    # Set models back to train mode
-    for model in model_parts:
-        model.train()
+    model.train()
 
     return avg_loss, avg_perplexity
-
 
 if __name__ == "__main__":
     # pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)

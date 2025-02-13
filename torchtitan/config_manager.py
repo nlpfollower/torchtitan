@@ -482,6 +482,12 @@ class JobConfig:
             default=100,
             help="Number of samples to evaluate on",
         )
+        self.parser.add_argument(
+            "--evaluation.batch_size",
+            type=int,
+            default=2,
+            help="Batch size",
+        )
         # checkpointing configs
         self.parser.add_argument(
             "--checkpoint.enable_checkpoint",
