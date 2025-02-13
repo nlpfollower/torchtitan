@@ -122,6 +122,19 @@ def main(job_config: JobConfig):
             dp_rank,
             device_type
         )
+        if job_config.evaluation.enabled:
+            eval_data_loader = build_custom_data_loader(
+                job_config.training.dataset_path,
+                job_config.training.dataset,
+                "test",  # Use a separate split for evaluation
+                tokenizer,
+                job_config.evaluation.batch_size,
+                job_config.training.seq_len,
+                world_size,
+                dp_rank,
+                device_type
+            )
+            eval_iterator = iter(eval_data_loader)
     else:
         raise ValueError(f"Unsupported dataset type: {job_config.training.dataset_type}")
 
@@ -303,6 +316,15 @@ def main(job_config: JobConfig):
         f"total steps {job_config.training.steps} "
         f"(warmup {job_config.training.warmup_steps})"
     )
+    eval_components = {
+        'model_parts': model_parts,
+        'eval_data_loader': eval_data_loader,
+        'parallel_dims': parallel_dims,
+        'pp_schedule': pp_schedule if parallel_dims.pp_enabled else None,
+        'loss_fn': loss_fn,
+        'device_type': device_type,
+        'world_mesh': world_mesh,
+    }
     with maybe_enable_profiling(
         job_config, global_step=train_state.step
     ) as torch_profiler, maybe_enable_memory_snapshot(
@@ -333,6 +355,10 @@ def main(job_config: JobConfig):
             input_ids = input_ids.to(device_type)
             labels = labels.to(device_type)
             optimizers.zero_grad()
+
+            # Evaluation step
+            if job_config.evaluation.enabled and train_state.step % job_config.evaluation.interval == 0:
+                evaluate(model_parts, job_config, train_state.step, metric_logger)
 
             # apply context parallelism if cp is enabled
             optional_context_parallel_ctx = (
@@ -502,6 +528,78 @@ def main(job_config: JobConfig):
 
     metric_logger.close()
     logger.info("Training completed")
+
+
+def evaluate(eval_components, job_config, current_step, metric_logger):
+    logger.info(f"Starting evaluation at step {current_step}")
+
+    model_parts = eval_components['model_parts']
+    eval_data_loader = eval_components['eval_data_loader']
+    parallel_dims = eval_components['parallel_dims']
+    pp_schedule = eval_components['pp_schedule']
+    loss_fn = eval_components['loss_fn']
+    device_type = eval_components['device_type']
+    world_mesh = eval_components['world_mesh']
+
+    # Set models to eval mode
+    for model in model_parts:
+        model.eval()
+
+    eval_losses = []
+    eval_perplexities = []
+
+    eval_iterator = iter(eval_data_loader)
+
+    with torch.no_grad():
+        for _ in range(job_config.evaluation.num_samples):
+            try:
+                eval_batch = next(eval_iterator)
+            except StopIteration:
+                logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
+                eval_iterator = iter(eval_data_loader)
+                eval_batch = next(eval_iterator)
+
+            input_ids, labels = eval_batch['input_ids'], eval_batch['labels']
+            input_ids = input_ids.to(device_type)
+            labels = labels.to(device_type)
+
+            # Forward pass
+            if parallel_dims.pp_enabled:
+                outputs = pp_schedule.forward(input_ids)
+            else:
+                outputs = model_parts[0](input_ids)
+
+            # Calculate loss
+            loss = loss_fn(outputs.logits, labels)
+            eval_losses.append(loss.item())
+
+            # Calculate perplexity
+            perplexity = torch.exp(loss)
+            eval_perplexities.append(perplexity.item())
+
+    # Calculate average metrics
+    avg_loss = sum(eval_losses) / len(eval_losses)
+    avg_perplexity = sum(eval_perplexities) / len(eval_perplexities)
+
+    # Aggregate metrics across all processes if using distributed training
+    if parallel_dims.dp_enabled:
+        avg_loss = utils.dist_mean(avg_loss, world_mesh["dp"])
+        avg_perplexity = utils.dist_mean(avg_perplexity, world_mesh["dp"])
+
+    # Log metrics
+    logger.info(f"Evaluation at step {current_step}: Loss: {avg_loss:.4f}, Perplexity: {avg_perplexity:.4f}")
+
+    metrics = {
+        "eval/loss": avg_loss,
+        "eval/perplexity": avg_perplexity,
+    }
+    metric_logger.log(metrics, step=current_step)
+
+    # Set models back to train mode
+    for model in model_parts:
+        model.train()
+
+    return avg_loss, avg_perplexity
 
 
 if __name__ == "__main__":

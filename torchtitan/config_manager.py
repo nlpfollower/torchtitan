@@ -465,6 +465,23 @@ class JobConfig:
             action="store_true",
             help="Use deterministic algorithms wherever possible, may be slower",
         )
+        self.parser.add_argument(
+            "--evaluation.enabled",
+            action="store_true",
+            help="Whether to enable periodic evaluation",
+        )
+        self.parser.add_argument(
+            "--evaluation.interval",
+            type=int,
+            default=50,
+            help="Number of training steps between evaluations",
+        )
+        self.parser.add_argument(
+            "--evaluation.num_samples",
+            type=int,
+            default=100,
+            help="Number of samples to evaluate on",
+        )
         # checkpointing configs
         self.parser.add_argument(
             "--checkpoint.enable_checkpoint",

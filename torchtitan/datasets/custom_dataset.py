@@ -83,9 +83,11 @@ class DistributedDataLoader(DataLoader):
                     input_ids = batch['input_ids'].to(self.device_type)
                     labels = batch['labels'].to(self.device_type)
                     document_ids = batch.get('document_ids')
-                    attention_mask = batch.get('attention_mask')
                     if document_ids is not None:
                         document_ids = document_ids.to(self.device_type)
+                    attention_mask = batch.get('attention_mask')
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(self.device_type)
                 except StopIteration:
                     break
             else:
