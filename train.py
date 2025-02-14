@@ -74,6 +74,12 @@ def main(job_config: JobConfig):
     device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
     device_module.set_device(device)
     utils.init_distributed(job_config)
+    logger.info(f"Torch previous num threads: {torch.get_num_threads()}")
+    num_threads = os.cpu_count()  # Set to the number of available CPU cores
+    num_threads_per_rank = max(1, num_threads // min(world_size, 8))
+    torch.set_num_threads(num_threads_per_rank)
+    logger.info(f"Torch new num threads: {torch.get_num_threads()}")
+
     # initialize device memory monitor and get peak flops for MFU calculation
     device_memory_monitor = build_device_memory_monitor()
     gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
@@ -134,7 +140,6 @@ def main(job_config: JobConfig):
                 dp_rank,
                 device_type
             )
-            eval_iterator = iter(eval_data_loader)
     else:
         raise ValueError(f"Unsupported dataset type: {job_config.training.dataset_type}")
 
@@ -568,12 +573,12 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
 
         with torch.no_grad():
             if parallel_dims.pp_enabled:
-                outputs = pp_schedule.forward(input_ids, attention_mask)
+                logits = pp_schedule.forward(input_ids, attention_mask)
             else:
-                outputs = model(input_ids, attention_mask)
+                logits = model(input_ids, attention_mask)
 
             reference_logits = reference_model(input_ids, attention_mask)
-            loss = loss_fn(outputs.logits, reference_logits, labels, document_ids)
+            loss = loss_fn(logits, reference_logits, labels, document_ids)
 
         eval_losses.append(loss.item())
         eval_perplexities.append(torch.exp(loss).item())

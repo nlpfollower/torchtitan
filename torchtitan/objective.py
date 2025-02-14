@@ -54,6 +54,7 @@ class ReferenceObjective:
         # Compute log probabilities first
         policy_log_probs = ReferenceObjective._compute_log_probs(policy_logits, labels)
         reference_log_probs = ReferenceObjective._compute_log_probs(reference_logits, labels)
+        document_ids = document_ids[:, 1:].contiguous()
 
         # Unpack the batch
         policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps = ReferenceObjective._unpack_batch(
@@ -68,6 +69,9 @@ class ReferenceObjective:
 
     @staticmethod
     def _compute_log_probs(logits, labels):
+        logits = logits[:, :-1, :].contiguous()
+        labels = labels[:, 1:].contiguous()
+
         loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
         batch_size, seq_len, vocab_size = logits.shape
         gathered_log_probs = -loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
