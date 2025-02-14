@@ -537,7 +537,7 @@ def main(job_config: JobConfig):
 
 
 def evaluate(eval_components, job_config, current_step, metric_logger):
-    logger.info(f"Starting evaluation at step {current_step}")
+    logger.info(f"Starting evaluation at step {current_step} with {job_config.evaluation.num_samples} samples")
 
     model = eval_components['model']
     reference_model = eval_components['reference_model']

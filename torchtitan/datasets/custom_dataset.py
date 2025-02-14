@@ -108,12 +108,12 @@ class DistributedDataLoader(DataLoader):
                 'attention_mask': attention_mask
             }
 
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        if self.rank == 0:
-            self.dataset.load_state_dict(state_dict)
-
     def state_dict(self) -> Dict[str, Any]:
-        return self.dataset.state_dict() if self.rank == 0 else {}
+        return self.dataset.state_dict() if self.dataset else {}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        if self.dataset:
+            self.dataset.load_state_dict(state_dict)
 
 class DummyDataset(IterableDataset):
     def __iter__(self):

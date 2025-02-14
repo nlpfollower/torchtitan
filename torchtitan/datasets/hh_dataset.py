@@ -26,6 +26,7 @@ class HHDataset(IterableDataset):
         self.batch_size = batch_size
         self.chat_format = ChatFormat(tokenizer)
         self.batches = self.load_and_batch_data(split, cache_dir)
+        self._sample_idx = 0
 
     def load_and_batch_data(self, split: str, cache_dir: str) -> List[Dict[str, torch.Tensor]]:
         print(f'Loading HH dataset ({split} split) from Huggingface...')
@@ -181,7 +182,15 @@ class HHDataset(IterableDataset):
         return len(self.batches)
 
     def __iter__(self) -> Iterator[Dict[str, any]]:
-        return iter(self.batches)
+        for i, batch in enumerate(self.batches[self._sample_idx:]):
+            self._sample_idx += 1
+            yield batch
+
+    def state_dict(self):
+        return {"sample_idx": self._sample_idx}
+
+    def load_state_dict(self, state_dict):
+        self._sample_idx = state_dict["sample_idx"]
 
 def build_hh_data_loader(
     tokenizer: Tokenizer,
