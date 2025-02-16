@@ -351,6 +351,121 @@ def test_advanced_document_causal_mask(num_samples: int, max_seq_length: int, ba
 
     return avg_diff, max_diff, num_mismatches
 
+def compare_masked_and_individual_passes_sft(reference_model, masked_logits, input_ids, document_ids, labels, device):
+    for b in range(input_ids.shape[0]):
+        sample_input_ids = input_ids[b]
+        sample_document_ids = document_ids[b]
+        sample_labels = labels[b]
+
+        unique_doc_ids = torch.unique(sample_document_ids)
+        unique_doc_ids = unique_doc_ids[unique_doc_ids != -1]  # Remove padding document ID
+
+        for doc_id in unique_doc_ids:
+            sample_mask = (sample_document_ids == doc_id)
+            sample_input = sample_input_ids[sample_mask]
+
+            start = time.perf_counter_ns()
+            with torch.no_grad():
+                individual_logits = reference_model(sample_input.unsqueeze(0), None)[0]
+                torch.cuda.synchronize()
+            individual_time = (time.perf_counter_ns() - start) / 1e6  # ms
+
+            masked_sample = masked_logits[b, sample_mask]
+
+            diff = torch.abs(masked_sample - individual_logits)
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+
+            mismatch = (masked_sample.argmax(dim=-1) != individual_logits.argmax(dim=-1)).sum().item()
+
+            total_tokens = len(sample_input)
+
+            yield {
+                "batch": b,
+                "sample": doc_id.item(),
+                "max_diff": max_diff,
+                "mean_diff": mean_diff,
+                "mismatches": mismatch,
+                "total_tokens": total_tokens,
+                "individual_time": individual_time
+            }
+
+def test_advanced_document_causal_mask_sft(num_samples: int, max_seq_length: int, batch_size: int):
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)  # Disable the math kernel to ensure flash is used
+
+    device, device_type = setup_environment()
+    job_config = create_job_config()
+    job_config.model.attention = "sdpa"
+    parallel_dims = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, world_size=1, enable_loss_parallel=False)
+    world_mesh = parallel_dims.build_mesh(device_type)
+    tokenizer = build_tokenizer("llama", job_config.model.tokenizer_path)
+    reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+
+    # Create the dataloader with "sft" mode
+    dataloader = build_hh_data_loader(tokenizer, batch_size, max_seq_length, split="train", mode="sft")
+
+    total_diff = 0
+    max_diff = 0
+    num_mismatches = 0
+    total_tokens = 0
+    samples_processed = 0
+
+    batch = next(iter(dataloader))
+    input_ids = batch['input_ids'].to(device)
+    labels = batch['labels'].to(device)
+    document_ids = batch['document_ids'].to(device)
+    attention_mask = batch['attention_mask'].to(device)
+
+    visualize_attention_mask(
+        attention_mask,
+        batch_idx=0,
+        save_path="attention_mask_sft.png",
+        title="Document Causal Mask (SFT Mode)"
+    )
+
+    # Warmup pass
+    with torch.no_grad():
+        _ = reference_model(input_ids, attention_mask)
+        _ = reference_model(input_ids[0:1], None)  # Single sample without mask
+    torch.cuda.synchronize()
+
+    # Measure masked forward pass
+    start = time.perf_counter_ns()
+    with torch.no_grad():
+        masked_logits = reference_model(input_ids, attention_mask)
+    torch.cuda.synchronize()
+    masked_time = (time.perf_counter_ns() - start) / 1e6  # Convert to milliseconds
+
+    comparison_results = compare_masked_and_individual_passes_sft(
+        reference_model, masked_logits, input_ids, document_ids, labels, device
+    )
+
+    total_individual_time = 0
+    for result in comparison_results:
+        logger.info(f"Batch {result['batch'] + 1}, Sample {result['sample'] + 1}:")
+        logger.info(f"  Max diff: {result['max_diff']:.6f}, Mean diff: {result['mean_diff']:.6f}, Mismatches: {result['mismatches']}")
+
+        total_individual_time += result['individual_time']
+        total_diff += result['mean_diff']
+        max_diff = max(max_diff, result['max_diff'])
+        num_mismatches += result['mismatches']
+        total_tokens += result['total_tokens']
+        samples_processed += 1
+    avg_diff = total_diff / samples_processed
+
+    logger.info("\nPerformance Summary:")
+    logger.info(f"Masked batch forward time: {masked_time:.2f}ms")
+    logger.info(f"Total individual passes time: {total_individual_time:.2f}ms")
+
+    logger.info("\nAccuracy Summary:")
+    logger.info(f"Test completed. Average difference: {avg_diff:.6f}, Max difference: {max_diff:.6f}")
+    logger.info(f"Total token prediction mismatches: {num_mismatches}")
+    logger.info(f"Total tokens processed: {total_tokens}")
+    dist.destroy_process_group()
+
+    return avg_diff, max_diff, num_mismatches
+
 def test_hh_mask_advanced():
     device, device_type = setup_environment()
     job_config = create_job_config()
@@ -634,7 +749,8 @@ if __name__ == "__main__":
     # pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     init_logger()
     logger.info("Starting HH dataset tests")
-    test_advanced_document_causal_mask(num_samples=50, max_seq_length=8192, batch_size=4)
+    test_advanced_document_causal_mask_sft(num_samples=50, max_seq_length=8192, batch_size=4)
+    # test_advanced_document_causal_mask(num_samples=50, max_seq_length=8192, batch_size=4)
     # test_sdpa_mask_equivalence()
     # test_hh_mask_advanced()
     # test_hh_mask()

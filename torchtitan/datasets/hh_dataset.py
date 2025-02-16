@@ -20,11 +20,14 @@ def extract_anthropic_prompt(prompt_and_response: str) -> str:
     return prompt_and_response[:search_term_idx + len(search_term)]
 
 class HHDataset(IterableDataset):
-    def __init__(self, tokenizer: Tokenizer, split: str = "train", seq_len: int = 2048, batch_size: int = 1, cache_dir: str = None):
+    def __init__(self, tokenizer: Tokenizer, split: str = "train", seq_len: int = 2048, batch_size: int = 1, cache_dir: str = None, mode: str = "align"):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.batch_size = batch_size
         self.chat_format = ChatFormat(tokenizer)
+        self.mode = mode
+        if mode not in ["align", "sft"]:
+            raise ValueError("Mode must be either 'align' or 'sft'")
         self.batches = self.load_and_batch_data(split, cache_dir)
         self._sample_idx = 0
 
@@ -66,7 +69,7 @@ class HHDataset(IterableDataset):
             current_sample["document_ids"].extend([id + current_doc_id for id in sample["document_ids"]])
 
             current_length += len(sample['input_ids'])
-            current_doc_id += 2
+            current_doc_id += 1 if self.mode == "sft" else 2
 
         # Handle any remaining data
         if current_sample["input_ids"]:
@@ -145,9 +148,14 @@ class HHDataset(IterableDataset):
         return prompt_tokens, chosen_tokens, rejected_tokens
 
     def process_sample(self, prompt: List[int], chosen: List[int], rejected: List[int]) -> Dict[str, List[int]]:
-        input_ids = prompt + chosen + prompt + rejected
-        labels = [-100] * len(prompt) + chosen + [-100] * len(prompt) + rejected
-        document_ids = [0] * (len(prompt) + len(chosen)) + [1] * (len(prompt) + len(rejected))
+        if self.mode == "align":
+            input_ids = prompt + chosen + prompt + rejected
+            labels = [-100] * len(prompt) + chosen + [-100] * len(prompt) + rejected
+            document_ids = [0] * (len(prompt) + len(chosen)) + [1] * (len(prompt) + len(rejected))
+        else:  # sft mode
+            input_ids = prompt + chosen
+            labels = [-100] * len(prompt) + chosen
+            document_ids = [0] * (len(prompt) + len(chosen))
 
         return {
             "input_ids": input_ids,
@@ -199,8 +207,9 @@ def build_hh_data_loader(
     split: str = "train",
     num_workers: int = 0,
     cache_dir: str = None,
+    mode: str = "align",
 ) -> DataLoader:
-    dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size, cache_dir=cache_dir)
+    dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size, cache_dir=cache_dir, mode=mode)
     return DataLoader(
         dataset,
         batch_size=None,  # We've already handled batching in the dataset

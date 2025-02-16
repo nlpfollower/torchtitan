@@ -7,6 +7,7 @@ from aiohttp.web_routedef import static
 from torch import nn
 
 from torchtitan.datasets import build_tokenizer
+from torchtitan.logging import logger
 
 
 class Objective:
@@ -16,12 +17,14 @@ class Objective:
             return Objective.default_loss
         elif loss_type == "classification":
             return Objective.classification_loss
+        elif loss_type == "classification_with_packing":
+            return Objective.classification_loss_with_packing
         else:
             raise ValueError(f"Unsupported loss function: {loss_type}")
 
     @staticmethod
     def default_loss(pred, labels):
-        return torch.nn.functional.cross_entropy(
+        return F.cross_entropy(
             pred.flatten(0, 1).float(), labels.flatten(0, 1)
         )
 
@@ -32,14 +35,55 @@ class Objective:
         shifted_labels = labels[:, 1:].contiguous()
 
         # Use built-in ignore_index. CrossEntropy already excludes -100 labels from loss.
-        loss = F.cross_entropy(
+        loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
+        loss = loss_fn(
             shifted_logits.view(-1, shifted_logits.size(-1)),
             shifted_labels.view(-1),
-            ignore_index=-100,  # Skip the -100 tokens
-            reduction="mean"  # or "sum" if you want control over scaling
         )
 
         return loss
+
+    @staticmethod
+    def classification_loss_with_packing(logits: torch.Tensor, labels: torch.Tensor,
+                                         document_ids: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, vocab_size = logits.shape
+
+        # Shift and flatten tensors
+        shifted_logits = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+        shifted_labels = labels[:, 1:].contiguous().view(-1)
+        shifted_document_ids = document_ids[:, 1:].contiguous().view(-1)
+
+        # Compute loss
+        loss = F.cross_entropy(shifted_logits, shifted_labels, reduction='none', ignore_index=-100)
+
+        # Reshape loss and document_ids to include batch dimension
+        loss = loss.view(batch_size, -1)
+
+        # Compute mean loss for each document in each batch
+        batch_losses = []
+        for b in range(batch_size):
+            unique_docs = torch.unique(document_ids[b])
+            unique_docs = unique_docs[unique_docs != -1]  # Remove padding document ID
+            doc_losses = []
+
+            for doc_id in unique_docs:
+                # Create mask for the current document, considering the shift in loss
+                doc_mask = (document_ids[b, 1:] == doc_id)
+                label_mask = (shifted_labels.view(batch_size, -1)[b] != -100)
+                combined_mask = doc_mask & label_mask
+
+                # Apply the combined mask to the loss
+                masked_loss = loss[b][combined_mask]
+                if masked_loss.numel() > 0:
+                    doc_loss = masked_loss.mean()
+                else:
+                    doc_loss = torch.tensor(0.0, device=loss.device)
+                doc_losses.append(doc_loss)
+
+            batch_loss = torch.stack(doc_losses).mean() if doc_losses else torch.tensor(0.0, device=logits.device)
+            batch_losses.append(batch_loss)
+
+        return torch.stack(batch_losses).mean()
 
 class ReferenceObjective:
     @staticmethod

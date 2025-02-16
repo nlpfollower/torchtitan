@@ -119,6 +119,12 @@ class DummyDataset(IterableDataset):
     def __iter__(self):
         return iter([])
 
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state_dict):
+        pass
+
 def build_custom_data_loader(
     data_dir: str,
     dataset: str,
