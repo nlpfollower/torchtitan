@@ -339,6 +339,7 @@ def main(job_config: JobConfig):
     ) as torch_profiler, maybe_enable_memory_snapshot(
         job_config, global_step=train_state.step
     ) as memory_profiler:
+        is_dataset_exhausted = False
         while train_state.step < job_config.training.steps:
             train_state.step += 1
             gc_handler.run(train_state.step)
@@ -349,6 +350,7 @@ def main(job_config: JobConfig):
                 batch = next(data_iterator)
             except StopIteration:
                 logger.warning("DataLoader has exhausted its data. Ending training.")
+                is_dataset_exhausted = True
                 break
 
             input_ids, labels = batch['input_ids'], batch['labels']
@@ -513,9 +515,9 @@ def main(job_config: JobConfig):
                 time_last_log = time.perf_counter()
                 device_memory_monitor.reset_peak_stats()
 
-            checkpoint.save(
-                train_state.step, force=(train_state.step == job_config.training.steps)
-            )
+            # save checkpoint. If train step reaches upper bound, skip because it will be saved at the end
+            if train_state.step < job_config.training.steps:
+                checkpoint.save(train_state.step)
 
             # signal the profiler that the next profiling step has started
             if torch_profiler:
@@ -530,6 +532,19 @@ def main(job_config: JobConfig):
                     timeout=timedelta(seconds=job_config.comm.train_timeout_seconds),
                     world_mesh=world_mesh,
                 )
+
+        if is_dataset_exhausted or train_state.step >= job_config.training.steps:
+            logger.info("End of training reached.")
+
+            # Run final evaluation if enabled
+            if job_config.evaluation.enabled:
+                logger.info("Running final evaluation...")
+                final_loss, final_perplexity = evaluate(eval_components, job_config, train_state.step, metric_logger)
+                logger.info(f"Final evaluation results - Loss: {final_loss:.4f}, Perplexity: {final_perplexity:.4f}")
+
+            # Save final checkpoint
+            logger.info("Saving final checkpoint...")
+            checkpoint.save(train_state.step, force=True, is_final=True)
 
     if torch.distributed.get_rank() == 0:
         logger.info("Sleeping 2 seconds for other ranks to complete")

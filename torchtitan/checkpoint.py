@@ -242,10 +242,12 @@ class CheckpointManager:
     def reset(self) -> None:
         self.begin_time = time.monotonic()
 
-    def _create_checkpoint_id(self, step: int) -> str:
+    def _create_checkpoint_id(self, step: int, is_final: bool = False) -> str:
+        if is_final:
+            return os.path.join(self.folder, "step-final")
         return os.path.join(self.folder, f"step-{step}")
 
-    def _save_last_step(self, curr_step: int) -> None:
+    def _save_last_step(self, curr_step: int, is_final: bool = False) -> None:
         # We only consider saving weights only at the end of the training. So
         # this won't affect preemption and training resume. We also only allow
         # dtype conversion when we are checkpoint model weights only and the
@@ -272,9 +274,9 @@ class CheckpointManager:
                 f"at last step, step {curr_step}."
             )
         else:
-            logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")
+            logger.info(f"Saving a full checkpoint at {'final' if is_final else 'last'} step, step {curr_step}.")
 
-        dcp.save(self.states, checkpoint_id=self._create_checkpoint_id(curr_step))
+        dcp.save(self.states, checkpoint_id=self._create_checkpoint_id(curr_step, is_final))
         self.reset()
 
     def _should_save(self, curr_step: int, force: bool = False) -> bool:
@@ -350,7 +352,7 @@ class CheckpointManager:
             self.staging = True
             self.staging_id = checkpoint_id
 
-    def save(self, curr_step: int, force: bool = False) -> None:
+    def save(self, curr_step: int, force: bool = False, is_final: bool = False) -> None:
         """
         force = True will force the checkpoint to be saved, even if the interval
         has not been reached.
@@ -361,10 +363,10 @@ class CheckpointManager:
             return
 
         begin = time.monotonic()
-        checkpoint_id = self._create_checkpoint_id(curr_step)
+        checkpoint_id = self._create_checkpoint_id(curr_step, is_final)
         self._async_wait()
         if force:
-            self._save_last_step(curr_step)
+            self._save_last_step(curr_step, is_final)
         elif self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
             self._async_with_pinned_memory(checkpoint_id)
         elif self.async_mode == AsyncMode.ASYNC:
@@ -456,9 +458,12 @@ class CheckpointManager:
         if self.keep_latest_k > 0:
             discovered_checkpoints = []
             for filename in os.listdir(self.folder):
+                if filename == "step-final":
+                    continue  # Skip the final checkpoint
                 match = re.search(r"step-(\d+)", filename)
-                path = os.path.join(self.folder, filename)
-                discovered_checkpoints.append((int(match.group(1)), path))
+                if match:
+                    path = os.path.join(self.folder, filename)
+                    discovered_checkpoints.append((int(match.group(1)), path))
 
             discovered_checkpoints.sort()
             to_delete = discovered_checkpoints[: -1 * self.keep_latest_k]
