@@ -331,6 +331,8 @@ def main(job_config: JobConfig):
         'parallel_dims': parallel_dims,
         'pp_schedule': pp_schedule if parallel_dims.pp_enabled else None,
         'loss_fn': loss_fn,
+        'world_size': world_size,
+        'rank': dp_rank,
         'device_type': device_type,
         'world_mesh': world_mesh,
     }
@@ -349,7 +351,7 @@ def main(job_config: JobConfig):
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
                 if batch == "end":
-                    is_dataset_exhausted[rank] = True
+                    is_dataset_exhausted[dp_rank] = True
                 torch.distributed.all_reduce(is_dataset_exhausted)
                 if torch.any(is_dataset_exhausted):
                     logger.info(f"Rank {rank}: All ranks have exhausted their data. Ending training.")
@@ -540,7 +542,7 @@ def main(job_config: JobConfig):
                 )
 
         torch.distributed.barrier()
-        if is_dataset_exhausted or train_state.step >= job_config.training.steps:
+        if torch.any(is_dataset_exhausted) or train_state.step >= job_config.training.steps:
             logger.info("End of training reached.")
 
             # Run final evaluation if enabled
@@ -570,6 +572,8 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     parallel_dims = eval_components['parallel_dims']
     pp_schedule = eval_components['pp_schedule']
     loss_fn = eval_components['loss_fn']
+    rank = eval_components['rank']
+    world_size = eval_components['world_size']
     device_type = eval_components['device_type']
     world_mesh = eval_components['world_mesh']
 
@@ -579,14 +583,19 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     eval_perplexities = []
 
     eval_iterator = iter(eval_data_loader)
-
+    is_eval_exhausted = torch.zeros(world_size, dtype=torch.bool, device=device_type)
     for _ in range(job_config.evaluation.num_samples):
         try:
             eval_batch = next(eval_iterator)
+            if eval_batch == "end":
+                is_eval_exhausted[rank] = True
+            torch.distributed.all_reduce(is_eval_exhausted)
+            if torch.any(is_eval_exhausted):
+                logger.info(f"Rank {parallel_dims.rank}: Evaluation data exhausted. Ending evaluation.")
+                break
         except StopIteration:
             logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
-            eval_iterator = iter(eval_data_loader)
-            eval_batch = next(eval_iterator)
+            break
 
         input_ids, labels = eval_batch['input_ids'].to(device_type), eval_batch['labels'].to(device_type)
         attention_mask = eval_batch.get('attention_mask')
