@@ -580,8 +580,8 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
             else:
                 logits = model(input_ids, attention_mask)
 
-            reference_logits = reference_model(input_ids, attention_mask)
             if job_config.reference_model.enabled:
+                reference_logits = reference_model(input_ids, attention_mask)
                 loss = loss_fn(logits, reference_logits, labels, document_ids)
             else:
                 loss = loss_fn(logits, labels, document_ids)
