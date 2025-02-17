@@ -44,12 +44,12 @@ def main(job_config: JobConfig):
     local_rank = int(os.environ.get("LOCAL_RANK"))
     rank = int(os.environ.get("RANK"))
     logger.info(f"rank {rank} and local rank {local_rank}")
-    if rank == 0:
-        print("Hello from rank 0")
-        pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
-    if rank == 1:
-        print("Hello from rank 1")
-        pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
+    # if rank == 0:
+    #     print("Hello from rank 0")
+    #     pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
+    # if rank == 1:
+    #     print("Hello from rank 1")
+    #     pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
 
     if job_config.job.print_args:
         logger.info(f"Running with args: {job_config.to_dict()}")
@@ -259,6 +259,7 @@ def main(job_config: JobConfig):
 
     checkpoint.load(step=job_config.checkpoint.load_step)
     metric_logger = build_metric_logger(job_config, parallel_dims)
+    reference_model = None
 
     if job_config.reference_model.enabled:
         reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
