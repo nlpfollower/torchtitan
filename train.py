@@ -126,7 +126,8 @@ def main(job_config: JobConfig):
             job_config.training.seq_len,
             world_size,
             dp_rank,
-            device_type
+            device_type,
+            mode=job_config.training.dataset_mode
         )
         if job_config.evaluation.enabled:
             eval_data_loader = build_custom_data_loader(
@@ -138,7 +139,8 @@ def main(job_config: JobConfig):
                 job_config.training.seq_len,
                 world_size,
                 dp_rank,
-                device_type
+                device_type,
+                mode=job_config.training.dataset_mode
             )
     else:
         raise ValueError(f"Unsupported dataset type: {job_config.training.dataset_type}")
@@ -409,7 +411,7 @@ def main(job_config: JobConfig):
                     if job_config.reference_model.enabled:
                         loss = loss_fn(logits, reference_logits, labels, document_ids)
                     else:
-                        loss = loss_fn(logits, labels)
+                        loss = loss_fn(logits, labels, document_ids)
                     # pred.shape=(bs, seq_len, vocab_size)
                     # need to free to before bwd to avoid peaking memory
                     del logits
@@ -578,7 +580,10 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                 logits = model(input_ids, attention_mask)
 
             reference_logits = reference_model(input_ids, attention_mask)
-            loss = loss_fn(logits, reference_logits, labels, document_ids)
+            if job_config.reference_model.enabled:
+                loss = loss_fn(logits, reference_logits, labels, document_ids)
+            else:
+                loss = loss_fn(logits, labels, document_ids)
 
         eval_losses.append(loss.item())
         eval_perplexities.append(torch.exp(loss).item())

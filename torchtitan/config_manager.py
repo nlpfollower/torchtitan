@@ -212,6 +212,13 @@ class JobConfig:
             choices=["huggingface", "custom"],
             help="Type of dataset to use (huggingface or custom)",
         )
+        self.parser.add_argument(
+            "--training.dataset_mode",
+            type=str,
+            default="sft",
+            choices=["align", "sft"],
+            help="Dataset mode: 'align' for preference pairs, 'sft' for single completions"
+        )
 
         self.parser.add_argument(
             "--training.dataset", type=str, default="c4_mini", help="Dataset to use"

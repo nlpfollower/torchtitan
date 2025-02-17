@@ -207,7 +207,7 @@ def build_hh_data_loader(
     split: str = "train",
     num_workers: int = 0,
     cache_dir: str = None,
-    mode: str = "align",
+    mode: str = "sft",
 ) -> DataLoader:
     dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size, cache_dir=cache_dir, mode=mode)
     return DataLoader(

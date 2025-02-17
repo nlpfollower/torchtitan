@@ -51,7 +51,6 @@ class Objective:
         # Shift and flatten tensors
         shifted_logits = logits[:, :-1, :].contiguous().view(-1, vocab_size)
         shifted_labels = labels[:, 1:].contiguous().view(-1)
-        shifted_document_ids = document_ids[:, 1:].contiguous().view(-1)
 
         # Compute loss
         loss = F.cross_entropy(shifted_logits, shifted_labels, reduction='none', ignore_index=-100)

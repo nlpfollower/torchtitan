@@ -137,12 +137,13 @@ def build_custom_data_loader(
     device_type: str,
     num_workers: int = 0,
     shuffle: bool = False,
+    mode: str = "align",
 ) -> 'DistributedDataLoader':
     if rank == 0:
         if dataset == "mmlu":
             dataset = MMLUDataset(data_dir, split, tokenizer)
         elif dataset == "hh":
-            dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size)
+            dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size, mode=mode)
         else:
             raise ValueError(f"Unsupported custom dataset: {dataset}")
     else:
