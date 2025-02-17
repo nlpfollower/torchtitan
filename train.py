@@ -591,7 +591,7 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                 is_eval_exhausted[rank] = True
             torch.distributed.all_reduce(is_eval_exhausted)
             if torch.any(is_eval_exhausted):
-                logger.info(f"Rank {parallel_dims.rank}: Evaluation data exhausted. Ending evaluation.")
+                logger.info(f"Rank {rank}: Evaluation data exhausted. Ending evaluation.")
                 break
         except StopIteration:
             logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
