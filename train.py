@@ -341,6 +341,22 @@ def main(job_config: JobConfig):
     ) as memory_profiler:
         is_dataset_exhausted = False
         while train_state.step < job_config.training.steps:
+            # Check if any rank has already exhausted its iterator.
+            exhausted_flag = torch.tensor(1 if is_dataset_exhausted else 0, device=device)
+            torch.distributed.all_reduce(exhausted_flag, op=torch.distributed.ReduceOp.MAX)
+            if exhausted_flag.item() == 1:
+                # Drain any extra queued batch(es) (we expect at most one).
+                extra_batches = 0
+                while True:
+                    try:
+                        _ = next(data_iterator)
+                        extra_batches += 1
+                    except StopIteration:
+                        break
+                if extra_batches > 1:
+                    logger.warning(f"More than one extra batch queued: {extra_batches}")
+                break  # Exit the training loop on all ranks
+
             train_state.step += 1
             gc_handler.run(train_state.step)
 
