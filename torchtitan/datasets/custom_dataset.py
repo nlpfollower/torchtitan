@@ -78,6 +78,7 @@ class DistributedDataLoader(DataLoader):
     def __iter__(self):
         for batch in self.dataset:
             yield {k: v.to(self.device_type) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        yield "end"
 
     def state_dict(self) -> Dict[str, Any]:
         return self.dataset.state_dict() if self.dataset else {}

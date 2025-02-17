@@ -339,24 +339,8 @@ def main(job_config: JobConfig):
     ) as torch_profiler, maybe_enable_memory_snapshot(
         job_config, global_step=train_state.step
     ) as memory_profiler:
-        is_dataset_exhausted = False
+        is_dataset_exhausted = torch.zeros(world_size, dtype=torch.bool, device=device)
         while train_state.step < job_config.training.steps:
-            # Check if any rank has already exhausted its iterator.
-            exhausted_flag = torch.tensor(1 if is_dataset_exhausted else 0, device=device)
-            torch.distributed.all_reduce(exhausted_flag, op=torch.distributed.ReduceOp.MAX)
-            if exhausted_flag.item() == 1:
-                # Drain any extra queued batch(es) (we expect at most one).
-                extra_batches = 0
-                while True:
-                    try:
-                        _ = next(data_iterator)
-                        extra_batches += 1
-                    except StopIteration:
-                        break
-                if extra_batches > 1:
-                    logger.warning(f"More than one extra batch queued: {extra_batches}")
-                break  # Exit the training loop on all ranks
-
             train_state.step += 1
             gc_handler.run(train_state.step)
 
@@ -364,9 +348,15 @@ def main(job_config: JobConfig):
                 # get batch
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
+                if batch == "end":
+                    is_dataset_exhausted[rank] = True
+                torch.distributed.all_reduce(is_dataset_exhausted)
+                if torch.any(is_dataset_exhausted):
+                    logger.info(f"Rank {rank}: All ranks have exhausted their data. Ending training.")
+                    break
+
             except StopIteration:
                 logger.warning("DataLoader has exhausted its data. Ending training.")
-                is_dataset_exhausted = True
                 break
 
             input_ids, labels = batch['input_ids'], batch['labels']
@@ -549,6 +539,7 @@ def main(job_config: JobConfig):
                     world_mesh=world_mesh,
                 )
 
+        torch.distributed.barrier()
         if is_dataset_exhausted or train_state.step >= job_config.training.steps:
             logger.info("End of training reached.")
 
