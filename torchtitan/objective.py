@@ -133,61 +133,52 @@ class ReferenceObjective:
 
         # Process each batch item separately
         max_chosen, max_rejected = 0, 0
-        chosen_counts, rejected_counts = [], []
+        policy_chosen_logps, policy_rejected_logps = [], []
+        reference_chosen_logps, reference_rejected_logps = [], []
 
         for i in range(batch_size):
-            unique_docs, counts = torch.unique(document_ids[i][document_ids[i] != -1], return_counts=True)
-            batch_chosen_counts = counts[unique_docs % 2 == 0]
-            batch_rejected_counts = counts[unique_docs % 2 == 1]
+            batch_chosen_mask = chosen_mask[i]
+            batch_rejected_mask = rejected_mask[i]
 
-            chosen_counts.append(batch_chosen_counts)
-            rejected_counts.append(batch_rejected_counts)
+            if batch_chosen_mask.any():
+                chosen_doc_ids = document_ids[i][batch_chosen_mask]
+                unique_chosen_docs, chosen_counts = torch.unique(chosen_doc_ids, return_counts=True)
+                max_chosen = max(max_chosen, chosen_counts.max().item())
 
-            max_chosen = max(max_chosen, batch_chosen_counts.max().item())
-            max_rejected = max(max_rejected, batch_rejected_counts.max().item())
+                chosen_splits = torch.split(policy_log_probs[i, batch_chosen_mask], chosen_counts.tolist())
+                ref_chosen_splits = torch.split(reference_log_probs[i, batch_chosen_mask], chosen_counts.tolist())
 
-        # Initialize lists for chosen and rejected log probabilities
-        policy_chosen_logps = []
-        policy_rejected_logps = []
-        reference_chosen_logps = []
-        reference_rejected_logps = []
+                for split, ref_split in zip(chosen_splits, ref_chosen_splits):
+                    if average_logprobs:
+                        policy_chosen_logps.append(split.mean())
+                        reference_chosen_logps.append(ref_split.mean())
+                    else:
+                        policy_chosen_logps.append(split.sum())
+                        reference_chosen_logps.append(ref_split.sum())
+            else:
+                # Handle empty chosen samples
+                policy_chosen_logps.append(torch.tensor(0.0, device=device))
+                reference_chosen_logps.append(torch.tensor(0.0, device=device))
 
-        # Unpack the samples
-        for i in range(batch_size):
-            chosen_doc_ids = document_ids[i][chosen_mask[i]]
-            rejected_doc_ids = document_ids[i][rejected_mask[i]]
+            if batch_rejected_mask.any():
+                rejected_doc_ids = document_ids[i][batch_rejected_mask]
+                unique_rejected_docs, rejected_counts = torch.unique(rejected_doc_ids, return_counts=True)
+                max_rejected = max(max_rejected, rejected_counts.max().item())
 
-            unique_chosen_docs, chosen_counts_per_doc = torch.unique(chosen_doc_ids, return_counts=True)
-            unique_rejected_docs, rejected_counts_per_doc = torch.unique(rejected_doc_ids, return_counts=True)
+                rejected_splits = torch.split(policy_log_probs[i, batch_rejected_mask], rejected_counts.tolist())
+                ref_rejected_splits = torch.split(reference_log_probs[i, batch_rejected_mask], rejected_counts.tolist())
 
-            chosen_splits = torch.split(policy_log_probs[i, chosen_mask[i]], chosen_counts_per_doc.tolist())
-            rejected_splits = torch.split(policy_log_probs[i, rejected_mask[i]], rejected_counts_per_doc.tolist())
-
-            ref_chosen_splits = torch.split(reference_log_probs[i, chosen_mask[i]], chosen_counts_per_doc.tolist())
-            ref_rejected_splits = torch.split(reference_log_probs[i, rejected_mask[i]],
-                                              rejected_counts_per_doc.tolist())
-
-            for split, ref_split in zip(chosen_splits, ref_chosen_splits):
-                if average_logprobs:
-                    non_zero_mask = split != 0
-                    policy_chosen_logps.append(
-                        split[non_zero_mask].mean() if non_zero_mask.any() else torch.tensor(0.0, device=device))
-                    reference_chosen_logps.append(
-                        ref_split[non_zero_mask].mean() if non_zero_mask.any() else torch.tensor(0.0, device=device))
-                else:
-                    policy_chosen_logps.append(split.sum())
-                    reference_chosen_logps.append(ref_split.sum())
-
-            for split, ref_split in zip(rejected_splits, ref_rejected_splits):
-                if average_logprobs:
-                    non_zero_mask = split != 0
-                    policy_rejected_logps.append(
-                        split[non_zero_mask].mean() if non_zero_mask.any() else torch.tensor(0.0, device=device))
-                    reference_rejected_logps.append(
-                        ref_split[non_zero_mask].mean() if non_zero_mask.any() else torch.tensor(0.0, device=device))
-                else:
-                    policy_rejected_logps.append(split.sum())
-                    reference_rejected_logps.append(ref_split.sum())
+                for split, ref_split in zip(rejected_splits, ref_rejected_splits):
+                    if average_logprobs:
+                        policy_rejected_logps.append(split.mean())
+                        reference_rejected_logps.append(ref_split.mean())
+                    else:
+                        policy_rejected_logps.append(split.sum())
+                        reference_rejected_logps.append(ref_split.sum())
+            else:
+                # Handle empty rejected samples
+                policy_rejected_logps.append(torch.tensor(0.0, device=device))
+                reference_rejected_logps.append(torch.tensor(0.0, device=device))
 
         return (
             torch.stack(policy_chosen_logps),

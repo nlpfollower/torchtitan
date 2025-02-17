@@ -54,7 +54,7 @@ class CustomIterableDataset(IterableDataset, Stateful):
 class DistributedDataLoader(DataLoader):
     def __init__(
         self,
-        dataset: Optional[IterableDataset],
+        dataset: IterableDataset,
         batch_size: int,
         seq_len: int,
         world_size: int,
@@ -66,9 +66,9 @@ class DistributedDataLoader(DataLoader):
         self.batch_size = batch_size
         self.seq_len = seq_len
         super().__init__(
-            dataset if rank == 0 else DummyDataset(),
-            batch_size=batch_size,
-            num_workers=num_workers if rank == 0 else 0,
+            dataset,
+            batch_size=None,  # We've already handled batching in the dataset
+            num_workers=num_workers,
             shuffle=shuffle,
         )
         self.world_size = world_size
@@ -76,37 +76,8 @@ class DistributedDataLoader(DataLoader):
         self.device_type = device_type
 
     def __iter__(self):
-        while True:
-            if self.rank == 0:
-                try:
-                    batch = next(iter(self.dataset))
-                    input_ids = batch['input_ids'].to(self.device_type)
-                    labels = batch['labels'].to(self.device_type)
-                    document_ids = batch.get('document_ids')
-                    if document_ids is not None:
-                        document_ids = document_ids.to(self.device_type)
-                    attention_mask = batch.get('attention_mask')
-                    if attention_mask is not None:
-                        attention_mask = attention_mask.to(self.device_type)
-                except StopIteration:
-                    break
-            else:
-                input_ids = torch.empty((self.batch_size, self.seq_len), dtype=torch.long).to(self.device_type)
-                labels = torch.empty_like(input_ids).to(self.device_type)
-                document_ids = torch.empty_like(input_ids).to(self.device_type)
-                attention_mask = torch.empty((self.batch_size, 1, self.seq_len, self.seq_len), dtype=torch.bool).to(self.device_type)
-
-            broadcast(input_ids, src=0)
-            broadcast(labels, src=0)
-            broadcast(document_ids, src=0)
-            broadcast(attention_mask, src=0)
-
-            yield {
-                'input_ids': input_ids,
-                'labels': labels,
-                'document_ids': document_ids,
-                'attention_mask': attention_mask
-            }
+        for batch in self.dataset:
+            yield {k: v.to(self.device_type) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     def state_dict(self) -> Dict[str, Any]:
         return self.dataset.state_dict() if self.dataset else {}
@@ -139,15 +110,12 @@ def build_custom_data_loader(
     shuffle: bool = False,
     mode: str = "align",
 ) -> 'DistributedDataLoader':
-    if rank == 0:
-        if dataset == "mmlu":
-            dataset = MMLUDataset(data_dir, split, tokenizer)
-        elif dataset == "hh":
-            dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size, mode=mode)
-        else:
-            raise ValueError(f"Unsupported custom dataset: {dataset}")
+    if dataset == "mmlu":
+        dataset = MMLUDataset(data_dir, split, tokenizer)
+    elif dataset == "hh":
+        dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size, mode=mode, world_size=world_size, rank=rank)
     else:
-        dataset = None
+        raise ValueError(f"Unsupported custom dataset: {dataset}")
 
     return DistributedDataLoader(
         dataset,

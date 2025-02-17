@@ -139,7 +139,7 @@ def test_classification_loss_with_packing(max_seq_length: int, batch_size: int):
     logger.info("Classification loss with packing test passed successfully!")
 
 if __name__ == "__main__":
-    pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    # pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     init_logger()
     logger.info("Starting DPO objective test")
     test_classification_loss_with_packing(max_seq_length=4096, batch_size=2)

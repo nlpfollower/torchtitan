@@ -1,6 +1,7 @@
 import re
 
 import torch
+from datasets.distributed import split_dataset_by_node
 from llama_models.llama3.api import ChatFormat, ToolPromptFormat, RawMessage, Role
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from typing import List, Dict, Any, Tuple, Iterator
@@ -20,7 +21,8 @@ def extract_anthropic_prompt(prompt_and_response: str) -> str:
     return prompt_and_response[:search_term_idx + len(search_term)]
 
 class HHDataset(IterableDataset):
-    def __init__(self, tokenizer: Tokenizer, split: str = "train", seq_len: int = 2048, batch_size: int = 1, cache_dir: str = None, mode: str = "align"):
+    def __init__(self, tokenizer: Tokenizer, split: str = "train", seq_len: int = 2048, batch_size: int = 1,
+                 cache_dir: str = None, mode: str = "align",  world_size: int = 1, rank: int = 0):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.batch_size = batch_size
@@ -28,14 +30,14 @@ class HHDataset(IterableDataset):
         self.mode = mode
         if mode not in ["align", "sft"]:
             raise ValueError("Mode must be either 'align' or 'sft'")
+        print(f'Loading HH dataset ({split} split) from Huggingface...')
+        full_dataset = load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
+        print('Dataset loaded. Processing...')
+        self.dataset = split_dataset_by_node(full_dataset, rank, world_size)
         self.batches = self.load_and_batch_data(split, cache_dir)
         self._sample_idx = 0
 
     def load_and_batch_data(self, split: str, cache_dir: str) -> List[Dict[str, torch.Tensor]]:
-        print(f'Loading HH dataset ({split} split) from Huggingface...')
-        dataset = load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
-        print('Dataset loaded. Processing...')
-
         batches = []
         current_batch = []
         current_sample = {"input_ids": [], "labels": [], "document_ids": []}
@@ -43,7 +45,7 @@ class HHDataset(IterableDataset):
         current_doc_id = 0
         curr = 0
 
-        for row in tqdm(dataset, desc='Processing HH'):
+        for row in tqdm(self.dataset, desc='Processing HH'):
             if curr > 10000:
                 break
             curr += 1
