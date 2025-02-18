@@ -33,7 +33,7 @@ class ReferenceModel(nn.Module):
     def generate_next_token(self, x, temperature=1.0, top_k=None, rng=None):
         return generate_next_token(self, x, temperature=temperature, top_k=top_k, rng=rng)
 
-def build_reference_model(job_config, world_mesh, parallel_dims, tokenizer):
+def build_reference_model(job_config, tokenizer):
     device_type, _ = get_device_info()
     device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
 

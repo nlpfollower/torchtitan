@@ -51,7 +51,7 @@ def test_dpo_objective(max_seq_length: int, batch_size: int):
     parallel_dims = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, world_size=1, enable_loss_parallel=False)
     world_mesh = parallel_dims.build_mesh(device_type)
     tokenizer = build_tokenizer("llama", job_config.model.tokenizer_path)
-    model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+    model = build_reference_model(job_config, tokenizer)
 
     # Build dataloader and get a single batch
     dataloader = build_hh_data_loader(tokenizer, batch_size, max_seq_length, split="train")
@@ -87,7 +87,7 @@ def test_classification_loss_with_packing(max_seq_length: int, batch_size: int):
     parallel_dims = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, world_size=1, enable_loss_parallel=False)
     world_mesh = parallel_dims.build_mesh(device_type)
     tokenizer = build_tokenizer("llama", job_config.model.tokenizer_path)
-    model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+    model = build_reference_model(job_config, tokenizer)
 
     # Build dataloader and get a single batch (SFT mode)
     dataloader = build_hh_data_loader(tokenizer, batch_size, max_seq_length, split="train", mode="sft")

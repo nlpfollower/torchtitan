@@ -123,7 +123,7 @@ def test_sdpa_mask_equivalence():
     parallel_dims = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, world_size=1, enable_loss_parallel=False)
     world_mesh = parallel_dims.build_mesh(device_type)
     tokenizer = build_tokenizer("llama", job_config.model.tokenizer_path)
-    reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+    reference_model = build_reference_model(job_config, tokenizer)
     chat_format = ChatFormat(tokenizer)
 
     def encode_prompt(messages):
@@ -285,7 +285,7 @@ def test_advanced_document_causal_mask(num_samples: int, max_seq_length: int, ba
     parallel_dims = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, world_size=1, enable_loss_parallel=False)
     world_mesh = parallel_dims.build_mesh(device_type)
     tokenizer = build_tokenizer("llama", job_config.model.tokenizer_path)
-    reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+    reference_model = build_reference_model(job_config, tokenizer)
 
     dataloader = build_hh_data_loader(tokenizer, batch_size, max_seq_length, split="train")
 
@@ -400,7 +400,7 @@ def test_advanced_document_causal_mask_sft(num_samples: int, max_seq_length: int
     parallel_dims = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, world_size=1, enable_loss_parallel=False)
     world_mesh = parallel_dims.build_mesh(device_type)
     tokenizer = build_tokenizer("llama", job_config.model.tokenizer_path)
-    reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+    reference_model = build_reference_model(job_config, tokenizer)
 
     # Create the dataloader with "sft" mode
     dataloader = build_hh_data_loader(tokenizer, batch_size, max_seq_length, split="train", mode="sft")
@@ -473,7 +473,7 @@ def test_hh_mask_advanced():
     parallel_dims = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, world_size=1, enable_loss_parallel=False)
     world_mesh = parallel_dims.build_mesh(device_type)
     tokenizer = build_tokenizer("llama", job_config.model.tokenizer_path)
-    reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+    reference_model = build_reference_model(job_config, tokenizer)
     chat_format = ChatFormat(tokenizer)
 
     def encode_prompt(messages):
@@ -590,7 +590,7 @@ def test_hh_mask():
     world_mesh = parallel_dims.build_mesh(device_type)
 
     tokenizer = build_tokenizer("llama", job_config.model.tokenizer_path)
-    reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+    reference_model = build_reference_model(job_config, tokenizer)
     chat_format = ChatFormat(tokenizer)
 
     prompt_messages = [

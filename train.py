@@ -262,7 +262,7 @@ def main(job_config: JobConfig):
     reference_model = None
 
     if job_config.reference_model.enabled:
-        reference_model = build_reference_model(job_config, world_mesh, parallel_dims, tokenizer)
+        reference_model = build_reference_model(job_config, tokenizer)
 
         if os.environ.get('DEBUG_REFERENCE_MODEL', '0') == '1':
             logger.info("Running reference model debug...")
@@ -554,6 +554,8 @@ def main(job_config: JobConfig):
             # Save final checkpoint
             logger.info("Saving final checkpoint...")
             checkpoint.save(train_state.step, force=True, is_final=True)
+
+
 
     if torch.distributed.get_rank() == 0:
         logger.info("Sleeping 2 seconds for other ranks to complete")
