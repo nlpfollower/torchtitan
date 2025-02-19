@@ -52,8 +52,8 @@ def checksum_model(model, world_mesh):
             checksum = tensor_checksum(gathered_param)
             checksums[f"part_{idx}.{name}"] = checksum.item()
             part_checksum = finite_field_add(part_checksum, checksum)
-            if rank == 0:
-                logger.info(f"Checksum for {name}: {checksum.item()} total checksum: {part_checksum}")
+            # if rank == 0:
+            #     logger.info(f"Checksum for {name}: {checksum.item()} total checksum: {part_checksum}")
 
         # Sum up checksums across pipeline parallel ranks
         if world_mesh.mesh_dim_names is not None and "pp" in world_mesh.mesh_dim_names:

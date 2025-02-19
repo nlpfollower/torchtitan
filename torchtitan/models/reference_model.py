@@ -9,14 +9,15 @@ from torchdata.nodes import Stateful
 from torchtitan.models import model_name_to_cls, models_config
 from torchtitan.parallelisms import models_parallelize_fns, ParallelDims, models_pipelining_fns
 from torchtitan.checkpoint import CheckpointManager, ModelWrapper
-from torchtitan.utils import get_device_info
+from torchtitan.utils import get_device_info, set_determinism
 from scripts.generate._generation import generate, generate_next_token
 import torch.nn as nn
 
 class ReferenceModel(nn.Module):
-    def __init__(self, model_parts, pp_schedule=None):
+    def __init__(self, model_parts, device_mesh, pp_schedule=None):
         super().__init__()
         self.model_parts = nn.ModuleList(model_parts)
+        self.device_mesh = device_mesh
         self.pp_schedule = pp_schedule
 
     def forward(self, x, mask):
@@ -51,6 +52,11 @@ def build_reference_model(job_config, tokenizer):
 
     # Create a separate device mesh for the reference model
     reference_mesh = reference_parallel_dims.build_mesh(device_type)
+
+    if job_config.training.deterministic:
+        set_determinism(
+            reference_mesh, device, job_config.training.seed, job_config.training.deterministic
+        )
 
     # Load the reference model configuration
     model_cls = model_name_to_cls[job_config.model.name]
@@ -94,7 +100,7 @@ def build_reference_model(job_config, tokenizer):
     )
     checkpoint.load(step=0, checkpoint_path=job_config.reference_model.checkpoint_path)
 
-    return ReferenceModel(reference_model_parts, pp_schedule if reference_parallel_dims.pp_enabled else None)
+    return ReferenceModel(reference_model_parts, reference_mesh, pp_schedule if reference_parallel_dims.pp_enabled else None)
 
 class MinimalOptimizersContainer(Stateful):
     def __init__(self, model):
