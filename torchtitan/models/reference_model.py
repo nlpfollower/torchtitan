@@ -5,7 +5,6 @@ from torch.distributed.tensor import DeviceMesh
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from torchdata.nodes import Stateful
-from transformers import pipeline
 
 from torchtitan.models import model_name_to_cls, models_config
 from torchtitan.models.llama import pipeline_llama, parallelize_llama

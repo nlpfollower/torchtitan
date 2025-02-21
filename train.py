@@ -322,11 +322,13 @@ def main(job_config: JobConfig):
         f"(warmup {job_config.training.warmup_steps})"
     )
     eval_components = {
-        'model_parts': model_parts if parallel_dims.pp_enabled else [model],
+        'model_parts': model_parts,
         'reference_model': reference_model,
         'eval_data_loader': eval_data_loader,
         'parallel_dims': parallel_dims,
         'pp_schedule': pp_schedule if parallel_dims.pp_enabled else None,
+        'has_first_stage': has_first_stage if parallel_dims.pp_enabled else True,
+        'has_last_stage': has_last_stage if parallel_dims.pp_enabled else True,
         'loss_fn': loss_fn,
         'world_size': world_size,
         'rank': dp_rank,
@@ -580,6 +582,8 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     eval_data_loader = eval_components['eval_data_loader']
     parallel_dims = eval_components['parallel_dims']
     pp_schedule = eval_components['pp_schedule']
+    has_first_stage = eval_components['has_first_stage']
+    has_last_stage = eval_components['has_last_stage']
     loss_fn = eval_components['loss_fn']
     rank = eval_components['rank']
     world_size = eval_components['world_size']
@@ -618,15 +622,14 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                 document_ids = document_ids.to(device_type)
 
             if parallel_dims.pp_enabled:
-                # Replicate PP forward step from training loop
-                targets, losses = (labels, []) if pp_schedule.has_last_stage else (None, None)
-                if pp_schedule.has_first_stage:
+                targets, losses = (labels, []) if has_last_stage else (None, None)
+                if has_first_stage:
                     pp_schedule.step(input_ids, document_ids, target=targets, losses=losses, is_training=False)
                 else:
                     pp_schedule.step(target=targets, losses=losses, is_training=False)
                 loss = (
                     torch.mean(torch.stack(losses)).to(device_type)
-                    if pp_schedule.has_last_stage
+                    if has_last_stage
                     else torch.tensor([-1.0], device=device_type)
                 )
             else:
