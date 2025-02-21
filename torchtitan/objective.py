@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from aiohttp.web_routedef import static
 from torch import nn
 
-from torchtitan.datasets import build_tokenizer
 from torchtitan.logging import logger
 
 

@@ -8,7 +8,6 @@ from torch.distributed import broadcast
 from torch.utils.data import DataLoader, IterableDataset
 from torchdata.nodes import Stateful
 
-from torchtitan.datasets.hf_datasets import DPAwareDataLoader
 from torchtitan.datasets.hh_dataset import build_hh_data_loader, HHDataset
 from torchtitan.datasets.mmlu_dataset import MMLUDataset
 from torchtitan.datasets.tokenizer import Tokenizer

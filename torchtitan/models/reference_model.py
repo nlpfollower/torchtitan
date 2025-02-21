@@ -5,9 +5,11 @@ from torch.distributed.tensor import DeviceMesh
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from torchdata.nodes import Stateful
+from transformers import pipeline
 
 from torchtitan.models import model_name_to_cls, models_config
-from torchtitan.parallelisms import models_parallelize_fns, ParallelDims, models_pipelining_fns
+from torchtitan.models.llama import pipeline_llama, parallelize_llama
+from torchtitan.parallelisms import ParallelDims
 from torchtitan.checkpoint import CheckpointManager, ModelWrapper
 from torchtitan.utils import get_device_info, set_determinism
 from scripts.generate._generation import generate, generate_next_token
@@ -74,15 +76,15 @@ def build_reference_model(job_config, tokenizer):
     # Apply parallelism to the reference model
     if reference_parallel_dims.pp_enabled:
         # Apply pipeline parallelism
-        pp_schedule, reference_model_parts = models_pipelining_fns[job_config.model.name](
+        pp_schedule, reference_model_parts = pipeline_llama(
             reference_model, reference_mesh["pp"], reference_parallel_dims, job_config, device, model_config, None
         )
         for m in reference_model_parts:
-            models_parallelize_fns[job_config.model.name](m, reference_mesh, reference_parallel_dims, job_config)
+            parallelize_llama(m, reference_mesh, reference_parallel_dims, job_config)
             m.to_empty(device=device)
     else:
         # Apply tensor parallelism
-        models_parallelize_fns[job_config.model.name](reference_model, reference_mesh, reference_parallel_dims, job_config)
+        parallelize_llama(reference_model, reference_mesh, reference_parallel_dims, job_config)
         reference_model.to_empty(device=device)
         reference_model_parts = [reference_model]
 

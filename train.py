@@ -110,13 +110,10 @@ def main(job_config: JobConfig):
     # build dataloader
     if job_config.training.dataset_type == "huggingface":
         data_loader = build_hf_data_loader(
-            job_config.training.dataset,
-            job_config.training.dataset_path,
-            tokenizer,
-            job_config.training.batch_size,
-            job_config.training.seq_len,
             dp_degree,
             dp_rank,
+            tokenizer,
+            job_config
         )
     elif job_config.training.dataset_type == "custom":
         data_loader = build_custom_data_loader(
@@ -284,8 +281,9 @@ def main(job_config: JobConfig):
     metric_logger = build_metric_logger(job_config, parallel_dims)
     reference_model = None
 
-    real_checksum, _ = checksum_model(model, world_mesh)
-    logger.info(f"Start Checkpoint checksum: {real_checksum}")
+    if not parallel_dims.pp_enabled:
+        real_checksum, _ = checksum_model(model, world_mesh)
+        logger.info(f"Start Checkpoint checksum: {real_checksum}")
     if job_config.reference_model.enabled:
         reference_model = build_reference_model(job_config, tokenizer)
 
@@ -324,7 +322,7 @@ def main(job_config: JobConfig):
         f"(warmup {job_config.training.warmup_steps})"
     )
     eval_components = {
-        'model': model,
+        'model_parts': model_parts if parallel_dims.pp_enabled else [model],
         'reference_model': reference_model,
         'eval_data_loader': eval_data_loader,
         'parallel_dims': parallel_dims,
@@ -405,7 +403,7 @@ def main(job_config: JobConfig):
                 with train_context(optional_context_parallel_ctx):
                     targets, losses = (labels, []) if has_last_stage else (None, None)
                     if has_first_stage:
-                        pp_schedule.step(input_ids, target=targets, losses=losses)
+                        pp_schedule.step(input_ids, document_ids, target=targets, losses=losses)
                     else:
                         pp_schedule.step(target=targets, losses=losses)
 
@@ -560,8 +558,9 @@ def main(job_config: JobConfig):
             logger.info("Saving final checkpoint...")
             checkpoint.save(train_state.step, force=True, is_final=True)
 
-            real_checksum, _ = checksum_model(model, world_mesh)
-            logger.info(f"Checkpoint - Checkpoint checksum: {real_checksum}")
+            if not parallel_dims.pp_enabled:
+                real_checksum, _ = checksum_model(model, world_mesh)
+                logger.info(f"Checkpoint - Checkpoint checksum: {real_checksum}")
 
 
 
@@ -576,7 +575,7 @@ def main(job_config: JobConfig):
 def evaluate(eval_components, job_config, current_step, metric_logger):
     logger.info(f"Starting evaluation at step {current_step} with {job_config.evaluation.num_samples} samples")
 
-    model = eval_components['model']
+    model_parts = eval_components['model_parts']
     reference_model = eval_components['reference_model']
     eval_data_loader = eval_components['eval_data_loader']
     parallel_dims = eval_components['parallel_dims']
@@ -587,7 +586,8 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     device_type = eval_components['device_type']
     world_mesh = eval_components['world_mesh']
 
-    model.eval()
+    for model in model_parts:
+        model.eval()
 
     eval_losses = []
     eval_perplexities = []
@@ -618,27 +618,40 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                 document_ids = document_ids.to(device_type)
 
             if parallel_dims.pp_enabled:
-                logits = pp_schedule.forward(input_ids, attention_mask)
+                # Replicate PP forward step from training loop
+                targets, losses = (labels, []) if pp_schedule.has_last_stage else (None, None)
+                if pp_schedule.has_first_stage:
+                    pp_schedule.step(input_ids, document_ids, target=targets, losses=losses, is_training=False)
+                else:
+                    pp_schedule.step(target=targets, losses=losses, is_training=False)
+                loss = (
+                    torch.mean(torch.stack(losses)).to(device_type)
+                    if pp_schedule.has_last_stage
+                    else torch.tensor([-1.0], device=device_type)
+                )
             else:
-                logits = model(input_ids, attention_mask)
+                logits = model_parts[0](input_ids, attention_mask)
+                if job_config.reference_model.enabled:
+                    reference_logits = reference_model(input_ids, attention_mask)
+                    loss = loss_fn(logits, reference_logits, labels, document_ids)
+                else:
+                    loss = loss_fn(logits, labels, document_ids)
 
-            if job_config.reference_model.enabled:
-                reference_logits = reference_model(input_ids, attention_mask)
-                loss = loss_fn(logits, reference_logits, labels, document_ids)
+            perplexity = torch.exp(loss)
+            if parallel_dims.dp_enabled:
+                loss, perplexity = (
+                    utils.dist_mean(loss, world_mesh["dp_cp"]),
+                    utils.dist_mean(perplexity, world_mesh["dp_cp"]),
+                )
             else:
-                loss = loss_fn(logits, labels, document_ids)
-
-            eval_losses.append(loss.item())
-            eval_perplexities.append(torch.exp(loss).item())
+                loss, perplexity = loss.item(), perplexity.item()
+            eval_losses.append(loss)
+            eval_perplexities.append(perplexity)
 
     avg_loss, avg_perplexity = 0, 0
     if len(eval_losses) > 0:
         avg_loss = sum(eval_losses) / len(eval_losses)
         avg_perplexity = sum(eval_perplexities) / len(eval_perplexities)
-
-    if parallel_dims.dp_enabled:
-        avg_loss = utils.dist_mean(avg_loss, world_mesh["dp"])
-        avg_perplexity = utils.dist_mean(avg_perplexity, world_mesh["dp"])
 
     logger.info(f"Evaluation at step {current_step}: Loss: {avg_loss:.4f}, Perplexity: {avg_perplexity:.4f}")
 
