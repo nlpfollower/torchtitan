@@ -101,16 +101,6 @@ def build_test_list():
         OverrideDefinitions(
             [
                 [
-                    "--training.tensor_parallel_degree 2",
-                    "--model.norm_type=fused_rmsnorm",
-                ],
-            ],
-            "2D eager with fused_rmsnorm",
-            "2d_eager_fused_rmsnorm",
-        ),
-        OverrideDefinitions(
-            [
-                [
                     "--checkpoint.enable_checkpoint",
                 ],
                 [
@@ -152,6 +142,18 @@ def build_test_list():
             "PP looped zero bubble test",
             "pp_looped_zero_bubble",
             ngpu=4,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--experimental.pipeline_parallel_degree 2",
+                    "--experimental.pipeline_parallel_schedule ZBVZeroBubble",
+                    "--experimental.pipeline_parallel_microbatches 8",
+                ],
+            ],
+            "PP zero bubble test (v shaped)",
+            "pp_zbv",
+            ngpu=2,
         ),
         OverrideDefinitions(
             [
@@ -382,14 +384,22 @@ def build_test_list():
             [
                 [
                     "--checkpoint.enable_checkpoint",
-                    "--experimental.pipeline_parallel_degree 2",
+                    "--training.tensor_parallel_degree=2",
+                    "--experimental.context_parallel_degree=2",
+                    "--training.enable_cpu_offload",
+                    "--optimizer.early_step_in_backward",
+                ],
+                [
+                    "--training.tensor_parallel_degree=2",
+                    "--experimental.context_parallel_degree=2",
+                    "--training.data_parallel_replicate_degree=2",
                     "--training.enable_cpu_offload",
                     "--optimizer.early_step_in_backward",
                 ],
             ],
-            "Enable CPU Offload with PP",
-            "enable_cpu_offload+PP",
-            ngpu=4,
+            "Enable CPU Offload, Optimizer in backward with TP, DP, CP",
+            "cpu_offload+opt_in_bwd+TP+DP+CP",
+            ngpu=8,
         ),
         OverrideDefinitions(
             [
@@ -413,6 +423,34 @@ def build_test_list():
             "Generation script test",
             "test_generate",
             ngpu=2,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--training.fsdp_reshard_after_forward always",
+                ],
+            ],
+            "Test always resharding after forward pass",
+            "fsdp_reshard_always",
+            ngpu=2,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--checkpoint.enable_checkpoint",
+                    "--training.steps 10",
+                ],
+                # Save at [dp:4] and load at [dp:2, tp:2]. Note that the dataloader should be
+                # excluded during loading to avoid errors caused by mismatched dp_degree.
+                [
+                    "--checkpoint.enable_checkpoint",
+                    "--checkpoint.exclude_from_loading lr_scheduler,dataloader,optimizer",
+                    "--training.tensor_parallel_degree 2",
+                    "--training.steps 20",
+                ],
+            ],
+            "Optional checkpoint",
+            "optional_checkpoint",
         ),
     ]
     return integration_tests_flavors

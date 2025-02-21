@@ -26,7 +26,20 @@ TORCH_DTYPE_MAP = {
 
 
 def string_list(raw_arg):
-    return raw_arg.split(",")
+    """Comma-separated string list argument."""
+    return [s.strip() for s in raw_arg.split(",") if s.strip()]
+
+
+def check_string_list_argument(args_dict: dict[str, any], fullargname: str):
+    section, name = fullargname.split(".")
+    # Split string list which are still raw strings.
+    if (
+        section in args_dict
+        and name in args_dict[section]
+        and isinstance(args_dict[section][name], str)
+    ):
+        sec = args_dict[section]
+        sec[name] = string_list(sec[name])
 
 
 class JobConfig:
@@ -174,13 +187,27 @@ class JobConfig:
             "--model.norm_type",
             type=str,
             default="rmsnorm",
-            help="Type of layer normalization to use [layernorm, np_layernorm, rmsnorm, fused_rmsnorm]",
+            choices=["layernorm", "np_layernorm", "rmsnorm"],
+            help="Type of layer normalization to use [layernorm, np_layernorm, rmsnorm]",
         )
         self.parser.add_argument(
             "--model.tokenizer_path",
             type=str,
             default="./torchtitan/datasets/tokenizer/tokenizer.model",
             help="Tokenizer path",
+        )
+        self.parser.add_argument(
+            "--model.converters",
+            type=string_list,
+            nargs="+",
+            default=[],
+            help="""
+                Comma separated list of converters to apply to the model.
+
+                For instance, the `float8` converter swaps `torch.nn.Linear`
+                with `Float8Linear`. This feature requires you to install 'torchao'
+                which can be found here: https://github.com/pytorch/ao
+            """,
         )
 
         # optimizer configs
@@ -221,7 +248,7 @@ class JobConfig:
         )
 
         self.parser.add_argument(
-            "--training.dataset", type=str, default="c4_mini", help="Dataset to use"
+            "--training.dataset", type=str, default="c4_test", help="Dataset to use"
         )
         self.parser.add_argument(
             "--training.dataset_path",
@@ -304,6 +331,23 @@ class JobConfig:
             "--training.disable_loss_parallel",
             action="store_true",
             help="Whether to apply loss parallel when sequence parallel is enabled",
+        )
+        self.parser.add_argument(
+            "--training.fsdp_reshard_after_forward",
+            type=str,
+            default="default",
+            choices=["default", "always", "never"],
+            help="""
+            `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
+            within an FSDP setup. `reshard_after_forward` controls parameter behavior after forward,
+            trading off memory and communication. See torch's `fully_shard` API for more documentation
+            on `reshard_after_forward`.
+            The supported policies include "default", "always" and "never":
+            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal
+              scenarios.
+            - "always" will enable `reshard_after_forward` for all forward passes.
+            - "never" will disable `reshard_after_forward` for all forward passes.
+            """,
         )
         self.parser.add_argument(
             "--training.use_block_attention_mask",
@@ -428,6 +472,23 @@ class JobConfig:
                 'alltoall' means to all-to-all shuffle the kv shards.
 
                 The default value is 'allgather'.
+            """,
+        )
+        # I'm not particularly fond of this. Users can choose to write their own wrapper
+        # module and import TorchTitan training loop and execute it, which look cleaner.
+        # One reason to provide this option is to allow users to use the existing run script.
+        # While the script is pretty trivial now, we may add more logic when integrating
+        # with TorchFT.
+        # This option is subject to change and may be deleted in the future.
+        self.parser.add_argument(
+            "--experimental.custom_model_path",
+            type=str,
+            default="",
+            help="""
+                The --custom_model_path option allows to specify a custom path to a model module
+                that is not natively implemented within TorchTitan.
+                Acceptable values are the file system path to the module (e.g., my_models/model_x)
+                dotted import module  (e.g., some_package.model_x).
             """,
         )
         self.parser.add_argument(
@@ -589,6 +650,17 @@ class JobConfig:
             default=-1,
             help="Load the checkpoint at the specified step. If -1, load the latest checkpoint.",
         )
+        self.parser.add_argument(
+            "--checkpoint.exclude_from_loading",
+            type=string_list,
+            nargs="*",
+            default=[],
+            help="""
+                Exclude specific keys from being loaded from the checkpoint.
+                Provide a comma-separated list of keys to exclude, e.g. 'optimizer,lr_scheduler,dataloader'.
+                This will load the model only, excluding the specified keys.
+            """,
+        )
         # activation checkpointing configs
         self.parser.add_argument(
             "--activation_checkpoint.mode",
@@ -608,15 +680,6 @@ class JobConfig:
 
         # float8 configs
         self.parser.add_argument(
-            "--float8.enable_float8_linear",
-            action="store_true",
-            help="""
-                If true, swaps `torch.nn.Linear` with `Float8Linear`.
-                This feature requires you to install 'torchao' which can be found
-                here: https://github.com/pytorch/ao
-            """,
-        )
-        self.parser.add_argument(
             "--float8.enable_fsdp_float8_all_gather",
             action="store_true",
             help="Whether enable float8 all-gather in FSDP",
@@ -627,23 +690,13 @@ class JobConfig:
             help="Whether precompute float8 scales dynamically for FSDP",
         )
         self.parser.add_argument(
-            "--float8.scaling_type_input",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-            choices=["dynamic", "delayed"],
-        )
-        self.parser.add_argument(
-            "--float8.scaling_type_weight",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-        )
-        self.parser.add_argument(
-            "--float8.scaling_type_grad_output",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
+            "--float8.force_recompute_fp8_weight_in_bwd",
+            action="store_true",
+            help="""
+            Whether to force the recomputation of FP8 weights during backward pass.
+            When using FSDP, it is recommended to enable `force_recompute_fp8_weight_in_bwd`
+            to prevent saving unsharded FP8 weights for backward computation.
+            """,
         )
 
         # communications library settings
@@ -703,18 +756,11 @@ class JobConfig:
                 logger.exception(f"Error details: {str(e)}")
                 raise e
 
+        # Checking string-list arguments are properly split into a list
         # if split-points came from 'args' (from cmd line) it would have already been parsed into a list by that parser
-        if (
-            "experimental" in args_dict
-            and "pipeline_parallel_split_points" in args_dict["experimental"]
-            and isinstance(
-                args_dict["experimental"]["pipeline_parallel_split_points"], str
-            )
-        ):
-            exp = args_dict["experimental"]
-            exp["pipeline_parallel_split_points"] = string_list(
-                exp["pipeline_parallel_split_points"]
-            )
+        string_list_argnames = self._get_string_list_argument_names()
+        for n in string_list_argnames:
+            check_string_list_argument(args_dict, n)
 
         # override args dict with cmd_args
         cmd_args_dict = self._args_to_two_level_dict(cmd_args)
@@ -742,6 +788,13 @@ class JobConfig:
         assert self.model.flavor
         assert self.model.tokenizer_path
 
+    def _get_string_list_argument_names(self) -> list[str]:
+        """Get the parser argument names of type `string_list`."""
+        string_list_args = [
+            v.dest for v in self.parser._actions if v.type is string_list
+        ]
+        return string_list_args
+
     def parse_args_from_command_line(
         self, args_list
     ) -> Tuple[argparse.Namespace, argparse.Namespace]:
@@ -749,6 +802,7 @@ class JobConfig:
         Parse command line arguments and return the parsed args and the command line only args
         """
         args = self.parser.parse_args(args_list)
+        string_list_argnames = set(self._get_string_list_argument_names())
 
         # aux parser to parse the command line only args, with no defaults from main parser
         aux_parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS)
@@ -757,7 +811,7 @@ class JobConfig:
                 aux_parser.add_argument(
                     "--" + arg, action="store_true" if val else "store_false"
                 )
-            elif arg == "experimental.pipeline_parallel_split_points":
+            elif arg in string_list_argnames:
                 # without this special case, type inference breaks here,
                 # since the inferred type is just 'list' and it ends up flattening
                 # e.g. from ["layers.0", "layers.1"] into ["l", "a", "y", "e", "r", "s", ".0", ...]

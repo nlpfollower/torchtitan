@@ -7,22 +7,28 @@
 # This file applies the PT-D pipeline parallelism to the Llama model.
 
 import copy
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining.schedules import (
+    _PipelineSchedule,
+    get_schedule_class,
+    ScheduleZBVZeroBubble,
+)
 
 from torchtitan.config_manager import JobConfig
 from torchtitan.logging import logger
-from torchtitan.models.llama.model import ModelArgs
-from torchtitan.parallelisms.parallel_dims import ParallelDims
-from torchtitan.parallelisms.pipelining_utils import (
+from torchtitan.parallelisms import ParallelDims
+from torchtitan.parallelisms.pipeline import (
     build_pipeline_schedule,
     generate_split_points,
     stage_ids_this_rank,
 )
+
+from .model import TransformerModelArgs
 
 
 DeviceType = Union[int, str, torch.device]
@@ -34,16 +40,25 @@ def pipeline_llama(
     parallel_dims: ParallelDims,
     job_config: JobConfig,
     device: DeviceType,
-    model_config: ModelArgs,
+    model_config: TransformerModelArgs,
     loss_fn: Callable[..., torch.Tensor],
-):
+) -> tuple[_PipelineSchedule, list[nn.Module], bool, bool]:
     stages, models = pipeline_llama_manual_split(
         model, pp_mesh, parallel_dims, job_config, device, model_config
     )
 
     pp_schedule = build_pipeline_schedule(job_config, stages, loss_fn)
 
-    return pp_schedule, models
+    # This is used in the train loop to determine whether to pass in the input_ids and labels
+    has_first_stage = False
+    has_last_stage = False
+    for stage in stages:
+        if stage.is_first:
+            has_first_stage = True
+        if stage.is_last:
+            has_last_stage = True
+
+    return pp_schedule, models, has_first_stage, has_last_stage
 
 
 def pipeline_llama_manual_split(
@@ -52,8 +67,8 @@ def pipeline_llama_manual_split(
     parallel_dims: ParallelDims,
     job_config: JobConfig,
     device: DeviceType,
-    model_config: ModelArgs,
-):
+    model_config: TransformerModelArgs,
+) -> tuple[list[PipelineStage], list[nn.Module]]:
     """
     This API extracts one torch.nn.Module objects for the part of the model configured to run inside this stage.
 
@@ -64,15 +79,19 @@ def pipeline_llama_manual_split(
     """
     pp_rank = pp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
-    microbatches = (
-        job_config.experimental.pipeline_parallel_microbatches or parallel_dims.pp
-    )
+
     splits = (
         job_config.experimental.pipeline_parallel_split_points
-        or generate_split_points(job_config, parallel_dims.pp, model_config)
+        or generate_split_points(job_config, parallel_dims.pp, model_config.n_layers)
     )
 
-    def _build_stage(stage_idx, start_layer, stop_layer, is_first=False, is_last=False):
+    def _build_stage(
+        stage_idx: int,
+        start_layer: Optional[str],
+        stop_layer: Optional[str],
+        is_first: bool = False,
+        is_last: bool = False,
+    ) -> tuple[PipelineStage, nn.Module]:
         model = copy.deepcopy(whole_model)
         if not is_first:
             model.tok_embeddings = None
@@ -106,7 +125,13 @@ def pipeline_llama_manual_split(
 
     stages = []
     models = []
-    for stage_idx in stage_ids_this_rank(pp_rank, pp_size, num_stages, style="loop"):
+
+    schedule_class = get_schedule_class(
+        job_config.experimental.pipeline_parallel_schedule
+    )
+    style = "v" if schedule_class == ScheduleZBVZeroBubble else "loop"
+
+    for stage_idx in stage_ids_this_rank(pp_rank, pp_size, num_stages, style=style):
         start_layer = splits[stage_idx - 1] if stage_idx > 0 else None
         stop_layer = splits[stage_idx] if stage_idx < num_stages - 1 else None
         stage, model_chunk = _build_stage(
@@ -118,7 +143,7 @@ def pipeline_llama_manual_split(
         )
         logger.info(
             f"PP rank {pp_rank} is building stage_idx {stage_idx}"
-            f" with start_layer {start_layer}, stop_layer {stop_layer}: model chunk \n{model_chunk}"
+            f" with start_layer {start_layer}, stop_layer {stop_layer}"
         )
         stages.append(stage)
         models.append(model_chunk)

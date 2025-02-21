@@ -35,7 +35,7 @@ Our guiding principles when building `torchtitan`:
    - [FSDP2](docs/fsdp.md) with per-parameter sharding
    - [Tensor Parallel](https://pytorch.org/docs/stable/distributed.tensor.parallel.html) (including [async TP](https://discuss.pytorch.org/t/distributed-w-torchtitan-introducing-async-tensor-parallelism-in-pytorch/209487))
    - [Pipeline Parallel](https://discuss.pytorch.org/t/distributed-w-torchtitan-training-with-zero-bubble-pipeline-parallelism/214420)
-   - Context Parallel
+   - [Context Parallel](https://discuss.pytorch.org/t/distributed-w-torchtitan-breaking-barriers-training-long-context-llms-with-1m-sequence-length-in-pytorch-using-context-parallel/215082)
 2. Selective layer and operator activation checkpointing
 3. [Distributed checkpointing](https://discuss.pytorch.org/t/distributed-w-torchtitan-optimizing-checkpointing-efficiency-with-pytorch-dcp/211250) (including async checkpointing)
    - [Interoperable checkpoints](docs/checkpoint.md) which can be loaded directly into [`torchtune`](https://github.com/pytorch/torchtune) for fine-tuning
@@ -52,7 +52,7 @@ Our guiding principles when building `torchtitan`:
     - estimate FSDP/HSDP memory usage without materializing the model
     - run distributed inference with Tensor Parallel
 
-We report our [Performance](docs/performance.md) verified on 64/128 GPUs.
+We report [performance](docs/performance.md) on up to 512 GPUs, and verify [loss converging](docs/converging.md) correctness of various techniques.
 
 ### Dive into the code
 

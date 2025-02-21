@@ -23,9 +23,10 @@ enable_wandb = false
 [model]
 name = "llama3"
 flavor = "debugmodel"
-norm_type = "rmsnorm"  # layernorm / np_layernorm / rmsnorm / fused_rmsnorm
+norm_type = "rmsnorm"  # layernorm / np_layernorm / rmsnorm
 # test tokenizer.model, for debug purpose only
 tokenizer_path = "./tests/assets/test_tiktoken.model"
+# converters = "float8"
 
 [optimizer]
 name = "AdamW"
@@ -39,6 +40,7 @@ max_norm = 1.0  # grad norm clipping
 steps = 10
 data_parallel_replicate_degree = 1
 data_parallel_shard_degree = -1
+fsdp_reshard_after_forward = "default" # default / never / always
 tensor_parallel_degree = 1
 compile = false
 dataset = "c4_test"  # supported datasets: c4_test (2K), c4 (177M)
@@ -62,4 +64,5 @@ mode = 'selective'  # ['none', 'selective', 'full']
 selective_ac_option = '2'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
-enable_float8_linear = false
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
