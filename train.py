@@ -44,9 +44,9 @@ def main(job_config: JobConfig):
     local_rank = int(os.environ.get("LOCAL_RANK"))
     rank = int(os.environ.get("RANK"))
     logger.info(f"rank {rank} and local rank {local_rank}")
-    # if rank == 0:
-    #     print("Hello from rank 0")
-    #     pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
+    if rank == 0:
+        print("Hello from rank 0")
+        pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
     # if rank == 1:
     #     print("Hello from rank 1")
     #     pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
@@ -105,6 +105,7 @@ def main(job_config: JobConfig):
     # build tokenizer
     tokenizer_type = model_name_to_tokenizer[model_name]
     tokenizer = build_tokenizer(tokenizer_type, job_config.model.tokenizer_path)
+    eval_data_loader = None
     # build dataloader
     if job_config.training.dataset_type == "huggingface":
         data_loader = build_hf_data_loader(
@@ -124,7 +125,7 @@ def main(job_config: JobConfig):
             tokenizer,
             job_config.training.batch_size,
             job_config.training.seq_len,
-            world_size,
+            dp_degree,
             dp_rank,
             device_type,
             mode=job_config.training.dataset_mode
@@ -137,7 +138,7 @@ def main(job_config: JobConfig):
                 tokenizer,
                 job_config.evaluation.batch_size,
                 job_config.training.seq_len,
-                world_size,
+                dp_degree,
                 dp_rank,
                 device_type,
                 mode=job_config.training.dataset_mode
@@ -261,6 +262,8 @@ def main(job_config: JobConfig):
     metric_logger = build_metric_logger(job_config, parallel_dims)
     reference_model = None
 
+    real_checksum, _ = checksum_model(model, world_mesh)
+    logger.info(f"Start Checkpoint checksum: {real_checksum}")
     if job_config.reference_model.enabled:
         reference_model = build_reference_model(job_config, tokenizer)
 
@@ -310,7 +313,6 @@ def main(job_config: JobConfig):
     losses_since_last_log = []
     ntokens_since_last_log = 0
     data_loading_times = []
-    time_last_log = time.perf_counter()
     device_memory_monitor.reset_peak_stats()
 
     checkpoint.reset()
@@ -343,6 +345,11 @@ def main(job_config: JobConfig):
     ) as memory_profiler:
         is_dataset_exhausted = torch.zeros(world_size, dtype=torch.bool, device=device)
         while train_state.step < job_config.training.steps:
+            # Evaluation step
+            if job_config.evaluation.enabled and train_state.step % job_config.evaluation.interval == 0:
+                evaluate(eval_components, job_config, train_state.step, metric_logger)
+
+            time_last_log = time.perf_counter()
             train_state.step += 1
             gc_handler.run(train_state.step)
 
@@ -361,7 +368,10 @@ def main(job_config: JobConfig):
                 logger.warning("DataLoader has exhausted its data. Ending training.")
                 break
 
-            input_ids, labels = batch['input_ids'], batch['labels']
+            try:
+                input_ids, labels = batch['input_ids'], batch['labels']
+            except TypeError:
+                input_ids, labels = batch[0], batch[1]
             attention_mask = None
             document_ids = None
             if job_config.training.use_block_attention_mask and 'document_ids' in batch:
@@ -374,10 +384,6 @@ def main(job_config: JobConfig):
             input_ids = input_ids.to(device_type)
             labels = labels.to(device_type)
             optimizers.zero_grad()
-
-            # Evaluation step
-            if job_config.evaluation.enabled and train_state.step % job_config.evaluation.interval == 0:
-                evaluate(eval_components, job_config, train_state.step, metric_logger)
 
             # apply context parallelism if cp is enabled
             optional_context_parallel_ctx = (
@@ -418,15 +424,27 @@ def main(job_config: JobConfig):
             else:
                 # Non-PP forward / backward
                 with train_context(optional_context_parallel_ctx):
+                    forward_start = time.perf_counter()
                     logits = model(input_ids, attention_mask)
+                    forward_end = time.perf_counter()
+
                     if job_config.reference_model.enabled:
                         loss = loss_fn(logits, reference_logits, labels, document_ids)
                     else:
                         loss = loss_fn(logits, labels, document_ids)
-                    # pred.shape=(bs, seq_len, vocab_size)
-                    # need to free to before bwd to avoid peaking memory
+
+                    # Free memory before backward pass
                     del logits
+
+                    backward_start = time.perf_counter()
                     loss.backward()
+                    backward_end = time.perf_counter()
+
+                forward_time = forward_end - forward_start
+                backward_time = backward_end - backward_start
+
+                logger.info(
+                    f"Step {train_state.step}: Forward time: {forward_time:.4f}s, Backward time: {backward_time:.4f}s")
 
             # clip gradients
             utils.clip_grad_norm_(
@@ -511,6 +529,8 @@ def main(job_config: JobConfig):
                 logger.info(
                     f"{color.cyan}step: {train_state.step:2}  "
                     f"{color.green}loss: {global_avg_loss:7.4f}  "
+                    f"{color.green}local loss: {avg_loss:7.4f}  "
+                    f"{color.green}current loss: {loss.item():7.4f}  "
                     f"{color.yellow}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
                     f"({device_mem_stats.max_reserved_pct:.2f}%)  "
                     f"{color.blue}tps: {round(tps):,}  "
@@ -520,7 +540,6 @@ def main(job_config: JobConfig):
                 losses_since_last_log.clear()
                 ntokens_since_last_log = 0
                 data_loading_times.clear()
-                time_last_log = time.perf_counter()
                 device_memory_monitor.reset_peak_stats()
 
             # save checkpoint. If train step reaches upper bound, skip because it will be saved at the end
@@ -555,6 +574,9 @@ def main(job_config: JobConfig):
             logger.info("Saving final checkpoint...")
             checkpoint.save(train_state.step, force=True, is_final=True)
 
+            real_checksum, _ = checksum_model(model, world_mesh)
+            logger.info(f"Checkpoint - Checkpoint checksum: {real_checksum}")
+
 
 
     if torch.distributed.get_rank() == 0:
@@ -584,30 +606,31 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     eval_losses = []
     eval_perplexities = []
 
+    eval_data_loader.reset()
     eval_iterator = iter(eval_data_loader)
     is_eval_exhausted = torch.zeros(world_size, dtype=torch.bool, device=device_type)
-    for _ in range(job_config.evaluation.num_samples):
-        try:
-            eval_batch = next(eval_iterator)
-            if eval_batch == "end":
-                is_eval_exhausted[rank] = True
-            torch.distributed.all_reduce(is_eval_exhausted)
-            if torch.any(is_eval_exhausted):
-                logger.info(f"Rank {rank}: Evaluation data exhausted. Ending evaluation.")
+    with torch.no_grad():
+        for _ in range(job_config.evaluation.num_samples):
+            try:
+                eval_batch = next(eval_iterator)
+                if eval_batch == "end":
+                    is_eval_exhausted[rank] = True
+                torch.distributed.all_reduce(is_eval_exhausted)
+                if torch.any(is_eval_exhausted):
+                    logger.info(f"Rank {rank}: Evaluation data exhausted. Ending evaluation.")
+                    break
+            except StopIteration:
+                logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
                 break
-        except StopIteration:
-            logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
-            break
 
-        input_ids, labels = eval_batch['input_ids'].to(device_type), eval_batch['labels'].to(device_type)
-        attention_mask = eval_batch.get('attention_mask')
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device_type)
-        document_ids = eval_batch.get('document_ids')
-        if document_ids is not None:
-            document_ids = document_ids.to(device_type)
+            input_ids, labels = eval_batch['input_ids'].to(device_type), eval_batch['labels'].to(device_type)
+            attention_mask = eval_batch.get('attention_mask')
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device_type)
+            document_ids = eval_batch.get('document_ids')
+            if document_ids is not None:
+                document_ids = document_ids.to(device_type)
 
-        with torch.no_grad():
             if parallel_dims.pp_enabled:
                 logits = pp_schedule.forward(input_ids, attention_mask)
             else:
@@ -619,11 +642,13 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
             else:
                 loss = loss_fn(logits, labels, document_ids)
 
-        eval_losses.append(loss.item())
-        eval_perplexities.append(torch.exp(loss).item())
+            eval_losses.append(loss.item())
+            eval_perplexities.append(torch.exp(loss).item())
 
-    avg_loss = sum(eval_losses) / len(eval_losses)
-    avg_perplexity = sum(eval_perplexities) / len(eval_perplexities)
+    avg_loss, avg_perplexity = 0, 0
+    if len(eval_losses) > 0:
+        avg_loss = sum(eval_losses) / len(eval_losses)
+        avg_perplexity = sum(eval_perplexities) / len(eval_perplexities)
 
     if parallel_dims.dp_enabled:
         avg_loss = utils.dist_mean(avg_loss, world_mesh["dp"])

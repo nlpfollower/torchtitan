@@ -33,7 +33,7 @@ class CustomIterableDataset(IterableDataset, Stateful):
 
     def __iter__(self):
         while True:
-            for i, sample in enumerate(self.dataset):
+            for i, sample in enumerate(self.dataset[self._sample_idx:]):
                 if i % self.world_size == self.rank:
                     self._sample_idx += 1
                     yield sample['input_ids'], sample['labels']
@@ -44,6 +44,9 @@ class CustomIterableDataset(IterableDataset, Stateful):
             else:
                 logger.warning("CustomIterableDataset is restarting its data iteration.")
                 self._sample_idx = 0
+
+    def reset(self):
+        self._sample_idx = 0
 
     def load_state_dict(self, state_dict):
         self._sample_idx = state_dict["sample_idx"]
@@ -79,6 +82,9 @@ class DistributedDataLoader(DataLoader):
         for batch in self.dataset:
             yield {k: v.to(self.device_type) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         yield "end"
+
+    def reset(self):
+        self.dataset.reset()
 
     def state_dict(self) -> Dict[str, Any]:
         return self.dataset.state_dict() if self.dataset else {}

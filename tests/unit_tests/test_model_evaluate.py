@@ -135,6 +135,10 @@ def run_eval():
 
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+
+    num_threads = os.cpu_count()  # Set to the number of available CPU cores
+    num_threads_per_rank = max(1, num_threads // min(world_size, 8))
+    torch.set_num_threads(num_threads_per_rank)
     device = torch.device(f"{device_type}:{rank}")
     torch.cuda.set_device(device)
 
@@ -157,6 +161,7 @@ def run_eval():
     if torch.distributed.get_rank() == 0 and loss is not None:
         logger.info(f"Final Evaluation - Loss: {loss:.4f}, Perplexity: {perplexity:.4f}")
 
+    torch.distributed.destroy_process_group()
 
 def main():
     args = parse_args()

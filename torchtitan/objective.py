@@ -23,13 +23,13 @@ class Objective:
             raise ValueError(f"Unsupported loss function: {loss_type}")
 
     @staticmethod
-    def default_loss(pred, labels):
+    def default_loss(pred, labels, document_ids):
         return F.cross_entropy(
             pred.flatten(0, 1).float(), labels.flatten(0, 1)
         )
 
     @staticmethod
-    def classification_loss(logits: torch.Tensor, labels: torch.Tensor, debug=False) -> torch.Tensor:
+    def classification_loss(logits: torch.Tensor, labels: torch.Tensor, document_ids: torch.Tensor) -> torch.Tensor:
         # Shift logits and labels so we predict token n+1 from token n
         shifted_logits = logits[:, :-1, :].contiguous()
         shifted_labels = labels[:, 1:].contiguous()
@@ -48,41 +48,53 @@ class Objective:
                                          document_ids: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, vocab_size = logits.shape
 
-        # Shift and flatten tensors
-        shifted_logits = logits[:, :-1, :].contiguous().view(-1, vocab_size)
-        shifted_labels = labels[:, 1:].contiguous().view(-1)
+        # Shift tensors
+        shifted_logits = logits[:, :-1, :].contiguous()
+        shifted_labels = labels[:, 1:].contiguous()
+        shifted_document_ids = document_ids[:, 1:].contiguous()
+
+        # Flatten tensors
+        flat_logits = shifted_logits.reshape(-1, vocab_size)
+        flat_labels = shifted_labels.reshape(-1)
 
         # Compute loss
-        loss = F.cross_entropy(shifted_logits, shifted_labels, reduction='none', ignore_index=-100)
-
-        # Reshape loss and document_ids to include batch dimension
-        loss = loss.view(batch_size, -1)
+        loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+        loss = loss_fn(flat_logits, flat_labels).view(batch_size, -1)
 
         # Compute mean loss for each document in each batch
         batch_losses = []
         for b in range(batch_size):
-            unique_docs = torch.unique(document_ids[b])
+            unique_docs = torch.unique(shifted_document_ids[b])
             unique_docs = unique_docs[unique_docs != -1]  # Remove padding document ID
             doc_losses = []
 
             for doc_id in unique_docs:
-                # Create mask for the current document, considering the shift in loss
-                doc_mask = (document_ids[b, 1:] == doc_id)
-                label_mask = (shifted_labels.view(batch_size, -1)[b] != -100)
+                # Create mask for the current document
+                doc_mask = (shifted_document_ids[b] == doc_id)
+                label_mask = (shifted_labels[b] != -100)
                 combined_mask = doc_mask & label_mask
 
                 # Apply the combined mask to the loss
                 masked_loss = loss[b][combined_mask]
                 if masked_loss.numel() > 0:
                     doc_loss = masked_loss.mean()
-                else:
-                    doc_loss = torch.tensor(0.0, device=loss.device)
-                doc_losses.append(doc_loss)
+                    doc_losses.append(doc_loss)
 
-            batch_loss = torch.stack(doc_losses).mean() if doc_losses else torch.tensor(0.0, device=logits.device)
-            batch_losses.append(batch_loss)
+            if doc_losses:
+                batch_loss = torch.stack(doc_losses).mean()
+                batch_losses.append(batch_loss)
 
-        return torch.stack(batch_losses).mean()
+        try:
+            return torch.stack(batch_losses).mean()
+        except RuntimeError as e:
+            if "stack expects each tensor to be equal size" in str(e):
+                # Log the error and return a default tensor
+                logger.info(f"Error in classification_loss_with_packing: {e}")
+                logger.info(f"batch_losses: {batch_losses}")
+                return torch.tensor([0.0], device=logits.device, dtype=logits.dtype)
+            else:
+                # Re-raise the exception if it's not the specific error we're handling
+                raise
 
 class ReferenceObjective:
     @staticmethod

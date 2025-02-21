@@ -196,6 +196,9 @@ class HHDataset(IterableDataset):
             self._sample_idx += 1
             yield batch
 
+    def reset(self):
+        self._sample_idx = 0
+
     def state_dict(self):
         return {"sample_idx": self._sample_idx}
 
