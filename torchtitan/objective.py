@@ -44,7 +44,15 @@ class Objective:
 
     @staticmethod
     def classification_loss_with_packing(logits: torch.Tensor, labels: torch.Tensor,
-                                         document_ids: torch.Tensor) -> torch.Tensor:
+                                         document_ids: torch.Tensor = None) -> torch.Tensor:
+        # If document_ids not provided, retrieve from global state.
+        if document_ids is None:
+            import global_state
+            document_ids = global_state.DOCUMENT_IDS
+            if document_ids is None:
+                raise ValueError("global_state.DOCUMENT_IDS is None. "
+                                 "Ensure that you update global_state.DOCUMENT_IDS with the current batch's document_ids before computing the loss.")
+
         batch_size, seq_len, vocab_size = logits.shape
 
         # Shift tensors

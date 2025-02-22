@@ -401,13 +401,17 @@ def main(job_config: JobConfig):
                     reference_logits = reference_model(input_ids, attention_mask)
 
             if parallel_dims.pp_enabled:
+                if document_ids is not None:
+                    import global_state
+                    global_state.DOCUMENT_IDS = document_ids
+
                 # Pipeline Parallel forward / backward inside step() call
                 with train_context(optional_context_parallel_ctx):
                     targets, losses = (labels, []) if has_last_stage else (None, None)
                     if has_first_stage:
-                        pp_schedule.step(input_ids, document_ids, target=targets, losses=losses)
+                        pp_schedule.step(input_ids, target=targets, losses=losses, **{"mask": attention_mask})
                     else:
-                        pp_schedule.step(target=targets, losses=losses)
+                        pp_schedule.step(target=targets, losses=losses, **{"mask": attention_mask})
 
                 # accumulate losses across pipeline microbatches
                 # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
@@ -622,11 +626,15 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                 document_ids = document_ids.to(device_type)
 
             if parallel_dims.pp_enabled:
+                if document_ids is not None:
+                    import global_state
+                    global_state.DOCUMENT_IDS = document_ids
+
                 targets, losses = (labels, []) if has_last_stage else (None, None)
                 if has_first_stage:
-                    pp_schedule.step(input_ids, document_ids, target=targets, losses=losses, is_training=False)
+                    pp_schedule.step(input_ids, target=targets, losses=losses, **{"mask": attention_mask})
                 else:
-                    pp_schedule.step(target=targets, losses=losses, is_training=False)
+                    pp_schedule.step(target=targets, losses=losses, **{"mask": attention_mask})
                 loss = (
                     torch.mean(torch.stack(losses)).to(device_type)
                     if has_last_stage
