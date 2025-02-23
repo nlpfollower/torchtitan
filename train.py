@@ -202,6 +202,7 @@ def main(job_config: JobConfig):
         # apply PT-D Pipeline Parallel
         (
             pp_schedule,
+            stages,
             model_parts,
             has_first_stage,
             has_last_stage,
@@ -402,8 +403,8 @@ def main(job_config: JobConfig):
 
             if parallel_dims.pp_enabled:
                 if document_ids is not None:
-                    import global_state
-                    global_state.DOCUMENT_IDS = document_ids
+                    from torchtitan import state
+                    state.DOCUMENT_IDS = document_ids
 
                 # Pipeline Parallel forward / backward inside step() call
                 with train_context(optional_context_parallel_ctx):
@@ -627,8 +628,8 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
 
             if parallel_dims.pp_enabled:
                 if document_ids is not None:
-                    import global_state
-                    global_state.DOCUMENT_IDS = document_ids
+                    from torchtitan import state
+                    state.DOCUMENT_IDS = document_ids
 
                 targets, losses = (labels, []) if has_last_stage else (None, None)
                 if has_first_stage:
@@ -672,7 +673,8 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     }
     metric_logger.log(metrics, step=current_step)
 
-    model.train()
+    for model in model_parts:
+        model.train()
 
     return avg_loss, avg_perplexity
 

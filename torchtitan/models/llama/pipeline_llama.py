@@ -42,7 +42,7 @@ def pipeline_llama(
     device: DeviceType,
     model_config: TransformerModelArgs,
     loss_fn: Callable[..., torch.Tensor],
-) -> tuple[_PipelineSchedule, list[nn.Module], bool, bool]:
+) -> tuple[_PipelineSchedule, list[PipelineStage], list[nn.Module], bool, bool]:
     stages, models = pipeline_llama_manual_split(
         model, pp_mesh, parallel_dims, job_config, device, model_config
     )
@@ -58,7 +58,7 @@ def pipeline_llama(
         if stage.is_last:
             has_last_stage = True
 
-    return pp_schedule, models, has_first_stage, has_last_stage
+    return pp_schedule, stages, models, has_first_stage, has_last_stage
 
 
 def pipeline_llama_manual_split(
