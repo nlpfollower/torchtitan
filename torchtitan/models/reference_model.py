@@ -31,6 +31,8 @@ class ReferenceModel(nn.Module):
             self.total_stages = len(stages) * pp_size
             # Map stage indices to actual stage objects for this rank
             self.stage_map = {stage.stage_index: stage for stage in stages}
+            self.has_last_stage = any(stage.is_last for stage in stages)
+        self._stages_initialized = False
 
     def forward(self, x, mask=None):
         if self.stages:
@@ -42,17 +44,17 @@ class ReferenceModel(nn.Module):
 
     def _pipeline_forward(self, x, mask=None):
         """Execute forward pass through pipeline stages in correct sequence."""
-        mb_args = [x]
-        mb_kwargs = {"mask": mask} if mask is not None else {}
+        mb_args = (x, )
 
         # Initialize stages if needed
         next_args: tuple[Any, ...] = tuple()
         if not self._stages_initialized:
             for stage in self.stages:
                 if stage.is_first:
-                    next_args = stage._prepare_forward_infra(1, mb_args, mb_kwargs)
+                    # TODO: 2
+                    next_args = stage._prepare_forward_infra(2, mb_args, {})
                 else:
-                    next_args = stage._prepare_forward_infra(1, next_args, mb_kwargs)
+                    next_args = stage._prepare_forward_infra(2, next_args, {})
             self._stages_initialized = True
 
         # Process all stages in sequence, including stages not on this rank
@@ -74,10 +76,10 @@ class ReferenceModel(nn.Module):
 
             # Process stage if it's on this rank
             if stage_idx in self.stage_map:
+                mb_kwargs = {"mask": mask} if mask is not None and stage_idx == 0 else {}
                 stage = self.stage_map[stage_idx]
-                output = stage.forward_one_chunk(0, mb_args[0], mb_kwargs)
-                mb_args = [output]
-                mb_kwargs = {}
+                output = stage.forward_one_chunk(0, mb_args, mb_kwargs)
+                mb_args = (output,)
 
                 # Handle sends to next stage if needed
                 if stage_idx < self.total_stages - 1:
@@ -86,9 +88,12 @@ class ReferenceModel(nn.Module):
                         self._batch_p2p(ops).wait()
                         ops = []
 
-        return output
+        for stage in self.stages:
+            stage.clear_runtime_states()
 
-    def _batch_p2p(p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
+        return output if self.has_last_stage else None
+
+    def _batch_p2p(self, p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
         """
         Simple wrapper over batch_isend_irecv from torch.distributed, which just adds a descriptive logger on top.
         """

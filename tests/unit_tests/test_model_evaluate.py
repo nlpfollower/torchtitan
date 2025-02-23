@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import time
 
 import pydevd_pycharm
 
@@ -11,7 +12,7 @@ if project_root not in sys.path:
 import torch
 from tests.unit_tests.test_utils import run_torchrun
 from torchtitan.config_manager import JobConfig
-from torchtitan.datasets import build_tokenizer
+from torchtitan.datasets.tokenizer import build_tokenizer
 from torchtitan.logging import init_logger, logger
 from torchtitan.parallelisms import ParallelDims
 from torchtitan.utils import get_device_info, set_determinism
@@ -54,11 +55,14 @@ def setup_job_config(args):
     job_config.reference_model.data_parallel_shard_degree = args.dp_shard
     job_config.reference_model.tensor_parallel_degree = args.tp
     job_config.reference_model.pipeline_parallel_degree = args.pp
+    job_config.experimental.pipeline_parallel_schedule = "ZBVZeroBubble"
     job_config.training.dataset_type = "custom"
     job_config.training.dataset = "hh"
     job_config.training.loss_function = "classification_with_packing"
     job_config.training.use_block_attention_mask = True
-    job_config.evaluation.batch_size = 1
+    job_config.evaluation.batch_size = 2
+    job_config.experimental.pipeline_parallel_microbatches = 2
+    job_config.training.batch_size = 2
     job_config.evaluation.enabled = True
     job_config.training.dataset_mode = "sft"
     job_config.evaluation.num_samples = 10
@@ -91,7 +95,19 @@ def evaluate(model, rank, world_size, eval_iter, loss_fn, world_mesh, device_typ
             document_ids = batch['document_ids'].to(device_type)
 
             logits = model(input_ids, attention_mask)
-            loss = loss_fn(logits, labels, document_ids)
+            loss = torch.zeros(1, dtype=next(model.parameters()).dtype, device=device_type)
+
+            # Compute loss only on last stage
+            if logits is not None:
+                loss = loss_fn(logits, labels, document_ids).reshape(1)
+
+            # Broadcast loss if using pipeline parallel
+            if "pp" in world_mesh.mesh_dim_names:
+                pp_group = world_mesh['pp'].get_group()
+                last_stage_rank = model.stages[0].stage_index_to_group_rank[model.total_stages - 1]
+                logger.info(f"Rank {rank}: Pre-broadcast loss {loss.item()}")
+                torch.distributed.broadcast(loss, src=last_stage_rank, group=pp_group)
+                logger.info(f"Rank {rank}: Post-broadcast loss {loss.item()}")
 
             eval_losses.append(loss.item())
             eval_perplexities.append(torch.exp(loss).item())
@@ -128,13 +144,19 @@ def evaluate(model, rank, world_size, eval_iter, loss_fn, world_mesh, device_typ
 
 
 def run_eval():
+    rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    if rank == 0:
+        print("Hello from rank 0")
+        pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
+    if rank == 1:
+        print("Hello from rank 1")
+        pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
+
     # pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     init_logger()
     args = parse_args()
     job_config = setup_job_config(args)
-
-    rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
 
     num_threads = os.cpu_count()  # Set to the number of available CPU cores
     num_threads_per_rank = max(1, num_threads // min(world_size, 8))
@@ -161,6 +183,8 @@ def run_eval():
     if torch.distributed.get_rank() == 0 and loss is not None:
         logger.info(f"Final Evaluation - Loss: {loss:.4f}, Perplexity: {perplexity:.4f}")
 
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
     torch.distributed.destroy_process_group()
 
 def main():
