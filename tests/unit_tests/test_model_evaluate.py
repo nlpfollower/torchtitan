@@ -99,12 +99,13 @@ def evaluate(model, rank, world_size, eval_iter, loss_fn, world_mesh, device_typ
 
             # Compute loss only on last stage
             if logits is not None:
-                loss = loss_fn(logits, labels, document_ids).reshape(1)
+                loss = loss_fn(logits, labels, document_ids=document_ids).reshape(1)
 
             # Broadcast loss if using pipeline parallel
             if "pp" in world_mesh.mesh_dim_names:
-                pp_group = world_mesh['pp'].get_group()
+                pp_group = world_mesh["pp"].get_group()
                 last_stage_rank = model.stages[0].stage_index_to_group_rank[model.total_stages - 1]
+
                 logger.info(f"Rank {rank}: Pre-broadcast loss {loss.item()}")
                 torch.distributed.broadcast(loss, src=last_stage_rank, group=pp_group)
                 logger.info(f"Rank {rank}: Post-broadcast loss {loss.item()}")
@@ -146,14 +147,18 @@ def evaluate(model, rank, world_size, eval_iter, loss_fn, world_mesh, device_typ
 def run_eval():
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if rank == 0:
-        print("Hello from rank 0")
-        pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
-    if rank == 1:
-        print("Hello from rank 1")
-        pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
-
-    # pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    # if rank == 0:
+    #     print("Hello from rank 0")
+    #     pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
+    # if rank == 1:
+    #     print("Hello from rank 1")
+    #     pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
+    # if rank == 2:
+    #     print("Hello from rank 1")
+    #     pydevd_pycharm.settrace('localhost', port=6793, stdoutToServer=True, stderrToServer=True)
+    # if rank == 3:
+    #     print("Hello from rank 1")
+    #     pydevd_pycharm.settrace('localhost', port=6794, stdoutToServer=True, stderrToServer=True)
     init_logger()
     args = parse_args()
     job_config = setup_job_config(args)
@@ -186,6 +191,8 @@ def run_eval():
     torch.distributed.barrier()
     torch.cuda.synchronize()
     torch.distributed.destroy_process_group()
+
+    sys.exit(0)
 
 def main():
     args = parse_args()

@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -18,18 +18,23 @@ class Objective:
             return Objective.classification_loss
         elif loss_type == "classification_with_packing":
             return Objective.classification_loss_with_packing
+        elif loss_type == "dpo_with_packing":
+            return Objective.dpo_loss_with_packing
         else:
             raise ValueError(f"Unsupported loss function: {loss_type}")
 
     @staticmethod
-    def default_loss(pred, labels, document_ids):
+    def default_loss(logits, labels, reference_logits=None, document_ids=None):
+        """Default cross-entropy loss"""
         return F.cross_entropy(
-            pred.flatten(0, 1).float(), labels.flatten(0, 1)
+            logits.flatten(0, 1).float(), labels.flatten(0, 1)
         )
 
     @staticmethod
-    def classification_loss(logits: torch.Tensor, labels: torch.Tensor, document_ids: torch.Tensor) -> torch.Tensor:
-        # Shift logits and labels so we predict token n+1 from token n
+    def classification_loss(logits: torch.Tensor, labels: torch.Tensor,
+                            reference_logits: Optional[torch.Tensor] = None,
+                            document_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+
         shifted_logits = logits[:, :-1, :].contiguous()
         shifted_labels = labels[:, 1:].contiguous()
 
@@ -44,14 +49,20 @@ class Objective:
 
     @staticmethod
     def classification_loss_with_packing(logits: torch.Tensor, labels: torch.Tensor,
-                                         document_ids: torch.Tensor = None) -> torch.Tensor:
-        # If document_ids not provided, retrieve from global state.
+                                         reference_logits: Optional[torch.Tensor] = None,
+                                         document_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+
         if document_ids is None:
-            import global_state
-            document_ids = global_state.DOCUMENT_IDS
-            if document_ids is None:
-                raise ValueError("global_state.DOCUMENT_IDS is None. "
-                                 "Ensure that you update global_state.DOCUMENT_IDS with the current batch's document_ids before computing the loss.")
+            try:
+                from torchtitan import state
+                document_ids = state.DOCUMENT_IDS
+            except (ImportError, AttributeError):
+                pass
+
+        if document_ids is None:
+            logger.warning("document_ids not provided for classification_loss_with_packing. "
+                           "Falling back to standard classification loss.")
+            return Objective.classification_loss(logits, labels)
 
         batch_size, seq_len, vocab_size = logits.shape
 
@@ -103,24 +114,35 @@ class Objective:
                 # Re-raise the exception if it's not the specific error we're handling
                 raise
 
-class ReferenceObjective:
     @staticmethod
-    def get_loss_function(loss_type):
-        if loss_type == "dpo":
-            return ReferenceObjective.dpo_loss
-        else:
-            raise ValueError(f"Unsupported loss function: {loss_type}")
+    def dpo_loss_with_packing(logits: torch.Tensor, labels: torch.Tensor,
+                              reference_logits: Optional[torch.Tensor] = None,
+                              document_ids: Optional[torch.Tensor] = None,
+                              beta: float = 0.1) -> torch.Tensor:
+        """
+        Direct Preference Optimization (DPO) loss
 
-    @staticmethod
-    def dpo_loss(policy_logits, reference_logits, labels, document_ids, beta=0.1):
+        Args:
+            logits: Policy model output logits
+            labels: Target labels
+            reference_logits: Reference model logits (required for DPO)
+            document_ids: Document IDs for identifying chosen vs rejected samples
+            beta: KL divergence weight (default: 0.1)
+        """
+        if reference_logits is None:
+            raise ValueError("DPO loss requires reference_logits")
+
+        if document_ids is None:
+            raise ValueError("DPO loss requires document_ids")
+
         # Compute log probabilities first
-        policy_log_probs = ReferenceObjective._compute_log_probs(policy_logits, labels)
-        reference_log_probs = ReferenceObjective._compute_log_probs(reference_logits, labels)
+        policy_log_probs = Objective._compute_log_probs(logits, labels)
+        reference_log_probs = Objective._compute_log_probs(reference_logits, labels)
         document_ids = document_ids[:, 1:].contiguous()
 
         # Unpack the batch
-        policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps = ReferenceObjective._unpack_batch(
-            policy_log_probs, reference_log_probs, document_ids)
+        policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps = (
+            Objective._unpack_batch(policy_log_probs, reference_log_probs, document_ids))
 
         # Compute DPO loss
         policy_logratios = policy_chosen_logps - policy_rejected_logps

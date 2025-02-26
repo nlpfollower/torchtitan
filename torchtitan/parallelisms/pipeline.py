@@ -4,7 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import os
-from typing import Callable
+from typing import Callable, List, Dict, Any, Optional, Tuple, Union
+
+import torch
+import torch.distributed as dist
 
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
@@ -169,3 +172,98 @@ def stage_ids_this_rank(
             zip(range(pp_size), range(num_stages - 1, pp_size - 1, -1))
         )
         return stage_v_pairs[pp_rank]
+
+
+def pipeline_forward(
+        stages: List[Any],
+        pp_size: int,
+        inputs: Any,
+        mask: Optional[torch.Tensor] = None,
+        document_ids: Optional[torch.Tensor] = None,
+        stages_initialized: bool = True,
+) -> Tuple[Any, bool]:
+    """
+    Performs a forward-only pass through pipeline stages in the correct sequence.
+
+    Args:
+        stages: List of pipeline stages available on this rank
+        inputs: Input tensor(s) to process
+        mask: Optional attention mask
+        document_ids: Optional document IDs for block attention
+        stages_initialized: Whether stages have been initialized already
+        device_type: Device type (cuda/cpu)
+        pp_size: Pipeline parallel size
+        pp_rank: Pipeline parallel rank
+
+    Returns:
+        tuple: (output tensor or None, has_last_stage flag)
+    """
+    if not stages:
+        return None, False
+
+    # Setup state information
+    mb_args = (inputs,) if not isinstance(inputs, tuple) else inputs
+    stage_map = {stage.stage_index: stage for stage in stages}
+    has_last_stage = any(stage.is_last for stage in stages)
+    total_stages = len(stage_map) * pp_size if pp_size else max(stage_map.keys()) + 1
+
+    # Set document_ids in state if available
+    if document_ids is not None:
+        from torchtitan import state
+        state.DOCUMENT_IDS = document_ids
+
+    # Initialize stages if needed
+    next_args: tuple[Any, ...] = tuple()
+    if not stages_initialized:
+        for stage in sorted(stages, key=lambda s: s.stage_index):
+            if stage.stage_index == 0:
+                next_args = stage._prepare_forward_infra(1, mb_args, {})
+            else:
+                next_args = stage._prepare_forward_infra(1, next_args, {})
+
+    # Process all stages in sequence
+    ops = []
+    output = None
+
+    # Clear runtime states for all stages on this rank
+    for stage in stages:
+        stage.clear_runtime_states()
+
+    # Process through all pipeline stages
+    for stage_idx in range(total_stages):
+        current_stage = stage_map.get(stage_idx)
+
+        if current_stage:
+            if stage_idx > 0 and stage_idx - 1 not in stage_map:
+                # We need to receive from the previous stage
+                ops.extend(current_stage.get_fwd_recv_ops(0))
+                if ops:
+                    _batch_p2p(ops).wait()
+                    ops = []
+
+            # Process this stage
+            mb_kwargs = {"mask": mask} if mask is not None else {}
+            output = current_stage.forward_one_chunk(0, mb_args, mb_kwargs)
+            mb_args = (output,)
+
+            if stage_idx < total_stages - 1:
+                # We need to send to the next stage
+                ops.extend(current_stage.get_fwd_send_ops(0))
+                next_stage = stage_map.get(stage_idx + 1)
+                if next_stage:
+                    ops.extend(next_stage.get_fwd_recv_ops(0))
+                if ops:
+                    _batch_p2p(ops).wait()
+                    ops = []
+            current_stage.clear_runtime_states()
+
+    return output, has_last_stage
+
+
+def _batch_p2p(p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
+    """
+    Simple wrapper over batch_isend_irecv from torch.distributed
+    """
+    if len(p2p_ops) == 0:
+        return None
+    return dist.batch_isend_irecv(p2p_ops).pop()

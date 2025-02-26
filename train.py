@@ -26,11 +26,13 @@ from torchtitan.models import model_name_to_cls, model_name_to_tokenizer, models
 from torchtitan.models.llama import pipeline_llama, parallelize_llama
 from torchtitan.models.llama.attention_utils import create_block_document_causal_mask
 from torchtitan.models.reference_model import build_reference_model
-from torchtitan.objective import Objective, ReferenceObjective
+from torchtitan.objective import Objective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.model_converter import build_model_converters
 from torchtitan.parallelisms import ParallelDims
+from torchtitan.parallelisms.pipeline import pipeline_forward
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
+from torchtitan import state
 
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
@@ -177,10 +179,7 @@ def main(job_config: JobConfig):
     )
 
     # loss function to be shared by Pipeline Parallel and SPMD training
-    if job_config.reference_model.enabled:
-        loss_fn = ReferenceObjective.get_loss_function(job_config.training.loss_function)
-    else:
-        loss_fn = Objective.get_loss_function(job_config.training.loss_function)
+    loss_fn = Objective.get_loss_function(job_config.training.loss_function)
 
     # TODO: compiling loss function causes CUDA errors, turning off for now
     # if job_config.training.compile:
@@ -280,7 +279,6 @@ def main(job_config: JobConfig):
 
     checkpoint.load(step=job_config.checkpoint.load_step)
     metric_logger = build_metric_logger(job_config, parallel_dims)
-    reference_model = None
 
     if not parallel_dims.pp_enabled:
         real_checksum, _ = checksum_model(model, world_mesh)
@@ -324,12 +322,10 @@ def main(job_config: JobConfig):
     )
     eval_components = {
         'model_parts': model_parts,
-        'reference_model': reference_model,
-        'eval_data_loader': eval_data_loader,
+        'reference_model': reference_model if job_config.reference_model.enabled else None,
+        'eval_data_loader': eval_data_loader if job_config.evaluation.enabled else None,
         'parallel_dims': parallel_dims,
-        'pp_schedule': pp_schedule if parallel_dims.pp_enabled else None,
-        'has_first_stage': has_first_stage if parallel_dims.pp_enabled else True,
-        'has_last_stage': has_last_stage if parallel_dims.pp_enabled else True,
+        'stages': stages if parallel_dims.pp_enabled else None,
         'loss_fn': loss_fn,
         'world_size': world_size,
         'rank': dp_rank,
@@ -397,18 +393,24 @@ def main(job_config: JobConfig):
                 else None
             )
 
+            reference_logits = None
             if job_config.reference_model.enabled:
                 with torch.no_grad():
                     reference_logits = reference_model(input_ids, attention_mask)
 
             if parallel_dims.pp_enabled:
                 if document_ids is not None:
-                    from torchtitan import state
                     state.DOCUMENT_IDS = document_ids
+                if reference_logits is not None:
+                    state.REFERENCE_LOGITS = reference_logits
 
                 # Pipeline Parallel forward / backward inside step() call
+                # TODO: Fix for DPO
                 with train_context(optional_context_parallel_ctx):
                     targets, losses = (labels, []) if has_last_stage else (None, None)
+                    ref_targets = (reference_logits,) if has_last_stage and reference_logits is not None else None
+
+                    # Pass reference_logits as an additional target if available
                     if has_first_stage:
                         pp_schedule.step(input_ids, target=targets, losses=losses, **{"mask": attention_mask})
                     else:
@@ -428,11 +430,7 @@ def main(job_config: JobConfig):
                     logits = model(input_ids, attention_mask)
                     forward_end = time.perf_counter()
 
-                    if job_config.reference_model.enabled:
-                        loss = loss_fn(logits, reference_logits, labels, document_ids)
-                    else:
-                        loss = loss_fn(logits, labels, document_ids)
-
+                    loss = loss_fn(logits, labels, reference_logits, document_ids)
                     # Free memory before backward pass
                     del logits
 
@@ -586,14 +584,18 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     reference_model = eval_components['reference_model']
     eval_data_loader = eval_components['eval_data_loader']
     parallel_dims = eval_components['parallel_dims']
-    pp_schedule = eval_components['pp_schedule']
-    has_first_stage = eval_components['has_first_stage']
-    has_last_stage = eval_components['has_last_stage']
+    stages = eval_components['stages']
     loss_fn = eval_components['loss_fn']
     rank = eval_components['rank']
     world_size = eval_components['world_size']
     device_type = eval_components['device_type']
     world_mesh = eval_components['world_mesh']
+
+    pp_mesh = None
+    pp_size = None
+    if parallel_dims.pp_enabled and stages:
+        pp_mesh = world_mesh["pp"]
+        pp_size = pp_mesh.size()
 
     for model in model_parts:
         model.eval()
@@ -601,7 +603,8 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
     eval_losses = []
     eval_perplexities = []
 
-    eval_data_loader.reset()
+    if hasattr(eval_data_loader, 'reset'):
+        eval_data_loader.reset()
     eval_iterator = iter(eval_data_loader)
     is_eval_exhausted = torch.zeros(world_size, dtype=torch.bool, device=device_type)
     with torch.no_grad():
@@ -618,36 +621,61 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                 logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
                 break
 
-            input_ids, labels = eval_batch['input_ids'].to(device_type), eval_batch['labels'].to(device_type)
-            attention_mask = eval_batch.get('attention_mask')
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device_type)
-            document_ids = eval_batch.get('document_ids')
-            if document_ids is not None:
-                document_ids = document_ids.to(device_type)
+            # Extract batch data
+            try:
+                input_ids, labels = eval_batch['input_ids'], eval_batch['labels']
+            except (TypeError, KeyError):
+                input_ids, labels = eval_batch[0], eval_batch[1]
 
-            if parallel_dims.pp_enabled:
-                if document_ids is not None:
-                    from torchtitan import state
-                    state.DOCUMENT_IDS = document_ids
+            input_ids = input_ids.to(device_type)
+            labels = labels.to(device_type)
 
-                targets, losses = (labels, []) if has_last_stage else (None, None)
-                if has_first_stage:
-                    pp_schedule.step(input_ids, target=targets, losses=losses, **{"mask": attention_mask})
-                else:
-                    pp_schedule.step(target=targets, losses=losses, **{"mask": attention_mask})
-                loss = (
-                    torch.mean(torch.stack(losses)).to(device_type)
-                    if has_last_stage
-                    else torch.tensor([-1.0], device=device_type)
+            attention_mask = None
+            if isinstance(eval_batch, dict) and 'attention_mask' in eval_batch:
+                attention_mask = eval_batch['attention_mask'].to(device_type)
+
+            document_ids = None
+            if isinstance(eval_batch, dict) and 'document_ids' in eval_batch:
+                document_ids = eval_batch['document_ids'].to(device_type)
+
+            # Get reference model logits if enabled - same for both PP and non-PP paths
+            reference_logits = None
+            if job_config.reference_model.enabled and reference_model is not None:
+                reference_logits = reference_model(input_ids, attention_mask)
+
+            # Handle pipeline parallel and standard forward paths
+            if parallel_dims.pp_enabled and stages:
+                # Use the unified pipeline_forward implementation
+                output, has_last_stage = pipeline_forward(
+                    stages=stages,
+                    pp_size=pp_size,
+                    inputs=input_ids,
+                    mask=attention_mask,
+                    document_ids=document_ids,
+                    stages_initialized=True,
                 )
+
+                # Initialize loss with zeros
+                loss = torch.zeros(1, dtype=torch.float32, device=device_type)
+
+                # Compute loss only if we have the last stage
+                if has_last_stage and output is not None:
+                    loss = loss_fn(output, labels, reference_logits, document_ids)
+
+                # Broadcast loss from the last stage to all ranks in PP group
+                if pp_mesh:
+                    pp_group = pp_mesh.get_group()
+                    # Find the rank with the last stage
+                    num_stages = stages[0].num_stages
+                    last_stage_rank = stages[0].stage_index_to_group_rank[num_stages - 1]
+                    # Broadcast the loss from the last stage
+                    torch.distributed.broadcast(loss, src=last_stage_rank, group=pp_group)
             else:
+                # Standard non-pipeline forward pass
                 logits = model_parts[0](input_ids, attention_mask)
-                if job_config.reference_model.enabled:
-                    reference_logits = reference_model(input_ids, attention_mask)
-                    loss = loss_fn(logits, reference_logits, labels, document_ids)
-                else:
-                    loss = loss_fn(logits, labels, document_ids)
+
+                # Apply the appropriate loss function depending on reference model configuration
+                loss = loss_fn(logits, labels, reference_logits, document_ids)
 
             perplexity = torch.exp(loss)
             if parallel_dims.dp_enabled:

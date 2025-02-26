@@ -13,7 +13,7 @@ from torchtitan.logging import init_logger, logger
 
 import torch
 from torchtitan.config_manager import JobConfig
-from torchtitan.datasets import build_tokenizer
+from torchtitan.datasets.tokenizer import build_tokenizer
 from torchtitan.checksum import checksum_model
 from torchtitan.utils import get_device_info
 from torchtitan.parallelisms import ParallelDims

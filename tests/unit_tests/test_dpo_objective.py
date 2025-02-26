@@ -4,14 +4,14 @@ import pydevd_pycharm
 import torch
 import torch.distributed as dist
 from torchtitan.config_manager import JobConfig
-from torchtitan.datasets import build_tokenizer
+from torchtitan.datasets.tokenizer import build_tokenizer
 from torchtitan.datasets.hh_dataset import build_hh_data_loader
 from torchtitan.models.reference_model import build_reference_model
 from torchtitan.parallelisms import ParallelDims
 from torchtitan.utils import get_device_info, set_determinism
 from torchtitan.logging import logger, init_logger
 from torchtitan.models.llama.attention_utils import create_block_document_causal_mask
-from torchtitan.objective import ReferenceObjective, Objective
+from torchtitan.objective import Objective
 import torch.nn.functional as F
 
 def setup_environment():
@@ -72,8 +72,8 @@ def test_dpo_objective(max_seq_length: int, batch_size: int):
         reference_logits = model(input_ids, attention_mask)
 
     # Compute DPO loss
-    loss_fn = ReferenceObjective.get_loss_function("dpo")
-    loss = loss_fn(policy_logits, reference_logits, labels, document_ids, beta=0.1)
+    loss_fn = Objective.get_loss_function("dpo_with_packing")
+    loss = loss_fn(policy_logits, labels, reference_logits, document_ids, beta=0.1)
 
     logger.info(f"DPO Loss: {loss.item()}")
     dummy_dpo = F.logsigmoid(torch.tensor(0.0, device=device, dtype=loss.dtype))

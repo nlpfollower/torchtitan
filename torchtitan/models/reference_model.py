@@ -11,6 +11,7 @@ from torchtitan.models import model_name_to_cls, models_config
 from torchtitan.models.llama import pipeline_llama, parallelize_llama
 from torchtitan.parallelisms import ParallelDims
 from torchtitan.checkpoint import CheckpointManager, ModelWrapper
+from torchtitan.parallelisms.pipeline import pipeline_forward
 from torchtitan.utils import get_device_info, set_determinism
 from scripts.generate._generation import generate, generate_next_token
 import torch.nn as nn
@@ -44,64 +45,15 @@ class ReferenceModel(nn.Module):
 
     def _pipeline_forward(self, x, mask=None):
         """Execute forward pass through pipeline stages in correct sequence."""
-        mb_args = (x, )
-
-        # Initialize stages if needed
-        next_args: tuple[Any, ...] = tuple()
-        if not self._stages_initialized:
-            for stage in self.stages:
-                if stage.is_first:
-                    # TODO: 2
-                    next_args = stage._prepare_forward_infra(2, mb_args, {})
-                else:
-                    next_args = stage._prepare_forward_infra(2, next_args, {})
-            self._stages_initialized = True
-
-        # Process all stages in sequence, including stages not on this rank
-        ops = []
-        output = None
-
-        # Clear runtime states for all stages on this rank
-        for stage in self.stages:
-            stage.clear_runtime_states()
-
-        for stage_idx in range(self.total_stages):
-            # Handle sends from previous stage if needed
-            if stage_idx > 0 and stage_idx in self.stage_map:
-                stage = self.stage_map[stage_idx]
-                ops.extend(stage.get_fwd_recv_ops(0))
-                if ops:
-                    self._batch_p2p(ops).wait()
-                    ops = []
-
-            # Process stage if it's on this rank
-            if stage_idx in self.stage_map:
-                mb_kwargs = {"mask": mask} if mask is not None and stage_idx == 0 else {}
-                stage = self.stage_map[stage_idx]
-                output = stage.forward_one_chunk(0, mb_args, mb_kwargs)
-                mb_args = (output,)
-
-                # Handle sends to next stage if needed
-                if stage_idx < self.total_stages - 1:
-                    ops.extend(stage.get_fwd_send_ops(0))
-                    if ops:
-                        self._batch_p2p(ops).wait()
-                        ops = []
-
-        for stage in self.stages:
-            stage.clear_runtime_states()
-
-        return output if self.has_last_stage else None
-
-    def _batch_p2p(self, p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
-        """
-        Simple wrapper over batch_isend_irecv from torch.distributed, which just adds a descriptive logger on top.
-        """
-        if len(p2p_ops) == 0:
-            return None
-        # desc_str = f"{desc}, " if desc else ""
-        # logger.debug("batch_p2p %s%s", desc_str, p2p_ops)
-        return dist.batch_isend_irecv(p2p_ops).pop()
+        output, has_last_stage = pipeline_forward(
+            stages=self.stages,
+            pp_size=self.pp_size,
+            inputs=x,
+            mask=mask,
+            stages_initialized=self._stages_initialized,
+        )
+        self._stages_initialized = True
+        return output if has_last_stage else None
 
     def generate(self, input_ids, max_new_tokens, temperature=1.0, top_k=None, seed=None):
         return generate(self, input_ids, max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k, seed=seed)
