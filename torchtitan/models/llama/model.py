@@ -445,9 +445,10 @@ class Transformer(nn.Module, ModelProtocol):
         """
         # Get attention mask from state if not provided directly
         if mask is None and microbatch_indices is not None and state.ATTENTION_MASK is not None:
-            if microbatch_indices is not None:
-                # Get the slice using explicit indices
-                mask = state.get_sliced_tensor_by_indices(state.ATTENTION_MASK, microbatch_indices)
+             # Get the slice using explicit indices
+            mask = state.get_sliced_tensor_by_indices(state.ATTENTION_MASK, microbatch_indices)
+            zero_impact = microbatch_indices.sum() * 0.0
+            tokens = tokens + zero_impact
 
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
