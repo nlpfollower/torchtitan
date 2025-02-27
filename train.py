@@ -30,7 +30,8 @@ from torchtitan.objective import Objective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.model_converter import build_model_converters
 from torchtitan.parallelisms import ParallelDims
-from torchtitan.parallelisms.pipeline import pipeline_forward, create_microbatch_index_tensor
+from torchtitan.parallelisms.pipeline import pipeline_forward, create_microbatch_index_tensor, \
+    monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from torchtitan import state
 
@@ -40,6 +41,11 @@ from torchtitan import state
 def main(job_config: JobConfig):
     init_logger()
     logger.info(f"Starting job: {job_config.job.description}")
+
+    # Apply the pipeline schedule and stage monkey patches before any pipeline initialization
+    restore_fn_pipeline_schedule = monkey_patch_pipeline_schedule()
+    restore_fn_pipeline_stage = monkey_patch_pipeline_stage()
+
     local_rank = int(os.environ.get("LOCAL_RANK"))
     rank = int(os.environ.get("RANK"))
     logger.info(f"rank {rank} and local rank {local_rank}")

@@ -8,6 +8,9 @@ from typing import Callable, List, Dict, Any, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch.distributed.pipelining._debug import map_debug_info
+from torch.distributed.pipelining._utils import flatten_args
+from torch.distributed.pipelining.stage import _normalize_model_output_as_tuple
 
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
@@ -273,3 +276,144 @@ def create_microbatch_index_tensor(batch_size: int, n_microbatches: int) -> torc
     microbatch_size = batch_size // n_microbatches
     reshaped_indices = indices.view(n_microbatches, microbatch_size, 1)
     return reshaped_indices
+
+
+def prepare_mask_microbatches(
+        mask: torch.Tensor,
+        batch_size: int,
+        n_microbatches: int
+):
+
+    if mask is None:
+        return [{}] * n_microbatches
+
+    microbatch_size = batch_size // n_microbatches
+    kwarg_mbs = []
+
+    for mb_idx in range(n_microbatches):
+        # Calculate slice indices
+        start_idx = mb_idx * microbatch_size
+        end_idx = start_idx + microbatch_size
+
+        # Create kwargs dict with only the mask for this microbatch
+        kwarg_mbs.append({'mask': mask[start_idx:end_idx]})
+
+    return kwarg_mbs
+
+
+def monkey_patch_pipeline_schedule():
+    """
+    Monkey-patches the PipelineSchedule to properly handle loss computation
+    with additional kwargs specific to each microbatch.
+    """
+    from torch.distributed.pipelining.schedules import _PipelineSchedule
+    import types
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # Store original methods
+    original_maybe_compute_loss = _PipelineSchedule._maybe_compute_loss
+    original_compute_loss = _PipelineSchedule._compute_loss
+
+    def patched_maybe_compute_loss(self, stage, output, target_mbs, mb_index):
+        """
+        Patched version that passes mb_index to _compute_loss.
+        """
+        if stage.is_last and self._has_backward:
+            loss = self._compute_loss(output, target_mbs[mb_index], mb_index)
+            self._internal_losses.append(loss)
+            return loss
+        return None
+
+    def patched_compute_loss(self, output, target, mb_index):
+        """
+        Patched version that passes mb_index to the loss function.
+        """
+        return self._loss_fn(output, target, mb_index)
+
+    # Apply the patches
+    _PipelineSchedule._maybe_compute_loss = patched_maybe_compute_loss
+    _PipelineSchedule._compute_loss = patched_compute_loss
+
+    logger.info("Successfully monkey-patched PipelineSchedule loss computation methods")
+
+    # Return a function to restore the original if needed
+    def restore_original():
+        _PipelineSchedule._maybe_compute_loss = original_maybe_compute_loss
+        _PipelineSchedule._compute_loss = original_compute_loss
+        logger.info("Restored original PipelineSchedule methods")
+
+    return restore_original
+
+
+def monkey_patch_pipeline_stage():
+    """
+    Monkey-patches PyTorch's pipeline stage implementation to exclude specified kwargs
+    from backward pass computation.
+    """
+    from torch.distributed.pipelining.stage import _PipelineStageBase
+    import types
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # Store original method for reference and safety
+    original_forward_one_chunk = _PipelineStageBase.forward_one_chunk
+
+    def patched_forward_one_chunk(self, fwd_chunk_id, args, kwargs=None):
+        """
+        Patched version of forward_one_chunk that excludes specified kwargs from backward computation.
+        """
+        if self.is_first:
+            composite_args = args
+        else:
+            composite_args = self._retrieve_recv_activations(fwd_chunk_id)
+
+        composite_kwargs = kwargs or {}
+
+        self._validate_fwd_input(args, kwargs)
+
+        # Compute forward
+        try:
+            output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
+
+        except Exception as e:
+            exc_msg = f"""
+                {self.log_prefix} failed to run forward:
+                args: {map_debug_info(composite_args)}
+                kwargs: {map_debug_info(composite_kwargs)}
+                """
+            raise RuntimeError(exc_msg) from e
+
+        # Normalize output for pipeline
+        output_tuple = _normalize_model_output_as_tuple(output)
+
+        self.output_chunks.append(output)
+
+        # Save only the filtered inputs for backward
+        flat_args = flatten_args(composite_args)
+        # DON'T include kwargs in the input tensors.
+        flatten_input_tensors = flat_args
+        self.fwd_cache[fwd_chunk_id] = (output_tuple, flatten_input_tensors)
+
+        logger.debug(
+            "%s Forwarded chunk %s, outputs: %s",
+            self.log_prefix,
+            fwd_chunk_id,
+            map_debug_info(output),
+        )
+
+        self._validate_fwd_outputs(output_tuple)
+        return output
+
+    # Apply the monkey patch
+    _PipelineStageBase.forward_one_chunk = types.MethodType(patched_forward_one_chunk, _PipelineStageBase)
+    logger.info("Successfully monkey-patched _PipelineStageBase.forward_one_chunk")
+
+    # Return a function to restore the original if needed
+    def restore_original():
+        _PipelineStageBase.forward_one_chunk = original_forward_one_chunk
+        logger.info("Restored original _PipelineStageBase.forward_one_chunk")
+
+    return restore_original

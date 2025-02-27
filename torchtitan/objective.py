@@ -14,15 +14,47 @@ class Objective:
     @staticmethod
     def get_loss_function(loss_type):
         if loss_type == "default":
-            return Objective.default_loss
+            loss_fn = Objective.default_loss
         elif loss_type == "classification":
-            return Objective.classification_loss
+            loss_fn = Objective.classification_loss
         elif loss_type == "classification_with_packing":
-            return Objective.classification_loss_with_packing
+            loss_fn = Objective.classification_loss_with_packing
         elif loss_type == "dpo_with_packing":
-            return Objective.dpo_loss_with_packing
+            loss_fn = Objective.dpo_loss_with_packing
         else:
             raise ValueError(f"Unsupported loss function: {loss_type}")
+
+        return Objective.wrap_loss_fn(loss_fn)
+
+    @staticmethod
+    def wrap_loss_fn(loss_fn):
+        """
+        Wraps a loss function to handle direct parameters or mb_index slicing.
+        Supports both explicit parameter passing and mb_index-based retrieval.
+        """
+
+        def wrapped_loss(logits, labels, reference_logits=None, document_ids=None, mb_index=None):
+            # If parameters weren't directly provided but mb_index is available, get from state
+            if reference_logits is None and mb_index is not None and state.REFERENCE_LOGITS is not None:
+                if state.MICROBATCH_SIZE is not None:
+                    start_idx = mb_index * state.MICROBATCH_SIZE
+                    end_idx = start_idx + min(state.MICROBATCH_SIZE, labels.size(0))
+                    reference_logits = state.REFERENCE_LOGITS[start_idx:end_idx]
+                else:
+                    reference_logits = state.REFERENCE_LOGITS
+
+            if document_ids is None and mb_index is not None and state.DOCUMENT_IDS is not None:
+                if state.MICROBATCH_SIZE is not None:
+                    start_idx = mb_index * state.MICROBATCH_SIZE
+                    end_idx = start_idx + min(state.MICROBATCH_SIZE, labels.size(0))
+                    document_ids = state.DOCUMENT_IDS[start_idx:end_idx]
+                else:
+                    document_ids = state.DOCUMENT_IDS
+
+            # Call the original loss function with either passed or retrieved tensors
+            return loss_fn(logits, labels, reference_logits, document_ids)
+
+        return wrapped_loss
 
     @staticmethod
     def default_loss(logits, labels, reference_logits=None, document_ids=None):
@@ -52,15 +84,6 @@ class Objective:
     def classification_loss_with_packing(logits: torch.Tensor, labels: torch.Tensor,
                                          reference_logits: Optional[torch.Tensor] = None,
                                          document_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-
-        if document_ids is None:
-            if state.DOCUMENT_IDS is not None:
-                document_ids = state.get_sliced_tensor_by_hash(state.DOCUMENT_IDS, labels)
-
-        if document_ids is None:
-            logger.warning("document_ids not provided for classification_loss_with_packing. "
-                           "Falling back to standard classification loss.")
-            return Objective.classification_loss(logits, labels)
 
         batch_size, seq_len, vocab_size = logits.shape
 
