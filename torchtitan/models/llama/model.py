@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
+from torchtitan import state
 from torchtitan.models.llama.attention_utils import sdpa_or_flex_attention
 from torchtitan.models.norms import build_norm
 from torchtitan.train_spec import BaseModelArgs, ModelProtocol
@@ -431,7 +432,7 @@ class Transformer(nn.Module, ModelProtocol):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, mask = None):
+    def forward(self, tokens: torch.Tensor, mask = None, microbatch_indices=None):
         """
         Perform a forward pass through the Transformer model.
 
@@ -442,6 +443,12 @@ class Transformer(nn.Module, ModelProtocol):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
+        # Get attention mask from state if not provided directly
+        if mask is None and microbatch_indices is not None and state.ATTENTION_MASK is not None:
+            if microbatch_indices is not None:
+                # Get the slice using explicit indices
+                mask = state.get_sliced_tensor_by_indices(state.ATTENTION_MASK, microbatch_indices)
+
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 

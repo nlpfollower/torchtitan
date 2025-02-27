@@ -30,7 +30,7 @@ from torchtitan.objective import Objective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.model_converter import build_model_converters
 from torchtitan.parallelisms import ParallelDims
-from torchtitan.parallelisms.pipeline import pipeline_forward
+from torchtitan.parallelisms.pipeline import pipeline_forward, create_microbatch_index_tensor
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from torchtitan import state
 
@@ -399,22 +399,26 @@ def main(job_config: JobConfig):
                     reference_logits = reference_model(input_ids, attention_mask)
 
             if parallel_dims.pp_enabled:
-                if document_ids is not None:
-                    state.DOCUMENT_IDS = document_ids
-                if reference_logits is not None:
-                    state.REFERENCE_LOGITS = reference_logits
+                state.set_state_tensors(
+                    document_ids=document_ids,
+                    reference_logits=reference_logits,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+
+                microbatch_indices = create_microbatch_index_tensor(
+                    job_config.training.batch_size, job_config.experimental.pipeline_parallel_microbatches)
 
                 # Pipeline Parallel forward / backward inside step() call
                 # TODO: Fix for DPO
                 with train_context(optional_context_parallel_ctx):
                     targets, losses = (labels, []) if has_last_stage else (None, None)
-                    ref_targets = (reference_logits,) if has_last_stage and reference_logits is not None else None
 
                     # Pass reference_logits as an additional target if available
                     if has_first_stage:
-                        pp_schedule.step(input_ids, target=targets, losses=losses, **{"mask": attention_mask})
+                        pp_schedule.step(input_ids, target=targets, losses=losses, microbatch_indices=microbatch_indices)
                     else:
-                        pp_schedule.step(target=targets, losses=losses, **{"mask": attention_mask})
+                        pp_schedule.step(target=targets, losses=losses, microbatch_indices=microbatch_indices)
 
                 # accumulate losses across pipeline microbatches
                 # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
@@ -651,7 +655,6 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                     pp_size=pp_size,
                     inputs=input_ids,
                     mask=attention_mask,
-                    document_ids=document_ids,
                     stages_initialized=True,
                 )
 

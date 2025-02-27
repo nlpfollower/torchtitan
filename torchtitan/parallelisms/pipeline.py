@@ -179,7 +179,6 @@ def pipeline_forward(
         pp_size: int,
         inputs: Any,
         mask: Optional[torch.Tensor] = None,
-        document_ids: Optional[torch.Tensor] = None,
         stages_initialized: bool = True,
 ) -> Tuple[Any, bool]:
     """
@@ -187,13 +186,10 @@ def pipeline_forward(
 
     Args:
         stages: List of pipeline stages available on this rank
+        pp_size: Pipeline parallel size
         inputs: Input tensor(s) to process
         mask: Optional attention mask
-        document_ids: Optional document IDs for block attention
         stages_initialized: Whether stages have been initialized already
-        device_type: Device type (cuda/cpu)
-        pp_size: Pipeline parallel size
-        pp_rank: Pipeline parallel rank
 
     Returns:
         tuple: (output tensor or None, has_last_stage flag)
@@ -206,11 +202,6 @@ def pipeline_forward(
     stage_map = {stage.stage_index: stage for stage in stages}
     has_last_stage = any(stage.is_last for stage in stages)
     total_stages = len(stage_map) * pp_size if pp_size else max(stage_map.keys()) + 1
-
-    # Set document_ids in state if available
-    if document_ids is not None:
-        from torchtitan import state
-        state.DOCUMENT_IDS = document_ids
 
     # Initialize stages if needed
     next_args: tuple[Any, ...] = tuple()
@@ -267,3 +258,18 @@ def _batch_p2p(p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
     if len(p2p_ops) == 0:
         return None
     return dist.batch_isend_irecv(p2p_ops).pop()
+
+
+def create_microbatch_index_tensor(batch_size: int, n_microbatches: int) -> torch.Tensor:
+    """
+    Create a tensor of indices [0..batch_size-1] shaped for microbatches.
+    Returns a tensor with requires_grad=True for backprop compatibility.
+    """
+    indices = torch.arange(batch_size, dtype=torch.float32)
+    # Make indices differentiable to avoid backward pass errors
+    indices.requires_grad_(True)
+
+    # Reshape into (n_microbatches, microbatch_size, 1)
+    microbatch_size = batch_size // n_microbatches
+    reshaped_indices = indices.view(n_microbatches, microbatch_size, 1)
+    return reshaped_indices

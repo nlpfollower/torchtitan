@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from aiohttp.web_routedef import static
 from torch import nn
 
+from torchtitan import state
 from torchtitan.logging import logger
 
 
@@ -53,11 +54,8 @@ class Objective:
                                          document_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         if document_ids is None:
-            try:
-                from torchtitan import state
-                document_ids = state.DOCUMENT_IDS
-            except (ImportError, AttributeError):
-                pass
+            if state.DOCUMENT_IDS is not None:
+                document_ids = state.get_sliced_tensor_by_hash(state.DOCUMENT_IDS, labels)
 
         if document_ids is None:
             logger.warning("document_ids not provided for classification_loss_with_packing. "
