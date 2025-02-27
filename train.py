@@ -30,8 +30,8 @@ from torchtitan.objective import Objective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.model_converter import build_model_converters
 from torchtitan.parallelisms import ParallelDims
-from torchtitan.parallelisms.pipeline import pipeline_forward, create_microbatch_index_tensor, \
-    monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule, prepare_mask_microbatches
+from torchtitan.parallelisms.pipeline import pipeline_forward, \
+    monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from torchtitan import state
 
