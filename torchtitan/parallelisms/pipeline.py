@@ -263,21 +263,6 @@ def _batch_p2p(p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
     return dist.batch_isend_irecv(p2p_ops).pop()
 
 
-def create_microbatch_index_tensor(batch_size: int, n_microbatches: int) -> torch.Tensor:
-    """
-    Create a tensor of indices [0..batch_size-1] shaped for microbatches.
-    Returns a tensor with requires_grad=True for backprop compatibility.
-    """
-    indices = torch.arange(batch_size, dtype=torch.float32)
-    # Make indices differentiable to avoid backward pass errors
-    indices.requires_grad_(True)
-
-    # Reshape into (n_microbatches, microbatch_size, 1)
-    microbatch_size = batch_size // n_microbatches
-    reshaped_indices = indices.view(n_microbatches, microbatch_size, 1)
-    return reshaped_indices
-
-
 def prepare_mask_microbatches(
         mask: torch.Tensor,
         batch_size: int,

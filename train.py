@@ -31,7 +31,7 @@ from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.model_converter import build_model_converters
 from torchtitan.parallelisms import ParallelDims
 from torchtitan.parallelisms.pipeline import pipeline_forward, create_microbatch_index_tensor, \
-    monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule
+    monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule, prepare_mask_microbatches
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from torchtitan import state
 
@@ -412,8 +412,11 @@ def main(job_config: JobConfig):
                     labels=labels
                 )
 
-                microbatch_indices = create_microbatch_index_tensor(
-                    job_config.training.batch_size, job_config.experimental.pipeline_parallel_microbatches)
+                kwarg_mbs = prepare_mask_microbatches(
+                    mask=attention_mask,
+                    batch_size=job_config.training.batch_size,
+                    n_microbatches=job_config.experimental.pipeline_parallel_microbatches
+                )
 
                 # Pipeline Parallel forward / backward inside step() call
                 # TODO: Fix for DPO
@@ -422,9 +425,9 @@ def main(job_config: JobConfig):
 
                     # Pass reference_logits as an additional target if available
                     if has_first_stage:
-                        pp_schedule.step(input_ids, target=targets, losses=losses, microbatch_indices=microbatch_indices)
+                        pp_schedule.step(input_ids, target=targets, losses=losses, kwarg_mbs=kwarg_mbs)
                     else:
-                        pp_schedule.step(target=targets, losses=losses, microbatch_indices=microbatch_indices)
+                        pp_schedule.step(target=targets, losses=losses, kwarg_mbs=kwarg_mbs)
 
                 # accumulate losses across pipeline microbatches
                 # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
