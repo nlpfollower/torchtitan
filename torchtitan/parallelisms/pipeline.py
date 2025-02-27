@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.pipelining._debug import map_debug_info
 from torch.distributed.pipelining._utils import flatten_args
-from torch.distributed.pipelining.stage import _normalize_model_output_as_tuple
+from torch.distributed.pipelining.stage import _normalize_model_output_as_tuple, _PipelineStageBase
 
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
@@ -292,7 +292,7 @@ def monkey_patch_pipeline_schedule():
         """
         Patched version that passes mb_index to the loss function.
         """
-        return self._loss_fn(output, target, mb_index)
+        return self._loss_fn(output, target, mb_index=mb_index)
 
     # Apply the patches
     _PipelineSchedule._maybe_compute_loss = patched_maybe_compute_loss
@@ -314,8 +314,6 @@ def monkey_patch_pipeline_stage():
     Monkey-patches PyTorch's pipeline stage implementation to exclude specified kwargs
     from backward pass computation.
     """
-    from torch.distributed.pipelining.stage import _PipelineStageBase
-    import types
     import logging
 
     logger = logging.getLogger(__name__)
@@ -334,7 +332,7 @@ def monkey_patch_pipeline_stage():
 
         composite_kwargs = kwargs or {}
 
-        self._validate_fwd_input(args, kwargs)
+        self._validate_fwd_input(args, composite_kwargs)
 
         # Compute forward
         try:
@@ -350,10 +348,8 @@ def monkey_patch_pipeline_stage():
 
         # Normalize output for pipeline
         output_tuple = _normalize_model_output_as_tuple(output)
-
         self.output_chunks.append(output)
 
-        # Save only the filtered inputs for backward
         flat_args = flatten_args(composite_args)
         # DON'T include kwargs in the input tensors.
         flatten_input_tensors = flat_args
@@ -369,8 +365,8 @@ def monkey_patch_pipeline_stage():
         self._validate_fwd_outputs(output_tuple)
         return output
 
-    # Apply the monkey patch
-    _PipelineStageBase.forward_one_chunk = types.MethodType(patched_forward_one_chunk, _PipelineStageBase)
+    # Apply the patch directly to the class - this is the key fix
+    _PipelineStageBase.forward_one_chunk = patched_forward_one_chunk
     logger.info("Successfully monkey-patched _PipelineStageBase.forward_one_chunk")
 
     # Return a function to restore the original if needed
