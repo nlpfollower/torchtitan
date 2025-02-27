@@ -263,29 +263,6 @@ def _batch_p2p(p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
     return dist.batch_isend_irecv(p2p_ops).pop()
 
 
-def prepare_mask_microbatches(
-        mask: torch.Tensor,
-        batch_size: int,
-        n_microbatches: int
-):
-
-    if mask is None:
-        return [{}] * n_microbatches
-
-    microbatch_size = batch_size // n_microbatches
-    kwarg_mbs = []
-
-    for mb_idx in range(n_microbatches):
-        # Calculate slice indices
-        start_idx = mb_idx * microbatch_size
-        end_idx = start_idx + microbatch_size
-
-        # Create kwargs dict with only the mask for this microbatch
-        kwarg_mbs.append({'mask': mask[start_idx:end_idx]})
-
-    return kwarg_mbs
-
-
 def monkey_patch_pipeline_schedule():
     """
     Monkey-patches the PipelineSchedule to properly handle loss computation

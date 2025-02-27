@@ -409,25 +409,21 @@ def main(job_config: JobConfig):
                     document_ids=document_ids,
                     reference_logits=reference_logits,
                     attention_mask=attention_mask,
-                    labels=labels
-                )
-
-                kwarg_mbs = prepare_mask_microbatches(
-                    mask=attention_mask,
+                    labels=labels,
                     batch_size=job_config.training.batch_size,
                     n_microbatches=job_config.experimental.pipeline_parallel_microbatches
                 )
 
                 # Pipeline Parallel forward / backward inside step() call
-                # TODO: Fix for DPO
                 with train_context(optional_context_parallel_ctx):
                     targets, losses = (labels, []) if has_last_stage else (None, None)
 
-                    # Pass reference_logits as an additional target if available
+                    # Pass mask as a regular keyword argument - it will be automatically
+                    # split into microbatches by PyTorch's pipeline implementation
                     if has_first_stage:
-                        pp_schedule.step(input_ids, target=targets, losses=losses, kwarg_mbs=kwarg_mbs)
+                        pp_schedule.step(input_ids, target=targets, losses=losses, mask=attention_mask)
                     else:
-                        pp_schedule.step(target=targets, losses=losses, kwarg_mbs=kwarg_mbs)
+                        pp_schedule.step(target=targets, losses=losses, mask=attention_mask)
 
                 # accumulate losses across pipeline microbatches
                 # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
