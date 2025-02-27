@@ -409,7 +409,6 @@ def main(job_config: JobConfig):
                     document_ids=document_ids,
                     reference_logits=reference_logits,
                     attention_mask=attention_mask,
-                    labels=labels,
                     batch_size=job_config.training.batch_size,
                     n_microbatches=job_config.experimental.pipeline_parallel_microbatches
                 )

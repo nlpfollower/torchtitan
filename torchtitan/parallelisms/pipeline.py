@@ -332,11 +332,17 @@ def monkey_patch_pipeline_stage():
 
         composite_kwargs = kwargs or {}
 
-        self._validate_fwd_input(args, composite_kwargs)
+        # Extract mask from kwargs for forward pass, but don't include in backward
+        mask = composite_kwargs.pop('mask', None) if composite_kwargs else None
+        forward_kwargs = composite_kwargs.copy()
+        if mask is not None:
+            forward_kwargs['mask'] = mask
+
+        self._validate_fwd_input(args, forward_kwargs)
 
         # Compute forward
         try:
-            output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
+            output = self.forward_maybe_with_nosync(*composite_args, **forward_kwargs)
 
         except Exception as e:
             exc_msg = f"""
@@ -351,8 +357,8 @@ def monkey_patch_pipeline_stage():
         self.output_chunks.append(output)
 
         flat_args = flatten_args(composite_args)
-        # DON'T include kwargs in the input tensors.
-        flatten_input_tensors = flat_args
+        flat_kwargs = flatten_args(composite_kwargs)
+        flatten_input_tensors = flat_args + flat_kwargs
         self.fwd_cache[fwd_chunk_id] = (output_tuple, flatten_input_tensors)
 
         logger.debug(

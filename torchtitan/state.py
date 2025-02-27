@@ -9,7 +9,7 @@ MICROBATCH_SIZE = None
 N_MICROBATCHES = None
 
 
-def set_state_tensors(document_ids=None, reference_logits=None, attention_mask=None, labels=None, batch_size=None,
+def set_state_tensors(document_ids=None, reference_logits=None, attention_mask=None, batch_size=None,
                       n_microbatches=None):
     """Initialize global state with tensor data and microbatch information."""
     global DOCUMENT_IDS, REFERENCE_LOGITS, ATTENTION_MASK, MICROBATCH_SIZE, N_MICROBATCHES
