@@ -22,11 +22,12 @@ def extract_anthropic_prompt(prompt_and_response: str) -> str:
 
 class HHDataset(IterableDataset):
     def __init__(self, tokenizer: Tokenizer, split: str = "train", seq_len: int = 2048, batch_size: int = 1,
-                 cache_dir: str = None, mode: str = "align",  world_size: int = 1, rank: int = 0):
+                 cache_dir: str = None, mode: str = "align", packing: bool = False, world_size: int = 1, rank: int = 0):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.batch_size = batch_size
         self.chat_format = ChatFormat(tokenizer)
+        self.packing = packing
         self.mode = mode
         if mode not in ["align", "sft"]:
             raise ValueError("Mode must be either 'align' or 'sft'")
@@ -52,32 +53,46 @@ class HHDataset(IterableDataset):
             prompt_tokens, chosen_tokens, rejected_tokens = self.process_row(row)
             sample = self.process_sample(prompt_tokens, chosen_tokens, rejected_tokens)
 
-            if current_length + len(sample['input_ids']) > self.seq_len:
-                # Pad the current sample to seq_len and add it to the current batch
-                self.pad_sample(current_sample, self.seq_len)
-                current_batch.append(current_sample)
+            assert len(sample['input_ids']) <= self.seq_len, f"Sample is too long: {len(sample['input_ids'])}"
+
+            if self.packing:
+                # Packing mode: combine multiple samples into a sequence up to seq_len
+                if current_length + len(sample['input_ids']) > self.seq_len:
+                    # Current sample is full, finalize it and start a new one
+                    self.pad_sample(current_sample, self.seq_len)
+                    current_batch.append(current_sample)
+
+                    if len(current_batch) == self.batch_size:
+                        batches.append(self.prepare_batch(current_batch))
+                        current_batch = []
+
+                    current_sample = {"input_ids": [], "labels": [], "document_ids": []}
+                    current_length = 0
+                    current_doc_id = 0
+
+                # Extend the current sample with the new data
+                current_sample["input_ids"].extend(sample["input_ids"])
+                current_sample["labels"].extend(sample["labels"])
+                current_sample["document_ids"].extend([id + current_doc_id for id in sample["document_ids"]])
+
+                current_length += len(sample['input_ids'])
+                current_doc_id += 1 if self.mode == "sft" else 2
+            else:
+                # Non-packing mode: each sample is individually processed
+                self.pad_sample(sample, self.seq_len)
+
+                current_batch.append(sample)
 
                 if len(current_batch) == self.batch_size:
                     batches.append(self.prepare_batch(current_batch))
                     current_batch = []
 
-                current_sample = {"input_ids": [], "labels": [], "document_ids": []}
-                current_length = 0
-                current_doc_id = 0
-
-            # Extend the current sample with the new data
-            current_sample["input_ids"].extend(sample["input_ids"])
-            current_sample["labels"].extend(sample["labels"])
-            current_sample["document_ids"].extend([id + current_doc_id for id in sample["document_ids"]])
-
-            current_length += len(sample['input_ids'])
-            current_doc_id += 1 if self.mode == "sft" else 2
-
-        # Handle any remaining data
-        if current_sample["input_ids"]:
+        # Handle any remaining data in packing mode
+        if self.packing and current_sample["input_ids"]:
             self.pad_sample(current_sample, self.seq_len)
             current_batch.append(current_sample)
 
+        # Handle any remaining batch (for both modes)
         if current_batch:
             while len(current_batch) < self.batch_size:
                 current_batch.append(self.create_empty_sample())
@@ -150,6 +165,8 @@ class HHDataset(IterableDataset):
         return prompt_tokens, chosen_tokens, rejected_tokens
 
     def process_sample(self, prompt: List[int], chosen: List[int], rejected: List[int]) -> Dict[str, List[int]]:
+        """Process tokens into format needed for training based on mode (align or sft)"""
+
         if self.mode == "align":
             input_ids = prompt + chosen + prompt + rejected
             labels = [-100] * len(prompt) + chosen + [-100] * len(prompt) + rejected
@@ -166,6 +183,7 @@ class HHDataset(IterableDataset):
         }
 
     def pad_sample(self, sample: Dict[str, List[int]], target_length: int):
+        """Pad sample to target length if needed"""
         pad_length = target_length - len(sample['input_ids'])
         sample['input_ids'].extend([self.tokenizer.pad_id] * pad_length)
         sample['labels'].extend([-100] * pad_length)
@@ -176,7 +194,10 @@ class HHDataset(IterableDataset):
             key: torch.tensor([sample[key] for sample in samples], dtype=torch.long)
             for key in ['input_ids', 'labels', 'document_ids']
         }
-        batch['attention_mask'] = create_document_causal_mask(batch['document_ids'])
+
+        # Create attention mask only in packing mode
+        if self.packing:
+            batch['attention_mask'] = create_document_causal_mask(batch['document_ids'])
 
         return batch
 
@@ -185,7 +206,6 @@ class HHDataset(IterableDataset):
             "input_ids": [self.tokenizer.pad_id] * self.seq_len,
             "labels": [-100] * self.seq_len,
             "document_ids": [-1] * self.seq_len,
-            "attention_mask": None
         }
 
     def __len__(self):
@@ -213,8 +233,22 @@ def build_hh_data_loader(
     num_workers: int = 0,
     cache_dir: str = None,
     mode: str = "sft",
+    packing: bool = False,
+    world_size: int = 1,
+    rank: int = 0,
 ) -> DataLoader:
-    dataset = HHDataset(tokenizer, split=split, seq_len=seq_len, batch_size=batch_size, cache_dir=cache_dir, mode=mode)
+    """Build a DataLoader for the HH dataset with specified configuration"""
+    dataset = HHDataset(
+        tokenizer=tokenizer,
+        split=split,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        cache_dir=cache_dir,
+        mode=mode,
+        packing=packing,
+        world_size=world_size,
+        rank=rank
+    )
     return DataLoader(
         dataset,
         batch_size=None,  # We've already handled batching in the dataset

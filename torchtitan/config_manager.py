@@ -246,6 +246,11 @@ class JobConfig:
             choices=["align", "sft"],
             help="Dataset mode: 'align' for preference pairs, 'sft' for single completions"
         )
+        self.parser.add_argument(
+            "--training.dataset_packing",
+            action="store_true",
+            help="Whether to pack multiple samples into a single sequence up to seq_len"
+        )
 
         self.parser.add_argument(
             "--training.dataset", type=str, default="c4_test", help="Dataset to use"
@@ -350,7 +355,7 @@ class JobConfig:
             """,
         )
         self.parser.add_argument(
-            "--training.use_block_attention_mask",
+            "--training.use_attention_mask",
             action="store_true",
             help="Whether to use block attention masking for datasets that support it"
         )

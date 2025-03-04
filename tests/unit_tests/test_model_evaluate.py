@@ -59,7 +59,7 @@ def setup_job_config(args):
     job_config.training.dataset_type = "custom"
     job_config.training.dataset = "hh"
     job_config.training.loss_function = "classification_with_packing"
-    job_config.training.use_block_attention_mask = True
+    job_config.training.use_attention_mask = True
     job_config.evaluation.batch_size = 2
     job_config.experimental.pipeline_parallel_microbatches = 2
     job_config.training.batch_size = 2
@@ -91,10 +91,12 @@ def evaluate(model, rank, world_size, eval_iter, loss_fn, world_mesh, device_typ
 
             input_ids = batch['input_ids'].to(device_type)
             labels = batch['labels'].to(device_type)
-            attention_mask = batch['attention_mask'].to(device_type)
             document_ids = batch['document_ids'].to(device_type)
+            attention_mask = None
+            if "attention_mask" in batch:
+                attention_mask = batch['attention_mask'].to(device_type)
 
-            logits = model(input_ids, attention_mask)
+            logits = model(input_ids, mask=attention_mask)
             loss = torch.zeros(1, dtype=next(model.parameters()).dtype, device=device_type)
 
             # Compute loss only on last stage
@@ -102,7 +104,7 @@ def evaluate(model, rank, world_size, eval_iter, loss_fn, world_mesh, device_typ
                 loss = loss_fn(logits, labels, document_ids=document_ids).reshape(1)
 
             # Broadcast loss if using pipeline parallel
-            if "pp" in world_mesh.mesh_dim_names:
+            if world_mesh.mesh_dim_names is not None and "pp" in world_mesh.mesh_dim_names:
                 pp_group = world_mesh["pp"].get_group()
                 last_stage_rank = model.stages[0].stage_index_to_group_rank[model.total_stages - 1]
 

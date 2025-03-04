@@ -269,7 +269,6 @@ def monkey_patch_pipeline_schedule():
     with additional kwargs specific to each microbatch.
     """
     from torch.distributed.pipelining.schedules import _PipelineSchedule
-    import types
     import logging
 
     logger = logging.getLogger(__name__)

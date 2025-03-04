@@ -134,7 +134,8 @@ def main(job_config: JobConfig):
             dp_degree,
             dp_rank,
             device_type,
-            mode=job_config.training.dataset_mode
+            mode=job_config.training.dataset_mode,
+            packing=job_config.training.dataset_packing
         )
         if job_config.evaluation.enabled:
             eval_data_loader = build_custom_data_loader(
@@ -147,7 +148,8 @@ def main(job_config: JobConfig):
                 dp_degree,
                 dp_rank,
                 device_type,
-                mode=job_config.training.dataset_mode
+                mode=job_config.training.dataset_mode,
+                packing=job_config.training.dataset_packing
             )
     else:
         raise ValueError(f"Unsupported dataset type: {job_config.training.dataset_type}")
@@ -372,10 +374,11 @@ def main(job_config: JobConfig):
                 input_ids, labels = batch['input_ids'], batch['labels']
             except TypeError:
                 input_ids, labels = batch[0], batch[1]
-            attention_mask = None
             document_ids = None
-            if job_config.training.use_block_attention_mask and 'document_ids' in batch:
+            attention_mask = None
+            if 'document_ids' in batch:
                 document_ids = batch['document_ids'].to(device_type)
+            if 'attention_mask' in batch:
                 attention_mask = batch['attention_mask'].to(device_type)
 
             ntokens_since_last_log += labels.numel()
@@ -435,7 +438,7 @@ def main(job_config: JobConfig):
                 # Non-PP forward / backward
                 with train_context(optional_context_parallel_ctx):
                     forward_start = time.perf_counter()
-                    logits = model(input_ids, attention_mask)
+                    logits = model(input_ids, mask=attention_mask)
                     forward_end = time.perf_counter()
 
                     loss = loss_fn(logits, labels, reference_logits, document_ids)
