@@ -340,18 +340,24 @@ def main(job_config: JobConfig):
         'device_type': device_type,
         'world_mesh': world_mesh,
     }
+    stages_initialized = False
     with maybe_enable_profiling(
         job_config, global_step=train_state.step
     ) as torch_profiler, maybe_enable_memory_snapshot(
         job_config, global_step=train_state.step
     ) as memory_profiler:
         is_dataset_exhausted = torch.zeros(world_size, dtype=torch.bool, device=device)
+        model_timers = []  # Will store (forward_time, backward_time) or (step_time) tuples
+        eval_timers = []  # Will store eval_time list
+        last_log_time = time.perf_counter()
         while train_state.step < job_config.training.steps:
             # Evaluation step
             if job_config.evaluation.enabled and train_state.step % job_config.evaluation.interval == 0:
-                evaluate(eval_components, job_config, train_state.step, metric_logger)
+                eval_start = time.perf_counter()
+                evaluate(eval_components, job_config, train_state.step, metric_logger, stages_initialized)
+                eval_timers.append(time.perf_counter()-eval_start)
+            stages_initialized = False
 
-            time_last_log = time.perf_counter()
             train_state.step += 1
             gc_handler.run(train_state.step)
 
@@ -416,6 +422,9 @@ def main(job_config: JobConfig):
                     n_microbatches=job_config.experimental.pipeline_parallel_microbatches
                 )
 
+                # For PP, measure the entire step time
+                pp_step_start = time.perf_counter()
+
                 # Pipeline Parallel forward / backward inside step() call
                 with train_context(optional_context_parallel_ctx):
                     targets, losses = (labels, []) if has_last_stage else (None, None)
@@ -426,6 +435,8 @@ def main(job_config: JobConfig):
                         pp_schedule.step(input_ids, target=targets, losses=losses, mask=attention_mask)
                     else:
                         pp_schedule.step(target=targets, losses=losses, mask=attention_mask)
+
+                model_timers.append(time.perf_counter() - pp_step_start)
 
                 # accumulate losses across pipeline microbatches
                 # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
@@ -439,7 +450,7 @@ def main(job_config: JobConfig):
                 with train_context(optional_context_parallel_ctx):
                     forward_start = time.perf_counter()
                     logits = model(input_ids, mask=attention_mask)
-                    forward_end = time.perf_counter()
+                    forward_time = time.perf_counter() - forward_start
 
                     loss = loss_fn(logits, labels, reference_logits, document_ids)
                     # Free memory before backward pass
@@ -447,13 +458,8 @@ def main(job_config: JobConfig):
 
                     backward_start = time.perf_counter()
                     loss.backward()
-                    backward_end = time.perf_counter()
-
-                forward_time = forward_end - forward_start
-                backward_time = backward_end - backward_start
-
-                logger.info(
-                    f"Step {train_state.step}: Forward time: {forward_time:.4f}s, Backward time: {backward_time:.4f}s")
+                    backward_time = time.perf_counter() - backward_start
+                    model_timers.append((forward_time, backward_time))
 
             # clip gradients
             utils.clip_grad_norm_(
@@ -473,6 +479,9 @@ def main(job_config: JobConfig):
                 train_state.step == 1
                 or train_state.step % job_config.metrics.log_freq == 0
             ):
+                current_time = time.perf_counter()
+                eval_time = sum(eval_timers)
+
                 if (
                     parallel_dims.dp_replicate_enabled
                     or parallel_dims.dp_shard_enabled
@@ -491,7 +500,28 @@ def main(job_config: JobConfig):
                 train_state.global_avg_losses.append(global_avg_loss)
                 train_state.global_max_losses.append(global_max_loss)
 
-                time_delta = time.perf_counter() - time_last_log
+                time_delta = current_time - last_log_time - eval_time
+
+                if parallel_dims.pp_enabled:
+                    # For PP runs, calculate average step time
+                    avg_step_time = sum(model_timers) / len(model_timers) if model_timers else 0
+                    timing_log = f"{color.cyan}step: {avg_step_time:.4f}s  "
+
+                    # Add to metrics
+                    metrics_timing = {
+                        "time_metrics/pp_step(s)": avg_step_time,
+                    }
+                else:
+                    # For non-PP runs, calculate average forward and backward times
+                    avg_forward_time = sum(t[0] for t in model_timers) / len(model_timers) if model_timers else 0
+                    avg_backward_time = sum(t[1] for t in model_timers) / len(model_timers) if model_timers else 0
+                    timing_log = f"{color.cyan}fwd: {avg_forward_time:.4f}s bwd: {avg_backward_time:.4f}s  "
+
+                    # Add to metrics
+                    metrics_timing = {
+                        "time_metrics/forward(s)": avg_forward_time,
+                        "time_metrics/backward(s)": avg_backward_time,
+                    }
 
                 # tokens per second per device, abbreviated as tps
                 tps = ntokens_since_last_log / (
@@ -525,6 +555,8 @@ def main(job_config: JobConfig):
                     "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
                     "memory/num_ooms": device_mem_stats.num_ooms,
                 }
+                metrics.update(metrics_timing)
+
                 metric_logger.log(metrics, step=train_state.step)
 
                 logger.info(
@@ -534,13 +566,18 @@ def main(job_config: JobConfig):
                     f"{color.yellow}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
                     f"({device_mem_stats.max_reserved_pct:.2f}%)  "
                     f"{color.blue}tps: {round(tps):,}  "
+                    f"{timing_log}"
                     f"{color.cyan}tflops: {tflops:,.2f}  "
                     f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
                 )
 
+                # Reset all counters after logging
                 ntokens_since_last_log = 0
-                data_loading_times.clear()
+                data_loading_times = []
+                model_timers = []
+                eval_timers = []
                 device_memory_monitor.reset_peak_stats()
+                last_log_time = time.perf_counter()
 
             # save checkpoint. If train step reaches upper bound, skip because it will be saved at the end
             if train_state.step < job_config.training.steps:
@@ -567,7 +604,7 @@ def main(job_config: JobConfig):
             # Run final evaluation if enabled
             if job_config.evaluation.enabled:
                 logger.info("Running final evaluation...")
-                final_loss, final_perplexity = evaluate(eval_components, job_config, train_state.step, metric_logger)
+                final_loss, final_perplexity = evaluate(eval_components, job_config, train_state.step, metric_logger, stages_initialized)
                 logger.info(f"Final evaluation results - Loss: {final_loss:.4f}, Perplexity: {final_perplexity:.4f}")
 
             # Save final checkpoint
@@ -588,7 +625,7 @@ def main(job_config: JobConfig):
     logger.info("Training completed")
 
 
-def evaluate(eval_components, job_config, current_step, metric_logger):
+def evaluate(eval_components, job_config, current_step, metric_logger, stages_initialized):
     logger.info(f"Starting evaluation at step {current_step} with {job_config.evaluation.num_samples} samples")
 
     model_parts = eval_components['model_parts']
@@ -662,7 +699,7 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                     pp_size=pp_size,
                     inputs=input_ids,
                     mask=attention_mask,
-                    stages_initialized=True,
+                    stages_initialized=stages_initialized,
                 )
 
                 # Initialize loss with zeros
@@ -682,7 +719,7 @@ def evaluate(eval_components, job_config, current_step, metric_logger):
                     torch.distributed.broadcast(loss, src=last_stage_rank, group=pp_group)
             else:
                 # Standard non-pipeline forward pass
-                logits = model_parts[0](input_ids, attention_mask)
+                logits = model_parts[0](input_ids, mask=attention_mask)
 
                 # Apply the appropriate loss function depending on reference model configuration
                 loss = loss_fn(logits, labels, reference_logits, document_ids)

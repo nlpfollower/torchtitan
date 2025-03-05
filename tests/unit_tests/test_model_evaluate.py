@@ -65,6 +65,7 @@ def setup_job_config(args):
     job_config.training.batch_size = 2
     job_config.evaluation.enabled = True
     job_config.training.dataset_mode = "sft"
+    job_config.training.dataset_packing = True
     job_config.evaluation.num_samples = 10
     job_config.evaluation.interval = 30
     return job_config
@@ -179,7 +180,8 @@ def run_eval():
         job_config.evaluation.batch_size,
         job_config.training.seq_len,
         split="test",
-        mode=job_config.training.dataset_mode
+        mode=job_config.training.dataset_mode,
+        packing=job_config.training.dataset_packing
     )
 
     loss_fn = Objective.get_loss_function(job_config.training.loss_function)
