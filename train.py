@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+import contextlib
 import os
 import time
 from datetime import timedelta
@@ -31,7 +31,7 @@ from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.model_converter import build_model_converters
 from torchtitan.parallelisms import ParallelDims
 from torchtitan.parallelisms.pipeline import pipeline_forward, \
-    monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule
+    monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule, PipelineEphemeralContext
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from torchtitan import state
 
@@ -655,85 +655,86 @@ def evaluate(eval_components, job_config, current_step, metric_logger, stages_in
         eval_data_loader.reset()
     eval_iterator = iter(eval_data_loader)
     is_eval_exhausted = torch.zeros(world_size, dtype=torch.bool, device=device_type)
-    with torch.no_grad():
-        for _ in range(job_config.evaluation.num_samples):
-            try:
-                eval_batch = next(eval_iterator)
-                if eval_batch == "end":
-                    is_eval_exhausted[rank] = True
-                torch.distributed.all_reduce(is_eval_exhausted)
-                if torch.any(is_eval_exhausted):
-                    logger.info(f"Rank {rank}: Evaluation data exhausted. Ending evaluation.")
+    with PipelineEphemeralContext(stages) if parallel_dims.pp_enabled and stages else contextlib.nullcontext():
+        with torch.no_grad():
+            for _ in range(job_config.evaluation.num_samples):
+                try:
+                    eval_batch = next(eval_iterator)
+                    if eval_batch == "end":
+                        is_eval_exhausted[rank] = True
+                    torch.distributed.all_reduce(is_eval_exhausted)
+                    if torch.any(is_eval_exhausted):
+                        logger.info(f"Rank {rank}: Evaluation data exhausted. Ending evaluation.")
+                        break
+                except StopIteration:
+                    logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
                     break
-            except StopIteration:
-                logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
-                break
 
-            # Extract batch data
-            try:
-                input_ids, labels = eval_batch['input_ids'], eval_batch['labels']
-            except (TypeError, KeyError):
-                input_ids, labels = eval_batch[0], eval_batch[1]
+                # Extract batch data
+                try:
+                    input_ids, labels = eval_batch['input_ids'], eval_batch['labels']
+                except (TypeError, KeyError):
+                    input_ids, labels = eval_batch[0], eval_batch[1]
 
-            input_ids = input_ids.to(device_type)
-            labels = labels.to(device_type)
+                input_ids = input_ids.to(device_type)
+                labels = labels.to(device_type)
 
-            attention_mask = None
-            if isinstance(eval_batch, dict) and 'attention_mask' in eval_batch:
-                attention_mask = eval_batch['attention_mask'].to(device_type)
+                attention_mask = None
+                if isinstance(eval_batch, dict) and 'attention_mask' in eval_batch:
+                    attention_mask = eval_batch['attention_mask'].to(device_type)
 
-            document_ids = None
-            if isinstance(eval_batch, dict) and 'document_ids' in eval_batch:
-                document_ids = eval_batch['document_ids'].to(device_type)
+                document_ids = None
+                if isinstance(eval_batch, dict) and 'document_ids' in eval_batch:
+                    document_ids = eval_batch['document_ids'].to(device_type)
 
-            # Get reference model logits if enabled - same for both PP and non-PP paths
-            reference_logits = None
-            if job_config.reference_model.enabled and reference_model is not None:
-                reference_logits = reference_model(input_ids, attention_mask)
+                # Get reference model logits if enabled - same for both PP and non-PP paths
+                reference_logits = None
+                if job_config.reference_model.enabled and reference_model is not None:
+                    reference_logits = reference_model(input_ids, attention_mask)
 
-            # Handle pipeline parallel and standard forward paths
-            if parallel_dims.pp_enabled and stages:
-                # Use the unified pipeline_forward implementation
-                output, has_last_stage = pipeline_forward(
-                    stages=stages,
-                    pp_size=pp_size,
-                    inputs=input_ids,
-                    mask=attention_mask,
-                    stages_initialized=stages_initialized,
-                )
+                # Handle pipeline parallel and standard forward paths
+                if parallel_dims.pp_enabled and stages:
+                    # Use the unified pipeline_forward implementation
+                    output, has_last_stage = pipeline_forward(
+                        stages=stages,
+                        pp_size=pp_size,
+                        inputs=input_ids,
+                        mask=attention_mask,
+                        stages_initialized=stages_initialized,
+                    )
 
-                # Initialize loss with zeros
-                loss = torch.zeros(1, dtype=torch.float32, device=device_type)
+                    # Initialize loss with zeros
+                    loss = torch.zeros(1, dtype=torch.float32, device=device_type)
 
-                # Compute loss only if we have the last stage
-                if has_last_stage and output is not None:
-                    loss = loss_fn(output, labels, reference_logits, document_ids)
+                    # Compute loss only if we have the last stage
+                    if has_last_stage and output is not None:
+                        loss = loss_fn(output, labels, reference_logits, document_ids)
 
-                # Broadcast loss from the last stage to all ranks in PP group
-                if pp_mesh:
-                    pp_group = pp_mesh.get_group()
-                    # Find the rank with the last stage
-                    num_stages = stages[0].num_stages
-                    last_stage_rank = stages[0].stage_index_to_group_rank[num_stages - 1]
-                    # Broadcast the loss from the last stage
-                    torch.distributed.broadcast(loss, src=last_stage_rank, group=pp_group)
-            else:
-                # Standard non-pipeline forward pass
-                logits = model_parts[0](input_ids, mask=attention_mask)
+                    # Broadcast loss from the last stage to all ranks in PP group
+                    if pp_mesh:
+                        pp_group = pp_mesh.get_group()
+                        # Find the rank with the last stage
+                        num_stages = stages[0].num_stages
+                        last_stage_rank = stages[0].stage_index_to_group_rank[num_stages - 1]
+                        # Broadcast the loss from the last stage
+                        torch.distributed.broadcast(loss, src=last_stage_rank, group=pp_group)
+                else:
+                    # Standard non-pipeline forward pass
+                    logits = model_parts[0](input_ids, mask=attention_mask)
 
-                # Apply the appropriate loss function depending on reference model configuration
-                loss = loss_fn(logits, labels, reference_logits, document_ids)
+                    # Apply the appropriate loss function depending on reference model configuration
+                    loss = loss_fn(logits, labels, reference_logits, document_ids)
 
-            perplexity = torch.exp(loss)
-            if parallel_dims.dp_enabled:
-                loss, perplexity = (
-                    utils.dist_mean(loss, world_mesh["dp_cp"]),
-                    utils.dist_mean(perplexity, world_mesh["dp_cp"]),
-                )
-            else:
-                loss, perplexity = loss.item(), perplexity.item()
-            eval_losses.append(loss)
-            eval_perplexities.append(perplexity)
+                perplexity = torch.exp(loss)
+                if parallel_dims.dp_enabled:
+                    loss, perplexity = (
+                        utils.dist_mean(loss, world_mesh["dp_cp"]),
+                        utils.dist_mean(perplexity, world_mesh["dp_cp"]),
+                    )
+                else:
+                    loss, perplexity = loss.item(), perplexity.item()
+                eval_losses.append(loss)
+                eval_perplexities.append(perplexity)
 
     avg_loss, avg_perplexity = 0, 0
     if len(eval_losses) > 0:

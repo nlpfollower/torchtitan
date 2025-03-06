@@ -263,6 +263,123 @@ def _batch_p2p(p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
     return dist.batch_isend_irecv(p2p_ops).pop()
 
 
+class PipelineEphemeralContext:
+    """
+    Context manager for temporarily working with pipeline stages in a clean state.
+
+    Creates an ephemeral execution environment for pipeline operations (like evaluation) by completely resetting pipeline
+    stages to their initial state, then restoring the original training state upon exit.
+
+    This context allows evaluation to run with different batch sizes or configurations without affecting the persistent
+    state needed for training. All stage metadata, communication buffers, and autograd state are preserved.
+
+    Usage:
+        with PipelineEphemeralContext(stages):
+            # Perform evaluation or other operations requiring fresh stage state
+            # Original training state is automatically restored when exiting
+    """
+
+    def __init__(self, stages):
+        """Initialize with pipeline stages."""
+        self.stages = stages
+        self.saved_state = {}
+
+    def __enter__(self):
+        """Save critical state from all pipeline stages and reset to fresh state."""
+        if not self.stages:
+            return self
+
+        # Save and reset each stage
+        for i, stage in enumerate(self.stages):
+            # Create a nested dictionary for this stage
+            stage_state = {}
+
+            # Save the output metadata (critical for tensor shape validation)
+            stage_state['_outputs_meta'] = stage._outputs_meta
+
+            # Save communication infrastructure
+            stage_state['args_recv_info'] = dict(stage.args_recv_info) if hasattr(stage, 'args_recv_info') else {}
+            stage_state['act_send_info'] = dict(stage.act_send_info) if hasattr(stage, 'act_send_info') else {}
+            stage_state['grad_recv_info'] = dict(stage.grad_recv_info) if hasattr(stage, 'grad_recv_info') else {}
+            stage_state['grad_send_info'] = stage.grad_send_info
+
+            # Save chunks configuration
+            stage_state['chunks'] = stage.chunks
+
+            # Save input shape metadata if present
+            if hasattr(stage, 'inputs_meta'):
+                stage_state['inputs_meta'] = stage.inputs_meta
+
+            # Track whether stages were initialized
+            if hasattr(stage, '_stage_initialized'):
+                stage_state['_stage_initialized'] = stage._stage_initialized
+
+            # Save backward state
+            stage_state['backward_state'] = dict(stage.backward_state)
+            stage_state['dw_runner'] = dict(stage.dw_runner)
+            stage_state['has_backward'] = stage.has_backward
+
+            # Store all saved state for this stage
+            self.saved_state[i] = stage_state
+
+            # Reset to initial state (as if freshly created)
+            stage._outputs_meta = None
+            stage.args_recv_info = {}
+            stage.act_send_info = {}
+            stage.grad_recv_info = {}
+            stage.grad_send_info = None
+            stage.chunks = None
+            if hasattr(stage, 'inputs_meta'):
+                stage.inputs_meta = None
+            if hasattr(stage, '_stage_initialized'):
+                stage._stage_initialized = False
+            stage.backward_state = {}
+            stage.dw_runner = {}
+
+            # Clear runtime states
+            stage.clear_runtime_states()
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Restore saved state to all pipeline stages."""
+        if not self.stages or not self.saved_state:
+            return
+
+        for i, stage in enumerate(self.stages):
+            if i not in self.saved_state:
+                continue
+
+            stage_state = self.saved_state[i]
+
+            # Restore critical shape validation metadata
+            stage._outputs_meta = stage_state['_outputs_meta']
+
+            # Restore communication infrastructure
+            stage.args_recv_info = stage_state['args_recv_info']
+            stage.act_send_info = stage_state['act_send_info']
+            stage.grad_recv_info = stage_state['grad_recv_info']
+            stage.grad_send_info = stage_state['grad_send_info']
+
+            # Restore chunks configuration
+            stage.chunks = stage_state['chunks']
+
+            # Restore input shape metadata if it was saved
+            if 'inputs_meta' in stage_state and hasattr(stage, 'inputs_meta'):
+                stage.inputs_meta = stage_state['inputs_meta']
+
+            # Restore initialization flag
+            if '_stage_initialized' in stage_state and hasattr(stage, '_stage_initialized'):
+                stage._stage_initialized = stage_state['_stage_initialized']
+
+            # Restore backward state
+            stage.backward_state = stage_state['backward_state']
+            stage.dw_runner = stage_state['dw_runner']
+            stage.has_backward = stage_state['has_backward']
+
+            # Clear runtime states to start fresh
+            stage.clear_runtime_states()
+
 def monkey_patch_pipeline_schedule():
     """
     Monkey-patches the PipelineSchedule to properly handle loss computation
