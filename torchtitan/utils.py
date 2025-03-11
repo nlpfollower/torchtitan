@@ -22,6 +22,9 @@ from torch import distributed as dist
 from torch._utils import _get_available_device_type, _get_device_module
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.experimental import context_parallel
+from torch.distributed.tensor.experimental._attention import set_rotate_method
+from torchtitan.parallelisms.context import context_parallel_with_attention_mask
 
 from torchtitan.logging import logger
 
@@ -208,28 +211,52 @@ SKIP_CLEANUP = "3"
 
 
 def create_context_parallel_ctx(
-    cp_mesh: DeviceMesh,
-    cp_buffers: List[torch.Tensor],
-    cp_seq_dims: List[int],
-    cp_no_restore_buffers: Set[torch.Tensor],
-    cp_rotate_method: str,
+        cp_mesh: DeviceMesh,
+        cp_buffers: List[torch.Tensor],
+        cp_seq_dims: List[int],
+        cp_no_restore_buffers: Set[torch.Tensor],
+        cp_rotate_method: str,
+        enable_attention_mask: bool = True,
 ):
-    try:
-        from torch.distributed.tensor.experimental import context_parallel
-        from torch.distributed.tensor.experimental._attention import set_rotate_method
-    except ImportError:
-        print(
-            f"PyTorch version {torch.__version__} does not include the experimental "
-            "Context Parallel API. Please update to a newer version."
-        )
+    """
+    Create a context for context parallelism that handles both buffer sharding and attention masking.
 
+    Args:
+        cp_mesh: Device mesh for context parallelism
+        cp_buffers: List of tensors to be sharded for context parallelism
+        cp_seq_dims: Sequence dimensions for each buffer in cp_buffers
+        cp_no_restore_buffers: Set of buffers that should not be restored after the context exits
+        cp_rotate_method: Method for rotating KV pairs ("allgather" or "alltoall")
+        enable_attention_mask: Whether to enable attention mask support via monkey patching
+
+    Returns:
+        A context manager that handles both buffer sharding and attention masking
+    """
+
+    # Set up the rotation method
     set_rotate_method(cp_rotate_method)
-    return context_parallel(
+
+    # Create the base context for buffer sharding
+    base_context = context_parallel(
         cp_mesh,
         buffers=cp_buffers,
         buffer_seq_dims=cp_seq_dims,
         no_restore_buffers=cp_no_restore_buffers,
     )
+
+    # If attention masks are enabled, wrap with the mask context
+    if enable_attention_mask:
+        # Create a combined context manager that applies both contexts
+        @contextlib.contextmanager
+        def combined_context():
+            with context_parallel_with_attention_mask():
+                with base_context:
+                    yield
+
+        return combined_context()
+    else:
+        # Just return the base context if masks not needed
+        return base_context
 
 
 def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool):
