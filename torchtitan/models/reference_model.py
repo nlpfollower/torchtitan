@@ -40,7 +40,7 @@ class ReferenceModel(nn.Module):
             return self._pipeline_forward(x, mask)
         else:
             for part in self.model_parts:
-                x = part(x, mask)
+                x = part(x, mask=mask)
             return x
 
     def _pipeline_forward(self, x, mask=None):

@@ -709,15 +709,6 @@ def evaluate(eval_components, job_config, current_step, metric_logger, stages_in
                     # Compute loss only if we have the last stage
                     if has_last_stage and output is not None:
                         loss = loss_fn(output, labels, reference_logits, document_ids)
-
-                    # Broadcast loss from the last stage to all ranks in PP group
-                    if pp_mesh:
-                        pp_group = pp_mesh.get_group()
-                        # Find the rank with the last stage
-                        num_stages = stages[0].num_stages
-                        last_stage_rank = stages[0].stage_index_to_group_rank[num_stages - 1]
-                        # Broadcast the loss from the last stage
-                        torch.distributed.broadcast(loss, src=last_stage_rank, group=pp_group)
                 else:
                     # Standard non-pipeline forward pass
                     logits = model_parts[0](input_ids, mask=attention_mask)

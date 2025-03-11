@@ -2,6 +2,7 @@ from typing import Union, Callable, Optional
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import (
     BlockMask,
     create_block_mask as create_block_causal_mask_flex,
@@ -85,14 +86,15 @@ def sdpa_or_flex_attention() -> Callable:
         if isinstance(mask, BlockMask):
             return compile_friendly_flex_attention(q, k, v, block_mask=mask)
         else:
-            # Support for 2D mask in SDPA
-            if mask is not None:
-                if mask.dim() == 2:
-                    mask = mask.unsqueeze(0).unsqueeze(0)
-                elif mask.dim() == 3:
-                    mask = mask.unsqueeze(1)
-                return nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-            else:
-                return nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                # Support for 2D mask in SDPA
+                if mask is not None:
+                    if mask.dim() == 2:
+                        mask = mask.unsqueeze(0).unsqueeze(0)
+                    elif mask.dim() == 3:
+                        mask = mask.unsqueeze(1)
+                    return nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+                else:
+                    return nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     return _attention_call

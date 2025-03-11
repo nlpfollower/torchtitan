@@ -18,6 +18,7 @@ torchtitan/datasets/**/*.model
 *.log
 error.json
 _remote_module_non_scriptable.py
-/models/
+models/
 repo.ai.txt
 torchtitan/datasets/mmlu
+tests/output/
