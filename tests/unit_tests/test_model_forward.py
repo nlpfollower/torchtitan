@@ -7,6 +7,10 @@ import torch
 import numpy as np
 from pathlib import Path
 
+from torch.distributed.tensor.experimental._attention import context_parallel_unshard
+
+from torchtitan.parallelisms.context import shard_attention_mask
+
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -18,7 +22,7 @@ from torchtitan.logging import init_logger, logger
 from torchtitan.utils import get_device_info, device_type, gather_dtensor
 from torchtitan.models.reference_model import build_reference_model
 from torchtitan.datasets.hh_dataset import build_hh_data_loader
-from torchtitan import utils
+from torchtitan import utils, state
 
 
 def parse_args():
@@ -64,6 +68,48 @@ def setup_job_config(args):
     job_config.training.dataset_mode = "sft"
     job_config.training.dataset_packing = True
     return job_config
+
+def properly_gather_logits(logits, world_mesh, cp_enabled):
+    """
+    Properly gather distributed logits, handling context parallelism specially
+
+    Args:
+        logits: The output logits tensor, potentially distributed
+        world_mesh: The device mesh for distribution
+        cp_enabled: Whether context parallelism is enabled
+
+    Returns:
+        Fully gathered logits tensor
+    """
+    if logits is None:
+        return None
+
+    # First check if this is a DTensor (for any parallelism)
+    is_dtensor = isinstance(logits, torch.distributed.tensor.DTensor)
+
+    # Special handling for context parallelism
+    if cp_enabled:
+        try:
+            # If using CP, we need to use context_parallel_unshard
+            # Context parallelism shards along sequence dimension (dim=1)
+            if is_dtensor:
+                # First make it local - this preserves the sharding
+                local_logits = logits.to_local()
+                # Then unshard using CP-specific function
+                return context_parallel_unshard(world_mesh["cp"], [local_logits], [1])[0]
+            else:
+                # If somehow already local but CP is enabled, we should still unshard
+                return context_parallel_unshard(world_mesh["cp"], [logits], [1])[0]
+        except Exception as e:
+            logger.warning(f"Error using context_parallel_unshard: {e}. Falling back to standard gather.")
+            # Fall back to standard gather
+            pass
+
+    # For other forms of parallelism or as fallback
+    if is_dtensor:
+        return gather_dtensor(logits, world_mesh)
+
+    return logits
 
 
 def run_forward_pass():
@@ -126,18 +172,35 @@ def run_forward_pass():
     optional_context_parallel_ctx = None
 
     if cp_enabled:
-        # Extract necessary components for CP context
         world_mesh = model.device_mesh
+        cp_mesh = world_mesh["cp"]
 
+        # If CP is enabled and mask exists, use sharded mask and set argument to None
+        if attention_mask is not None:
+            attention_mask = shard_attention_mask(attention_mask, cp_mesh)
+
+        # Create CP context with appropriate buffers
         if hasattr(model, 'model_parts'):
-            # Create CP context with appropriate buffers
             optional_context_parallel_ctx = utils.create_context_parallel_ctx(
-                cp_mesh=world_mesh["cp"],
+                cp_mesh=cp_mesh,
                 cp_buffers=[input_ids] + [m.freqs_cis for m in model.model_parts],
                 cp_seq_dims=[1] + [0 for _ in model.model_parts],
                 cp_no_restore_buffers={input_ids},
                 cp_rotate_method=job_config.experimental.context_parallel_rotate_method,
             )
+
+    # Set state tensors (common for both cases)
+    state.set_state_tensors(
+        attention_mask=attention_mask,
+        batch_size=job_config.training.batch_size,
+        n_microbatches=1  # Always 1 for evaluation
+    )
+
+    # When using CP, avoid passing the mask twice
+    if cp_enabled:
+        forward_mask = None
+    else:
+        forward_mask = attention_mask
 
     # Create context manager
     train_context = utils.get_train_context(False, False)
@@ -152,17 +215,23 @@ def run_forward_pass():
         start_time.record()
         # Use the context manager if CP is enabled
         with train_context(optional_context_parallel_ctx):
-            logits = model(input_ids, mask=attention_mask)
+            logits = model(input_ids, mask=forward_mask)
         end_time.record()
 
         # Wait for CUDA kernels to finish
         torch.cuda.synchronize()
         elapsed_time = start_time.elapsed_time(end_time) / 1000  # Convert to seconds
 
-    # Gather the distributed logits
+    # Gather the distributed logits with proper CP handling
     gathered_logits = None
     if logits is not None:
-        gathered_logits = gather_dtensor(logits, model.device_mesh)
+        gathered_logits = properly_gather_logits(logits, model.device_mesh, cp_enabled)
+
+    # Log original and gathered shapes for debugging
+    if logits is not None:
+        logger.info(f"Original logits shape: {logits.shape}")
+        if gathered_logits is not None:
+            logger.info(f"Gathered logits shape: {gathered_logits.shape}")
 
     # Make sure the output directory exists
     output_dir = Path(args.output_dir)

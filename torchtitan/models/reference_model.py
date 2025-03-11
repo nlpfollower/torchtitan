@@ -66,11 +66,14 @@ def build_reference_model(job_config, tokenizer):
     device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
 
     # Create a separate parallel dimension for the reference model
-    world_size = job_config.reference_model.data_parallel_shard_degree * job_config.reference_model.tensor_parallel_degree * job_config.reference_model.pipeline_parallel_degree
+    world_size = (job_config.reference_model.data_parallel_shard_degree *
+                  job_config.reference_model.tensor_parallel_degree *
+                  job_config.reference_model.pipeline_parallel_degree *
+                  job_config.experimental.context_parallel_degree)
     reference_parallel_dims = ParallelDims(
         dp_replicate=1,
         dp_shard=job_config.reference_model.data_parallel_shard_degree,
-        cp=1,
+        cp=job_config.experimental.context_parallel_degree,
         tp=job_config.reference_model.tensor_parallel_degree,
         pp=job_config.reference_model.pipeline_parallel_degree,
         world_size=world_size,

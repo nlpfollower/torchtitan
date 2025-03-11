@@ -30,6 +30,7 @@ from torchtitan.objective import Objective
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.model_converter import build_model_converters
 from torchtitan.parallelisms import ParallelDims
+from torchtitan.parallelisms.context import shard_attention_mask
 from torchtitan.parallelisms.pipeline import pipeline_forward, \
     monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule, PipelineEphemeralContext
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
@@ -394,6 +395,12 @@ def main(job_config: JobConfig):
             labels = labels.to(device_type)
             optimizers.zero_grad()
 
+            # Process attention mask for CP if needed
+            forward_mask = attention_mask
+            if parallel_dims.cp_enabled and attention_mask is not None:
+                attention_mask = shard_attention_mask(attention_mask, world_mesh["cp"])
+                forward_mask = None
+
             # apply context parallelism if cp is enabled
             # ensure CP handles the separate freqs_cis buffer for each pp stage
             optional_context_parallel_ctx = (
@@ -408,20 +415,21 @@ def main(job_config: JobConfig):
                 else None
             )
 
+            # Set state tensors (important for both PP and non-PP paths)
+            state.set_state_tensors(
+                document_ids=document_ids,
+                attention_mask=attention_mask,
+                batch_size=job_config.training.batch_size,
+                n_microbatches=job_config.experimental.pipeline_parallel_microbatches
+            )
+
             reference_logits = None
             if job_config.reference_model.enabled:
                 with torch.no_grad():
-                    reference_logits = reference_model(input_ids, attention_mask)
+                    reference_logits = reference_model(input_ids, forward_mask)
+                    state.set_state_tensors(reference_logits=reference_logits)
 
             if parallel_dims.pp_enabled:
-                state.set_state_tensors(
-                    document_ids=document_ids,
-                    reference_logits=reference_logits,
-                    attention_mask=attention_mask,
-                    batch_size=job_config.training.batch_size,
-                    n_microbatches=job_config.experimental.pipeline_parallel_microbatches
-                )
-
                 # For PP, measure the entire step time
                 pp_step_start = time.perf_counter()
 
@@ -432,9 +440,9 @@ def main(job_config: JobConfig):
                     # Pass mask as a regular keyword argument - it will be automatically
                     # split into microbatches by PyTorch's pipeline implementation
                     if has_first_stage:
-                        pp_schedule.step(input_ids, target=targets, losses=losses, mask=attention_mask)
+                        pp_schedule.step(input_ids, target=targets, losses=losses, mask=forward_mask)
                     else:
-                        pp_schedule.step(target=targets, losses=losses, mask=attention_mask)
+                        pp_schedule.step(target=targets, losses=losses, mask=forward_mask)
 
                 model_timers.append(time.perf_counter() - pp_step_start)
 
@@ -449,7 +457,7 @@ def main(job_config: JobConfig):
                 # Non-PP forward / backward
                 with train_context(optional_context_parallel_ctx):
                     forward_start = time.perf_counter()
-                    logits = model(input_ids, mask=attention_mask)
+                    logits = model(input_ids, mask=forward_mask)
                     forward_time = time.perf_counter() - forward_start
 
                     loss = loss_fn(logits, labels, reference_logits, document_ids)

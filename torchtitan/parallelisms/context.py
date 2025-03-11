@@ -34,12 +34,12 @@ logger = logging.getLogger(__name__)
 aten = torch.ops.aten
 
 
-def _get_mask_chunk(local_mask, q_chunk, k_chunk, i, rank, size, is_causal, seq_dim=2):
+def _get_mask_chunk(local_mask, i, rank, size):
     """
     Extract the appropriate chunk of attention mask for the current SDPA operation with round-robin scheduling.
 
     Args:
-        local_mask: The 4D global attention mask (batch, heads, seq, seq)
+        local_mask: The 4D global attention mask (batch, heads, seq/size, seq)
         q_chunk: Current query chunk
         k_chunk: Current key chunk
         i: Current iteration in the ring rotation
@@ -285,12 +285,32 @@ def monkey_patch_context_parallel_attention():
                 q, k, v, partial = q_chunks[1], key, value, True
 
             # Get the appropriate mask chunk for this operation
-            current_mask = _get_mask_chunk(mask_to_use, q, k, i, rank, size, is_causal, seq_dim)
+            current_mask = _get_mask_chunk(mask_to_use, i, rank, size)
 
             # Set up kwargs for the operation
             kwargs_to_pass = kwargs.copy()
             if current_mask is not None:
-                kwargs_to_pass["attn_mask"] = current_mask
+                # Get expected dimensions from query and key
+                L, S = q.size(-2), k.size(-2)
+
+                # Validate mask shape matches query/key dimensions
+                mask_L, mask_S = current_mask.size(-2), current_mask.size(-1)
+                logger.info(f"current i: {i}")
+                assert mask_L == L, f"Mask query dimension {mask_L} doesn't match query dimension {L}"
+                assert mask_S == S, f"Mask key dimension {mask_S} doesn't match key dimension {S}"
+
+                # Create bias tensor with proper shape and dtype
+                attn_bias = torch.zeros_like(current_mask, dtype=q.dtype)
+
+                # Convert boolean mask to bias by filling masked positions with -inf
+                if current_mask.dtype == torch.bool:
+                    attn_bias.masked_fill_(current_mask.logical_not(), float("-inf"))
+                else:
+                    # If mask is already a float-based mask, convert to query dtype
+                    attn_bias = current_mask.to(q.dtype)
+
+                # Add as attn_bias parameter which is what efficient attention expects
+                kwargs_to_pass["attn_bias"] = attn_bias
 
             # See https://github.com/pytorch/pytorch/blob/release/2.4/aten/src/ATen/native/native_functions.yaml#L14695
             # for the SDPA kernel definitions.
@@ -340,3 +360,36 @@ def context_parallel_with_attention_mask():
         yield
     finally:
         restore_fn()
+
+
+def shard_attention_mask(attention_mask, cp_mesh):
+    """
+        Shard the attention mask according to the round-robin pattern required by CP
+
+        Args:
+            attention_mask: The full attention mask tensor
+            cp_mesh: The context parallel mesh
+
+        Returns:
+            Properly sharded attention mask for the current rank
+        """
+    if attention_mask is None:
+        return None
+
+    cp_size = cp_mesh.size()
+    cp_rank = cp_mesh.get_local_rank()
+
+    # Mask must be 4D (batch, heads, q_seq, kv_seq)
+    assert attention_mask.dim() == 4, "Mask must be 4D (batch, heads, q_seq, kv_seq)"
+
+    # Apply round-robin sharding
+    seq_len = attention_mask.size(2)
+    assert seq_len % (2 * cp_size) == 0, f"Sequence length {seq_len} must be divisible by 2*CP size {2 * cp_size}"
+
+    chunks = list(attention_mask.chunk(2 * cp_size, dim=2))
+
+    # Round-robin pattern: rank i gets chunks i and (2*cp_size-1-i)
+    local_chunks = [chunks[cp_rank], chunks[-cp_rank]]
+    local_mask = torch.cat(local_chunks, dim=2)
+
+    return local_mask
