@@ -71,6 +71,13 @@ def run_forward_pass():
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
+    init_logger()
+    logger.info(f"Torch previous num threads: {torch.get_num_threads()}")
+    num_threads = os.cpu_count()  # Set to the number of available CPU cores
+    num_threads_per_rank = max(1, num_threads // min(world_size, 8))
+    torch.set_num_threads(num_threads_per_rank)
+    logger.info(f"Torch new num threads: {torch.get_num_threads()}")
+
     if rank == 0:
         print("Hello from rank 0")
         pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
