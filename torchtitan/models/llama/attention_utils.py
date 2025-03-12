@@ -1,3 +1,6 @@
+import os
+import pickle
+from collections import defaultdict
 from typing import Union, Callable, Optional
 
 import torch
@@ -10,6 +13,38 @@ from torch.nn.attention.flex_attention import (
 )
 
 flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+
+ATTENTION_TRACING = False
+ATTENTION_OUTPUTS = defaultdict(list)
+TRACE_DIR = None
+
+def enable_attention_tracing(output_dir):
+    """Enable tracing of attention operations"""
+    global ATTENTION_TRACING, ATTENTION_OUTPUTS, TRACE_DIR
+    ATTENTION_TRACING = True
+    ATTENTION_OUTPUTS.clear()
+    TRACE_DIR = output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
+def disable_attention_tracing():
+    """Disable tracing and save collected outputs"""
+    global ATTENTION_TRACING
+    ATTENTION_TRACING = False
+    save_attention_outputs()
+
+
+def save_attention_outputs():
+    """Save collected attention outputs to file"""
+    if not TRACE_DIR:
+        return
+
+    output_path = os.path.join(TRACE_DIR, f"attention_outputs_rank{torch.distributed.get_rank()}.pkl")
+    with open(output_path, "wb") as f:
+        pickle.dump(ATTENTION_OUTPUTS, f)
+
+    print(f"Saved {len(ATTENTION_OUTPUTS)} attention traces to {output_path}")
 
 def create_block_document_causal_mask(document_ids: torch.Tensor):
     batch_size, max_seq_len = document_ids.shape
@@ -82,19 +117,26 @@ def sdpa_or_flex_attention() -> Callable:
         k: torch.Tensor,
         v: torch.Tensor,
         mask: Optional[_MaskType] = None,
+        layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
+
         if isinstance(mask, BlockMask):
             return compile_friendly_flex_attention(q, k, v, block_mask=mask)
         else:
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                 # Support for 2D mask in SDPA
                 if mask is not None:
-                    if mask.dim() == 2:
-                        mask = mask.unsqueeze(0).unsqueeze(0)
-                    elif mask.dim() == 3:
-                        mask = mask.unsqueeze(1)
-                    return nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+                    output = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
                 else:
-                    return nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+                    output = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+                # Trace output
+                if ATTENTION_TRACING:
+                    ATTENTION_OUTPUTS["dp"].append({
+                        "layer_idx": layer_idx,
+                        "output_shape": output.shape,
+                        "mask_shape": mask.shape if mask is not None else None,
+                        "output": output.detach().cpu()
+                    })
+                return output
 
     return _attention_call

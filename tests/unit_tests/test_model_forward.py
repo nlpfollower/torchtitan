@@ -9,8 +9,6 @@ from pathlib import Path
 
 from torch.distributed.tensor.experimental._attention import context_parallel_unshard
 
-from torchtitan.parallelisms.context import shard_attention_mask
-
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -19,11 +17,12 @@ from tests.unit_tests.test_utils import run_torchrun
 from torchtitan.config_manager import JobConfig
 from torchtitan.datasets.tokenizer import build_tokenizer
 from torchtitan.logging import init_logger, logger
-from torchtitan.utils import get_device_info, device_type, gather_dtensor
+from torchtitan.utils import device_type, gather_dtensor
 from torchtitan.models.reference_model import build_reference_model
+from torchtitan.models.llama import attention_utils
 from torchtitan.datasets.hh_dataset import build_hh_data_loader
 from torchtitan import utils, state
-
+from torchtitan.parallelisms import context
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Test context parallelism masking")
@@ -38,6 +37,8 @@ def parse_args():
                         help="Directory to save output logits")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--run_test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--trace_attn", action="store_true", help="Trace attention operations")
+    parser.add_argument("--trace_dir", type=str, help="Directory to save attention traces")
     return parser.parse_args()
 
 
@@ -124,11 +125,10 @@ def run_forward_pass():
     torch.set_num_threads(num_threads_per_rank)
     logger.info(f"Torch new num threads: {torch.get_num_threads()}")
 
-    if rank == 0:
-        print("Hello from rank 0")
-        pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    # if rank == 0:
+    #     print("Hello from rank 0")
+    #     pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
 
-    init_logger()
     args = parse_args()
     job_config = setup_job_config(args)
 
@@ -171,13 +171,26 @@ def run_forward_pass():
     cp_enabled = job_config.experimental.context_parallel_degree > 1
     optional_context_parallel_ctx = None
 
+    if args.trace_attn:
+        trace_dir = args.trace_dir or os.path.join(args.output_dir, "attention_traces")
+        os.makedirs(trace_dir, exist_ok=True)
+
+        if cp_enabled:
+            # Enable CP attention tracing
+            context.enable_attention_tracing(trace_dir)
+        else:
+            # Enable standard attention tracing
+            attention_utils.enable_attention_tracing(trace_dir)
+
+        logger.info(f"Enabled attention tracing to {trace_dir}")
+
     if cp_enabled:
         world_mesh = model.device_mesh
         cp_mesh = world_mesh["cp"]
 
         # If CP is enabled and mask exists, use sharded mask and set argument to None
         if attention_mask is not None:
-            attention_mask = shard_attention_mask(attention_mask, cp_mesh)
+            attention_mask = context.shard_attention_mask(attention_mask, cp_mesh)
 
         # Create CP context with appropriate buffers
         if hasattr(model, 'model_parts'):
@@ -267,6 +280,12 @@ def run_forward_pass():
         }, output_path)
 
         logger.info(f"Saved logits to {output_path}")
+
+    if args.trace_attn:
+        if cp_enabled:
+            context.disable_attention_tracing()
+        else:
+            attention_utils.disable_attention_tracing()
 
     # Clean up
     torch.distributed.barrier()

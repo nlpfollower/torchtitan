@@ -180,6 +180,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask = None,
+        layer_idx = None,
     ):
         """
         Forward pass of the attention module.
@@ -213,7 +214,7 @@ class Attention(nn.Module):
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         # we use casual mask for training
-        output = self._attention_call(xq, xk, xv, mask=mask)
+        output = self._attention_call(xq, xk, xv, mask=mask, layer_idx=layer_idx)
         output = output.transpose(
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
@@ -328,7 +329,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, layer_idx=self.layer_id)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 

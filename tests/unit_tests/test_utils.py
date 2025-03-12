@@ -22,6 +22,17 @@ def run_torchrun(script_path, args):
     # Set environment variable to help with cleanup
     current_env["PYTHONUNBUFFERED"] = "1"  # Ensure output is not buffered
 
+    cmd_args = []
+    for k, v in vars(args).items():
+        if k == 'run_test':
+            continue
+        elif isinstance(v, bool) and v is True:
+            # For boolean flags that are True, just add the flag without a value
+            cmd_args.append(f"--{k}")
+        elif v is not None:
+            # For all other arguments, add with their values
+            cmd_args.append(f"--{k}={v}")
+
     cmd = [
               sys.executable, "-m", "torch.distributed.run",
               f"--nproc_per_node={ngpu}",
@@ -32,7 +43,7 @@ def run_torchrun(script_path, args):
               "--tee=3",
               script_path,
               "--run_test"
-          ] + [f"--{k}={v}" for k, v in vars(args).items() if k != 'run_test']
+          ] + cmd_args
 
     # Use a process group so signals are propagated to children
     try:

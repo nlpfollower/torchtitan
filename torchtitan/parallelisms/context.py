@@ -10,6 +10,9 @@ Module for context parallelism related utilities and monkey patches.
 
 import contextlib
 import logging
+import os
+import pickle
+from collections import defaultdict
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -33,8 +36,39 @@ logger = logging.getLogger(__name__)
 
 aten = torch.ops.aten
 
+ATTENTION_TRACING = False
+ATTENTION_OUTPUTS = defaultdict(list)
+TRACE_DIR = None
 
-def _get_mask_chunk(local_mask, i, rank, size):
+def enable_attention_tracing(output_dir):
+    """Enable tracing of attention operations"""
+    global ATTENTION_TRACING, ATTENTION_OUTPUTS, TRACE_DIR
+    ATTENTION_TRACING = True
+    ATTENTION_OUTPUTS.clear()
+    TRACE_DIR = output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
+def disable_attention_tracing():
+    """Disable tracing and save collected outputs"""
+    global ATTENTION_TRACING
+    ATTENTION_TRACING = False
+    save_attention_outputs()
+
+
+def save_attention_outputs():
+    """Save collected attention outputs to file"""
+    if not TRACE_DIR:
+        return
+
+    output_path = os.path.join(TRACE_DIR, f"attention_outputs_rank{torch.distributed.get_rank()}.pkl")
+    with open(output_path, "wb") as f:
+        pickle.dump(ATTENTION_OUTPUTS, f)
+
+    print(f"Saved {len(ATTENTION_OUTPUTS)} attention traces to {output_path}")
+
+def _get_mask_chunk(local_mask, q_chunk, i, rank, size):
     """
     Extract the appropriate chunk of attention mask for the current SDPA operation with round-robin scheduling.
 
@@ -58,6 +92,13 @@ def _get_mask_chunk(local_mask, i, rank, size):
     assert _cp_options.enable_load_balance, "This implementation requires load balancing to be enabled"
     assert _cp_options.rotate_method == _RotateMethod.ALL_GATHER, "Only ALL_GATHER rotation method is supported"
     assert local_mask.dim() == 4, "Mask must be 4D (batch, heads, q_seq, kv_seq)"
+    # Get the number of heads from the query tensor
+    num_heads_q = q_chunk.size(1)
+
+    # If mask has only 1 head but query has multiple, broadcast the mask
+    if local_mask.size(1) == 1 and num_heads_q > 1:
+        # Expand the mask to match the number of heads
+        local_mask = local_mask.expand(-1, num_heads_q, -1, -1)
 
     # Calculate sequence length per rank
     full_seq_len = local_mask.size(3)
@@ -285,7 +326,7 @@ def monkey_patch_context_parallel_attention():
                 q, k, v, partial = q_chunks[1], key, value, True
 
             # Get the appropriate mask chunk for this operation
-            current_mask = _get_mask_chunk(mask_to_use, i, rank, size)
+            current_mask = _get_mask_chunk(mask_to_use, q, i, rank, size)
 
             # Set up kwargs for the operation
             kwargs_to_pass = kwargs.copy()
@@ -321,9 +362,37 @@ def monkey_patch_context_parallel_attention():
                 is_causal=is_causal_behavior.value,
                 **kwargs_to_pass,
             )
+
+            # Trace the outputs
+            if ATTENTION_TRACING:
+                layer_idx = getattr(torch, '_current_layer_idx', -1)
+                ATTENTION_OUTPUTS["cp"].append({
+                    "layer_idx": layer_idx,
+                    "iteration": i,
+                    "rank": rank,
+                    "is_causal": is_causal_behavior.value,
+                    "partial": partial,
+                    "output_shape": out.shape,
+                    "output": out.detach().cpu(),
+                    "logsumexp": logsumexp.detach().cpu()
+                })
+
             sdpa_merger.step(out, logsumexp, partial)
 
-        return (*sdpa_merger.results(), *rest)
+        results = sdpa_merger.results()
+
+        # Record merged results if tracing is enabled
+        if ATTENTION_TRACING:
+            layer_idx = getattr(torch, '_current_layer_idx', -1)
+            ATTENTION_OUTPUTS["cp_merged"].append({
+                "layer_idx": layer_idx,
+                "rank": rank,
+                "output_shape": results[0].shape,
+                "output": results[0].detach().cpu(),
+                "logsumexp": results[1].detach().cpu()
+            })
+
+        return (*results, *rest)
 
     # Apply the patches
     attn_module._scaled_dot_product_ring_efficient_attention = patched_sdp_efficient_attention
