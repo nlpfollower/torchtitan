@@ -336,7 +336,6 @@ def monkey_patch_context_parallel_attention():
 
                 # Validate mask shape matches query/key dimensions
                 mask_L, mask_S = current_mask.size(-2), current_mask.size(-1)
-                logger.info(f"current i: {i}")
                 assert mask_L == L, f"Mask query dimension {mask_L} doesn't match query dimension {L}"
                 assert mask_S == S, f"Mask key dimension {mask_S} doesn't match key dimension {S}"
 
