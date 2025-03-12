@@ -193,6 +193,10 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
+        # Store layer index for tracing
+        if layer_idx is not None:
+            torch._current_layer_idx = layer_idx
+
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -214,7 +218,7 @@ class Attention(nn.Module):
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         # we use casual mask for training
-        output = self._attention_call(xq, xk, xv, mask=mask, layer_idx=layer_idx)
+        output = self._attention_call(xq, xk, xv, mask=mask)
         output = output.transpose(
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)

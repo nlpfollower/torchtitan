@@ -23,11 +23,16 @@ def load_attention_outputs(filepath):
 def get_layer_outputs(attention_outputs, layer_idx, parallel_type):
     """Extract outputs for a specific layer and parallel type"""
     if parallel_type == "cp":
-        # Use merged results for CP
-        return [out["output"] for out in attention_outputs["cp_merged"]
-                if out["layer_idx"] == layer_idx]
+        cp_outputs = []
+        for out in attention_outputs["cp_merged"]:
+            if out["layer_idx"] == layer_idx:
+                # Use unsharded output if available, otherwise use regular output
+                if "unsharded_output" in out and out["unsharded_output"] is not None:
+                    cp_outputs.append(out["unsharded_output"])
+                else:
+                    cp_outputs.append(out["output"])
+        return cp_outputs
     else:
-        # Use DP outputs
         return [out["output"] for out in attention_outputs["dp"]
                 if out["layer_idx"] == layer_idx]
 

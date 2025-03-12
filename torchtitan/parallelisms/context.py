@@ -28,7 +28,7 @@ from torch.distributed.tensor.experimental._attention import (
     _create_rotater,
     _SDPAMerger,
     _is_causal_behavior,
-    _maybe_wait, _RotateMethod,
+    _maybe_wait, _RotateMethod, context_parallel_unshard,
 )
 from torchtitan import state
 
@@ -351,6 +351,9 @@ def monkey_patch_context_parallel_attention():
 
                 # Add as attn_bias parameter which is what efficient attention expects
                 kwargs_to_pass["attn_bias"] = attn_bias
+            else:
+                # Create a None tensor for attn_bias
+                kwargs_to_pass["attn_bias"] = None
 
             # See https://github.com/pytorch/pytorch/blob/release/2.4/aten/src/ATen/native/native_functions.yaml#L14695
             # for the SDPA kernel definitions.
@@ -382,13 +385,33 @@ def monkey_patch_context_parallel_attention():
 
         # Record merged results if tracing is enabled
         if ATTENTION_TRACING:
-            layer_idx = getattr(torch, '_current_layer_idx', -1)
+            cp_output = results[0]
+            cp_logsumexp = results[1]
+
+            # Unshard the outputs to full sequence length
+            # Store both sharded and unsharded versions
+            unsharded_outputs = None
+            if mesh is not None:
+                try:
+                    # Unshard along sequence dimension (2)
+                    unsharded_outputs = context_parallel_unshard(mesh, [cp_output], [2])
+                    unsharded_output = unsharded_outputs[0]
+
+                    # Also unshard logsumexp if needed
+                    unsharded_logsumexp = context_parallel_unshard(mesh, [cp_logsumexp], [1])[0]
+                except Exception as e:
+                    # Log error but continue with sharded outputs
+                    print(f"Error unsharding output: {e}")
+
             ATTENTION_OUTPUTS["cp_merged"].append({
                 "layer_idx": layer_idx,
                 "rank": rank,
-                "output_shape": results[0].shape,
-                "output": results[0].detach().cpu(),
-                "logsumexp": results[1].detach().cpu()
+                "output_shape": cp_output.shape,
+                "output": cp_output.detach().cpu(),
+                "logsumexp": cp_logsumexp.detach().cpu(),
+                "unsharded_output_shape": unsharded_output.shape if unsharded_outputs else None,
+                "unsharded_output": unsharded_output.detach().cpu() if unsharded_outputs else None,
+                "unsharded_logsumexp": unsharded_logsumexp.detach().cpu() if unsharded_outputs else None
             })
 
         return (*results, *rest)

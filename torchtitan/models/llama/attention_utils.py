@@ -117,8 +117,8 @@ def sdpa_or_flex_attention() -> Callable:
         k: torch.Tensor,
         v: torch.Tensor,
         mask: Optional[_MaskType] = None,
-        layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
+        layer_idx = getattr(torch, '_current_layer_idx', -1)
 
         if isinstance(mask, BlockMask):
             return compile_friendly_flex_attention(q, k, v, block_mask=mask)
