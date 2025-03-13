@@ -131,16 +131,24 @@ def sdpa_or_flex_attention() -> Callable:
                     output = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 
                 if ATTENTION_TRACING:
-                    if "dp_detailed" not in ATTENTION_OUTPUTS:
-                        ATTENTION_OUTPUTS["dp_detailed"] = []
+                    layer_idx = getattr(torch, '_current_layer_idx', -1)
 
-                    ATTENTION_OUTPUTS["dp_detailed"].append({
-                        "layer_idx": layer_idx,
-                        "q": q.detach().cpu(),
-                        "k": k.detach().cpu(),
-                        "mask": mask.detach().cpu() if mask is not None else None,
-                        "output": output.detach().cpu()
-                    })
+                    # Only trace detailed data for layer 0
+                    if layer_idx == 0:
+                        if "dp_detailed" not in ATTENTION_OUTPUTS:
+                            ATTENTION_OUTPUTS["dp_detailed"] = []
+
+                        ATTENTION_OUTPUTS["dp_detailed"].append({
+                            "layer_idx": layer_idx,
+                            "q": q.detach().cpu(),
+                            "k": k.detach().cpu(),
+                            "mask": mask.detach().cpu() if mask is not None else None,
+                            "output": output.detach().cpu()
+                        })
+
+                    # Keep regular output tracing for all layers
+                    if "dp" not in ATTENTION_OUTPUTS:
+                        ATTENTION_OUTPUTS["dp"] = []
 
                     ATTENTION_OUTPUTS["dp"].append({
                         "layer_idx": layer_idx,

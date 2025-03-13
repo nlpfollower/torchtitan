@@ -45,6 +45,10 @@ def enable_attention_tracing(output_dir):
     global ATTENTION_TRACING, ATTENTION_OUTPUTS, TRACE_DIR
     ATTENTION_TRACING = True
     ATTENTION_OUTPUTS.clear()
+
+    # Add container for detailed tensor data
+    ATTENTION_OUTPUTS["cp_detailed"] = []
+
     TRACE_DIR = output_dir
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
@@ -368,6 +372,22 @@ def monkey_patch_context_parallel_attention():
             # Trace the outputs
             if ATTENTION_TRACING:
                 layer_idx = getattr(torch, '_current_layer_idx', -1)
+
+                # Only trace detailed data for layer 0
+                if layer_idx == 0:
+                    ATTENTION_OUTPUTS["cp_detailed"].append({
+                        "layer_idx": layer_idx,
+                        "iteration": i,
+                        "rank": rank,
+                        "source_rank": (rank - i) % size,
+                        "is_causal": is_causal_behavior.value,
+                        "partial": partial,
+                        "q": q.detach().cpu(),
+                        "k": k.detach().cpu(),
+                        "mask": current_mask.detach().cpu() if current_mask is not None else None
+                    })
+
+                # Keep regular output tracing for all layers
                 ATTENTION_OUTPUTS["cp"].append({
                     "layer_idx": layer_idx,
                     "iteration": i,
