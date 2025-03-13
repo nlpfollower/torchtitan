@@ -129,8 +129,19 @@ def sdpa_or_flex_attention() -> Callable:
                     output = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
                 else:
                     output = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-                # Trace output
+
                 if ATTENTION_TRACING:
+                    if "dp_detailed" not in ATTENTION_OUTPUTS:
+                        ATTENTION_OUTPUTS["dp_detailed"] = []
+
+                    ATTENTION_OUTPUTS["dp_detailed"].append({
+                        "layer_idx": layer_idx,
+                        "q": q.detach().cpu(),
+                        "k": k.detach().cpu(),
+                        "mask": mask.detach().cpu() if mask is not None else None,
+                        "output": output.detach().cpu()
+                    })
+
                     ATTENTION_OUTPUTS["dp"].append({
                         "layer_idx": layer_idx,
                         "output_shape": output.shape,

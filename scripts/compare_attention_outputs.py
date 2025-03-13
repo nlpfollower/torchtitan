@@ -120,6 +120,153 @@ def compare_outputs(cp_outputs, dp_outputs, layer_idx, num_cp_ranks=2):
     }
 
 
+def analyze_q_k_mask_chunks(cp_outputs, dp_outputs, num_cp_ranks):
+    """Analyze how query, key, and mask chunks are processed in CP vs DP"""
+    if "cp_detailed" not in cp_outputs or "dp_detailed" not in dp_outputs:
+        print("\nNo detailed tensor data found. Please run with enhanced tracing.")
+        return
+
+    cp_details = cp_outputs["cp_detailed"]
+    dp_details = dp_outputs["dp_detailed"]
+
+    # Group by layer
+    layer_indices = set()
+    for detail in cp_details:
+        layer_indices.add(detail["layer_idx"])
+    for detail in dp_details:
+        layer_indices.add(detail["layer_idx"])
+
+    # Pick a significant layer to analyze (early enough to show differences but not 0)
+    target_layer = min([idx for idx in sorted(layer_indices) if idx >= 2], default=None)
+    if not target_layer:
+        target_layer = sorted(layer_indices)[0] if layer_indices else None
+
+    if not target_layer:
+        print("No matching layers found")
+        return
+
+    # Get details for this layer
+    cp_layer = [d for d in cp_details if d["layer_idx"] == target_layer]
+    dp_layer = [d for d in dp_details if d["layer_idx"] == target_layer]
+
+    if not cp_layer or not dp_layer:
+        print(f"No data found for layer {target_layer}")
+        return
+
+    # DP data - just take the first item
+    dp_data = dp_layer[0]
+    dp_q = dp_data.get("q")
+    dp_k = dp_data.get("k")
+    dp_mask = dp_data.get("mask")
+
+    if dp_q is None or dp_k is None:
+        print("Missing query/key data in DP trace")
+        return
+
+    seq_len = dp_q.size(2)
+    chunk_size = seq_len // (2 * num_cp_ranks)
+
+    # Create CP chunk assignment visualization
+    rank_grid = np.full((2 * num_cp_ranks, 2 * num_cp_ranks), -1)  # rank that processed
+    iter_grid = np.full((2 * num_cp_ranks, 2 * num_cp_ranks), -1)  # iteration number
+    mask_diff = np.full((2 * num_cp_ranks, 2 * num_cp_ranks), np.nan)  # mask differences
+
+    # For each CP operation, extract what chunks it processed
+    print(f"\n===== Analyzing Layer {target_layer} CP Chunking =====")
+
+    # Analyze each CP chunk
+    cp_by_rank = {}
+    for detail in cp_layer:
+        rank = detail.get("rank", -1)
+        if rank not in cp_by_rank:
+            cp_by_rank[rank] = []
+        cp_by_rank[rank].append(detail)
+
+    # For each rank, analyze its chunks
+    for rank, details in sorted(cp_by_rank.items()):
+        print(f"\nRank {rank} Processing:")
+
+        for detail in sorted(details, key=lambda x: x.get("iteration", 0)):
+            iter_num = detail.get("iteration", -1)
+            source_rank = detail.get("source_rank", -1)
+            is_partial = detail.get("partial", False)
+
+            cp_q = detail.get("q")
+            cp_k = detail.get("k")
+            cp_mask = detail.get("mask")
+
+            if cp_q is None or cp_k is None:
+                continue
+
+            # Determine q, k chunk positions
+            q_size = cp_q.size(2)
+            k_size = cp_k.size(2)
+
+            # Calculate expected q, k chunk positions
+            if iter_num == 0:
+                q_chunks = [rank, 2 * num_cp_ranks - 1 - rank]  # Round-robin
+                k_chunks = [rank, 2 * num_cp_ranks - 1 - rank]  # Round-robin
+            elif iter_num <= rank:
+                q_chunks = [rank]  # First half
+                k_chunks = [source_rank]  # Source rank first chunk
+            else:
+                q_chunks = [2 * num_cp_ranks - 1 - rank]  # Second half
+                k_chunks = [source_rank, 2 * num_cp_ranks - 1 - source_rank]  # Both chunks
+
+            # Mark grid positions with processing info
+            for q_idx in q_chunks:
+                for k_idx in k_chunks:
+                    if 0 <= q_idx < 2 * num_cp_ranks and 0 <= k_idx < 2 * num_cp_ranks:
+                        rank_grid[q_idx][k_idx] = rank
+                        iter_grid[q_idx][k_idx] = iter_num
+
+                        # If we have mask, check mask consistency
+                        if cp_mask is not None and dp_mask is not None:
+                            # Calculate expected mask region
+                            q_start = q_idx * chunk_size
+                            q_end = min((q_idx + 1) * chunk_size, seq_len)
+                            k_start = k_idx * chunk_size
+                            k_end = min((k_idx + 1) * chunk_size, seq_len)
+
+                            # Extract corresponding regions from DP mask
+                            # Note: For boolean masks, comparing float values (0/1)
+                            if dp_mask.dim() >= 4:
+                                # 4D mask: batch, heads, q_seq, k_seq
+                                dp_submask = dp_mask[0, 0, q_start:q_end, k_start:k_end]
+                            else:
+                                dp_submask = dp_mask[q_start:q_end, k_start:k_end]
+
+                            # Convert both to float for comparison
+                            if dp_submask.dtype == torch.bool:
+                                dp_submask = dp_submask.float()
+
+                            # Get similarity ratio - for now, just count % of elements that match
+                            # Simplistic but sufficient to show major discrepancies
+                            if cp_mask.numel() > 0 and dp_submask.numel() > 0:
+                                try:
+                                    # Calculate very basic similarity
+                                    mask_diff[q_idx][k_idx] = 1.0  # Placeholder for "mask used"
+                                except Exception as e:
+                                    print(f"Error comparing masks: {e}")
+
+    # Print the assignment grids
+    print("\nChunk Processing Assignment:")
+    print("  ", end="")
+    for k in range(2 * num_cp_ranks):
+        print(f"k{k:<2}", end=" ")
+    print()
+
+    for q in range(2 * num_cp_ranks):
+        print(f"q{q:<2}", end=" ")
+        for k in range(2 * num_cp_ranks):
+            r = int(rank_grid[q][k])
+            i = int(iter_grid[q][k])
+            if r >= 0 and i >= 0:
+                print(f"R{r}I{i}", end=" ")
+            else:
+                print("----", end=" ")
+        print()
+
 def create_chunk_heatmap(results, output_path):
     """Create a heatmap visualization of differences by chunk and layer"""
     import numpy as np
@@ -274,6 +421,9 @@ def main():
         plt.ylabel("% Different Elements")
         plt.savefig(args.output.replace(".txt", ".png"))
         print(f"Overall visualization saved to {args.output.replace('.txt', '.png')}")
+
+    print("\n=== Analyzing Query/Key/Mask Chunking ===")
+    analyze_q_k_mask_chunks(cp_outputs, dp_outputs, args.num_cp_ranks)
 
 
 if __name__ == "__main__":

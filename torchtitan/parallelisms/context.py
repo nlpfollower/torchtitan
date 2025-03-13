@@ -455,15 +455,16 @@ def context_parallel_with_attention_mask():
 
 def shard_attention_mask(attention_mask, cp_mesh):
     """
-        Shard the attention mask according to the round-robin pattern required by CP
+    Shard the attention mask according to the round-robin pattern required by CP.
+    CRITICAL: This must exactly match the _RoundRobinLoadBalancer.shard() implementation.
 
-        Args:
-            attention_mask: The full attention mask tensor
-            cp_mesh: The context parallel mesh
+    Args:
+        attention_mask: The full attention mask tensor
+        cp_mesh: The context parallel mesh
 
-        Returns:
-            Properly sharded attention mask for the current rank
-        """
+    Returns:
+        Properly sharded attention mask for the current rank
+    """
     if attention_mask is None:
         return None
 
@@ -473,14 +474,20 @@ def shard_attention_mask(attention_mask, cp_mesh):
     # Mask must be 4D (batch, heads, q_seq, kv_seq)
     assert attention_mask.dim() == 4, "Mask must be 4D (batch, heads, q_seq, kv_seq)"
 
-    # Apply round-robin sharding
-    seq_len = attention_mask.size(2)
-    assert seq_len % (2 * cp_size) == 0, f"Sequence length {seq_len} must be divisible by 2*CP size {2 * cp_size}"
+    # For query dimension (dim=2), use the same round-robin pattern as for tensors
+    q_seq_len = attention_mask.size(2)
+    assert q_seq_len % (cp_size * 2) == 0, f"Sequence length {q_seq_len} must be divisible by 2*CP size {2 * cp_size}"
 
-    chunks = list(attention_mask.chunk(2 * cp_size, dim=2))
+    # Shard the query dimension EXACTLY as done in _RoundRobinLoadBalancer.shard()
+    chunks = attention_mask.chunk(cp_size * 2, dim=2)
+    q_sharded_mask = torch.cat(
+        (chunks[cp_rank], chunks[cp_size * 2 - cp_rank - 1]),
+        dim=2
+    )
 
-    # Round-robin pattern: rank i gets chunks i and (2*cp_size-1-i)
-    local_chunks = [chunks[cp_rank], chunks[-cp_rank]]
-    local_mask = torch.cat(local_chunks, dim=2)
+    # For key dimension (dim=3), we need a full copy since attention is across all keys
+    # but we could also apply the same pattern for dim=3 to be consistent
+    k_seq_len = attention_mask.size(3)
 
-    return local_mask
+    # The key is to use this exact mask with no further processing in _get_mask_chunk
+    return q_sharded_mask
