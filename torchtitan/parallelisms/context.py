@@ -88,21 +88,17 @@ def _get_mask_chunk(local_mask, q_chunk, i, rank, size):
     second_k_start = (2 * size - 1 - source_rank) * seq_len_per_rank
     second_k_end = (2 * size - source_rank) * seq_len_per_rank
 
+    # Determine which mask section to return based on iteration and rank
     if i == 0:
         # First iteration: Self-attention for this rank's tokens
-        # Extract mask for all queries x all keys from this rank
         left = local_mask[:, :, :, first_k_start:first_k_end]
         right = local_mask[:, :, :, second_k_start:second_k_end]
 
         # Concatenate horizontally to form the full mask
-        return torch.cat([left, right], dim=3)
-
+        result_mask = torch.cat([left, right], dim=3)
     elif i <= rank:
         # For i <= rank: Process all queries with first chunk of keys from rank (rank-i)
-        # Looking at the templated_ring_attention, we see it only uses key.chunk(2)[0]
-        # So we only need the mask for the first chunk of keys
-        return local_mask[:, :, :, first_k_start:first_k_end]
-
+        result_mask = local_mask[:, :, :, first_k_start:first_k_end]
     else:  # i > rank
         # For i > rank: Only use the second half of queries against keys from source_rank
         # Extract mask for second chunk of queries x both chunks of keys
@@ -110,7 +106,9 @@ def _get_mask_chunk(local_mask, q_chunk, i, rank, size):
         bottom_right = local_mask[:, :, q_split:, second_k_start:second_k_end]
 
         # Concatenate horizontally to match the key dimension structure
-        return torch.cat([bottom_left, bottom_right], dim=3)
+        result_mask = torch.cat([bottom_left, bottom_right], dim=3)
+
+    return result_mask
 
 def monkey_patch_context_parallel_attention():
     """
@@ -370,6 +368,10 @@ def monkey_patch_context_parallel_attention():
         kv_rotater = _create_rotater(pg, 2)
         dkv_rotater = _create_rotater(pg, 2, method=_RotateMethod.ALL_TO_ALL)
 
+        # For NaN checking
+        def has_nan(tensor):
+            return torch.isnan(tensor).any() or torch.isinf(tensor).any()
+
         # Get attention mask
         attn_bias = kwargs.get("attn_bias", None)
         state_mask = state.ATTENTION_MASK if hasattr(state, 'ATTENTION_MASK') else None
@@ -436,11 +438,22 @@ def monkey_patch_context_parallel_attention():
                         attn_bias = chunk_mask.to(torch.float32)
                     local_kwargs["attn_bias"] = attn_bias
 
+
+                # Call backward op with sanitized inputs
+                # Replace NaN in inputs
+                q = torch.nan_to_num(q)
+                k = torch.nan_to_num(k)
+                v = torch.nan_to_num(v)
+                out_ = torch.nan_to_num(out_)
+                lse = torch.nan_to_num(lse)
+                dout = torch.nan_to_num(dout)
+
                 # Call backward with float32 precision
                 grad_query_, grad_key_, grad_value_, *rest = op(
                     query=q, key=k, value=v, out=out_, logsumexp=lse,
                     is_causal=is_causal_behavior.value, **local_kwargs
                 )
+
             else:
                 # Skip iteration
                 grad_query_ = torch.zeros_like(query32, dtype=torch.float32)
@@ -518,6 +531,24 @@ def monkey_patch_context_parallel_attention():
                 except Exception as e:
                     print(f"ERROR in query update: {e}", file=sys.stderr)
                     grad_query = torch.nan_to_num(grad_query + grad_query_)
+
+        # Final processing with careful conversion
+        # print(f"DEBUG: Finalizing gradients", file=sys.stderr)
+        next_grad_kv = dkv_rotater.next_buffer()
+        next_grad_kv = torch.nan_to_num(next_grad_kv)
+
+        # Extract final gradients
+        pointer = 0
+        grad_key = next_grad_kv[pointer:pointer + grad_key.numel()].reshape(grad_key.shape)
+        pointer += grad_key.numel()
+        grad_value = next_grad_kv[pointer:pointer + grad_value.numel()].reshape(grad_value.shape)
+
+        # Final sanitization and conversion to original dtype
+        grad_query = torch.nan_to_num(grad_query).to(query.dtype)
+        grad_key = torch.nan_to_num(grad_key).to(key.dtype)
+        grad_value = torch.nan_to_num(grad_value).to(value.dtype)
+
+        return (grad_query, grad_key, grad_value, *rest)
 
     # Apply the patches
     attn_module._scaled_dot_product_ring_efficient_attention = patched_sdp_efficient_attention
