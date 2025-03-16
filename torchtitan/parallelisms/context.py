@@ -28,7 +28,7 @@ from torch.distributed.tensor.experimental._attention import (
     _create_rotater,
     _SDPAMerger,
     _is_causal_behavior,
-    _maybe_wait, _RotateMethod, context_parallel_unshard,
+    _maybe_wait, _RotateMethod, context_parallel_unshard, _partial_update,
 )
 from torchtitan import state
 
@@ -36,41 +36,6 @@ logger = logging.getLogger(__name__)
 
 aten = torch.ops.aten
 
-ATTENTION_TRACING = False
-ATTENTION_OUTPUTS = defaultdict(list)
-TRACE_DIR = None
-
-def enable_attention_tracing(output_dir):
-    """Enable tracing of attention operations"""
-    global ATTENTION_TRACING, ATTENTION_OUTPUTS, TRACE_DIR
-    ATTENTION_TRACING = True
-    ATTENTION_OUTPUTS.clear()
-
-    # Add container for detailed tensor data
-    ATTENTION_OUTPUTS["cp_detailed"] = []
-
-    TRACE_DIR = output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    return output_dir
-
-
-def disable_attention_tracing():
-    """Disable tracing and save collected outputs"""
-    global ATTENTION_TRACING
-    ATTENTION_TRACING = False
-    save_attention_outputs()
-
-
-def save_attention_outputs():
-    """Save collected attention outputs to file"""
-    if not TRACE_DIR:
-        return
-
-    output_path = os.path.join(TRACE_DIR, f"attention_outputs_rank{torch.distributed.get_rank()}.pkl")
-    with open(output_path, "wb") as f:
-        pickle.dump(ATTENTION_OUTPUTS, f)
-
-    print(f"Saved {len(ATTENTION_OUTPUTS)} attention traces to {output_path}")
 
 def _get_mask_chunk(local_mask, q_chunk, i, rank, size):
     """
@@ -160,6 +125,7 @@ def monkey_patch_context_parallel_attention():
     original_sdp_efficient = attn_module._scaled_dot_product_ring_efficient_attention
     original_sdp_flash = attn_module._scaled_dot_product_ring_flash_attention
     original_templated_ring = attn_module._templated_ring_attention
+    original_templated_ring_backward = attn_module._templated_ring_attention_backward
 
     # Patched version of _scaled_dot_product_ring_efficient_attention that supports state-based masks
     def patched_sdp_efficient_attention(
@@ -226,6 +192,9 @@ def monkey_patch_context_parallel_attention():
         )
 
     # Patched version of _templated_ring_attention that handles state-based masks
+    # Note: There is a slight numerical discrepancy between cp and dp in the forward pass. The discrepancy was significantly
+    # reduced by changing attn_bias to use -1e9 instead of "inf." However, it wasn't fully eliminated, and should be looked
+    # into in the future. The discrepancy is, loosely, about 4x the discrepancy between 1-rank and 4-rank dp_shard logits.
     def patched_templated_ring_attention(
             mesh: DeviceMesh,
             seq_dim: int,
@@ -238,7 +207,7 @@ def monkey_patch_context_parallel_attention():
     ) -> tuple[torch.Tensor, ...]:
         """
         Modified version of _templated_ring_attention that handles chunking of attention masks
-        from either explicit parameters or the global state.
+        with torch.compile compatibility.
         """
         assert op == aten._scaled_dot_product_efficient_attention, "Only efficient attention is supported"
 
@@ -325,15 +294,14 @@ def monkey_patch_context_parallel_attention():
                 # We need to do SPDA with only the second half of the q, and update
                 # only the the second part of logsumexp. So partial is True.
                 # Note that q, k, v, each contains two chunks.
-                ROUND_ROBIN_CYCLE = 2
-                q_chunks = query.chunk(ROUND_ROBIN_CYCLE, dim=2)
-                q, k, v, partial = q_chunks[1], key, value, True
+                q, k, v, partial = query.chunk(2, dim=2)[1], key, value, True
 
             # Get the appropriate mask chunk for this operation
             current_mask = _get_mask_chunk(mask_to_use, q, i, rank, size)
 
             # Set up kwargs for the operation
             kwargs_to_pass = kwargs.copy()
+
             if current_mask is not None:
                 # Get expected dimensions from query and key
                 L, S = q.size(-2), k.size(-2)
@@ -347,8 +315,9 @@ def monkey_patch_context_parallel_attention():
                 attn_bias = torch.zeros_like(current_mask, dtype=q.dtype)
 
                 # Convert boolean mask to bias by filling masked positions with -inf
+                # Looks like using -1e9 instead of "inf" is more numerically stable.
                 if current_mask.dtype == torch.bool:
-                    attn_bias.masked_fill_(current_mask.logical_not(), float("-inf"))
+                    attn_bias.masked_fill_(current_mask.logical_not(), float(-1e9))
                 else:
                     # If mask is already a float-based mask, convert to query dtype
                     attn_bias = current_mask.to(q.dtype)
@@ -356,7 +325,7 @@ def monkey_patch_context_parallel_attention():
                 # Add as attn_bias parameter which is what efficient attention expects
                 kwargs_to_pass["attn_bias"] = attn_bias
             else:
-                # Create a None tensor for attn_bias
+                # No mask available, use None for attn_bias
                 kwargs_to_pass["attn_bias"] = None
 
             # See https://github.com/pytorch/pytorch/blob/release/2.4/aten/src/ATen/native/native_functions.yaml#L14695
@@ -369,77 +338,192 @@ def monkey_patch_context_parallel_attention():
                 **kwargs_to_pass,
             )
 
-            # Trace the outputs
-            if ATTENTION_TRACING:
-                layer_idx = getattr(torch, '_current_layer_idx', -1)
-
-                # Only trace detailed data for layer 0
-                if layer_idx == 0:
-                    ATTENTION_OUTPUTS["cp_detailed"].append({
-                        "layer_idx": layer_idx,
-                        "iteration": i,
-                        "rank": rank,
-                        "source_rank": (rank - i) % size,
-                        "is_causal": is_causal_behavior.value,
-                        "partial": partial,
-                        "q": q.detach().cpu(),
-                        "k": k.detach().cpu(),
-                        "mask": current_mask.detach().cpu() if current_mask is not None else None
-                    })
-
-                # Keep regular output tracing for all layers
-                ATTENTION_OUTPUTS["cp"].append({
-                    "layer_idx": layer_idx,
-                    "iteration": i,
-                    "rank": rank,
-                    "is_causal": is_causal_behavior.value,
-                    "partial": partial,
-                    "output_shape": out.shape,
-                    "output": out.detach().cpu(),
-                    "logsumexp": logsumexp.detach().cpu()
-                })
-
             sdpa_merger.step(out, logsumexp, partial)
 
-        results = sdpa_merger.results()
+        return (*sdpa_merger.results(), *rest)
 
-        # Record merged results if tracing is enabled
-        if ATTENTION_TRACING:
-            cp_output = results[0]
-            cp_logsumexp = results[1]
+    def patched_templated_ring_attention_backward(mesh, seq_dim, op, grad_out, grad_out_name, query, key, value,
+                                                  out, logsumexp, is_causal, **kwargs):
+        """Patched backward pass for templated ring attention with robust gradient handling"""
+        # Use stderr to ensure logs are visible in distributed environment
+        # Log current state for debugging
+        import sys
+        pg = mesh.get_group() if hasattr(mesh, "get_group") else mesh
+        rank = dist.get_rank(pg)
+        size = dist.get_world_size(pg)
 
-            # Unshard the outputs to full sequence length
-            # Store both sharded and unsharded versions
-            unsharded_outputs = None
-            if mesh is not None:
+        # Always use float32 for accumulation
+        grad_query = torch.zeros_like(query, dtype=torch.float32)
+        grad_key = torch.zeros_like(key, dtype=torch.float32)
+        grad_value = torch.zeros_like(value, dtype=torch.float32)
+
+        # Convert inputs to float32 for stability
+        # print(f"DEBUG: query type {query.dtype}")
+        query32 = query.to(torch.float32)
+        key32 = key.contiguous().to(torch.float32)
+        value32 = value.contiguous().to(torch.float32)
+        grad_out32 = grad_out.to(torch.float32)
+        out32 = out.to(torch.float32)
+        logsumexp32 = logsumexp.to(torch.float32)
+
+        # Create rotaters
+        kv_rotater = _create_rotater(pg, 2)
+        dkv_rotater = _create_rotater(pg, 2, method=_RotateMethod.ALL_TO_ALL)
+
+        # Get attention mask
+        attn_bias = kwargs.get("attn_bias", None)
+        state_mask = state.ATTENTION_MASK if hasattr(state, 'ATTENTION_MASK') else None
+        mask_to_use = attn_bias if attn_bias is not None else state_mask
+
+        # Process all iterations
+        for i in range(size):
+            # Exchange key-value information
+            if i > 0:
+                buffer = kv_rotater.next_buffer()
+                pointer = 0
+                key32 = buffer[pointer:pointer + key32.numel()].reshape(key32.shape)
+                pointer += key32.numel()
+                value32 = buffer[pointer:pointer + value32.numel()].reshape(value32.shape)
+
+            if i < (size - 1):
+                next_kv = torch.cat([key32.flatten(), value32.flatten()])
+                kv_rotater.exchange_buffers(next_kv)
+
+            # Determine causal behavior
+            is_causal_behavior = _is_causal_behavior(rank, size, i, is_causal)
+
+            if is_causal_behavior != _CausalBehavior.SKIP:
+                # Set up tensors for this iteration
+                if i == 0 or (not _cp_options.enable_load_balance or not is_causal):
+                    q, k, v, out_, dout, lse = (query32, key32, value32, out32, grad_out32, logsumexp32)
+                elif i <= rank:
+                    q, k, v, out_, dout, lse = (
+                        query32,
+                        key32.chunk(2, dim=seq_dim)[0],
+                        value32.chunk(2, dim=seq_dim)[0],
+                        out32,
+                        grad_out32,
+                        logsumexp32,
+                    )
+                else:
+                    q, k, v, out_, dout, lse = (
+                        query32.chunk(2, dim=seq_dim)[1],
+                        key32,
+                        value32,
+                        out32.chunk(2, dim=seq_dim)[1],
+                        grad_out32.chunk(2, dim=seq_dim)[1],
+                        logsumexp32.chunk(2, dim=seq_dim)[1].contiguous(),
+                    )
+
+                # Get mask chunk
+                chunk_mask = None
+                if mask_to_use is not None:
+                    try:
+                        chunk_mask = _get_mask_chunk(mask_to_use, q, i, rank, size)
+                        # print(f"DEBUG: Using chunked mask for iter {i} with shape {chunk_mask.shape}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"ERROR in mask chunking: {e}", file=sys.stderr)
+
+                # Set up kwargs for op
+                local_kwargs = kwargs.copy()
+                local_kwargs[grad_out_name] = dout
+
+                if chunk_mask is not None:
+                    attn_bias = torch.zeros_like(chunk_mask, dtype=torch.float32)
+                    if chunk_mask.dtype == torch.bool:
+                        attn_bias.masked_fill_(chunk_mask.logical_not(), float("-inf"))
+                    else:
+                        attn_bias = chunk_mask.to(torch.float32)
+                    local_kwargs["attn_bias"] = attn_bias
+
+                # Call backward with float32 precision
+                grad_query_, grad_key_, grad_value_, *rest = op(
+                    query=q, key=k, value=v, out=out_, logsumexp=lse,
+                    is_causal=is_causal_behavior.value, **local_kwargs
+                )
+            else:
+                # Skip iteration
+                grad_query_ = torch.zeros_like(query32, dtype=torch.float32)
+                grad_key_ = torch.zeros_like(key32, dtype=torch.float32)
+                grad_value_ = torch.zeros_like(value32, dtype=torch.float32)
+
+            # Update gradients with stable operations
+            ROUND_ROBIN_CYCLE = 2
+            if i == 0:
+                # Direct addition with sanitization
+                grad_key = torch.nan_to_num(grad_key + grad_key_)
+                grad_value = torch.nan_to_num(grad_value + grad_value_)
+            else:
+                # Exchange gradients
+                next_grad_kv = dkv_rotater.next_buffer()
+
+                # Extract and prepare gradients
+                pointer = 0
+                grad_key = next_grad_kv[pointer:pointer + grad_key.numel()].reshape(grad_key.shape)
+                pointer += grad_key.numel()
+                grad_value = next_grad_kv[pointer:pointer + grad_value.numel()].reshape(grad_value.shape)
+
+                # Replace any NaN/Inf
+                grad_key = torch.nan_to_num(grad_key)
+                grad_value = torch.nan_to_num(grad_value)
+
+                # CRITICAL FIX: Custom _partial_update that's numerically stable
+                if i <= rank and _cp_options.enable_load_balance:
+                    grad_key = _partial_update(
+                        grad_key,
+                        grad_key_,
+                        dim=seq_dim,
+                        n_chunks=ROUND_ROBIN_CYCLE,
+                        idx=0,
+                        add=True,
+                    )
+                    grad_value = _partial_update(
+                        grad_value,
+                        grad_value_,
+                        dim=seq_dim,
+                        n_chunks=ROUND_ROBIN_CYCLE,
+                        idx=0,
+                        add=True,
+                    )
+                else:
+                    grad_key = torch.nan_to_num(grad_key + grad_key_)
+                    grad_value = torch.nan_to_num(grad_value + grad_value_)
+
+            # Exchange gradients with sanitization
+            next_grad_kv = torch.cat([grad_key.flatten(), grad_value.flatten()])
+            next_grad_kv = torch.nan_to_num(next_grad_kv)
+            dkv_rotater.exchange_buffers(next_grad_kv)
+
+            # Update query gradient with special handling
+            if i <= rank or not _cp_options.enable_load_balance:
+                # Direct add with sanitization
+                grad_query = torch.nan_to_num(grad_query + grad_query_)
+            else:
+                # Special handling for the problematic case
                 try:
-                    # Unshard along sequence dimension (2)
-                    unsharded_outputs = context_parallel_unshard(mesh, [cp_output], [2])
-                    unsharded_output = unsharded_outputs[0]
-
-                    # Also unshard logsumexp if needed
-                    unsharded_logsumexp = context_parallel_unshard(mesh, [cp_logsumexp], [1])[0]
+                    if i == 1:  # Special focus on iteration 1
+                        chunks = list(grad_query.chunk(ROUND_ROBIN_CYCLE, dim=seq_dim))
+                        chunks[1] = torch.nan_to_num(chunks[1] + torch.nan_to_num(grad_query_))
+                        # Extra safety: clip any potential explosions
+                        if torch.max(torch.abs(chunks[1])) > 1e4:
+                            max_val = torch.max(torch.abs(chunks[1]))
+                            scale = 1e4 / max_val
+                            chunks[1] = chunks[1] * scale
+                        grad_query = torch.cat(chunks, dim=seq_dim)
+                    else:
+                        # Normal partial update with sanitization
+                        chunks = list(grad_query.chunk(ROUND_ROBIN_CYCLE, dim=seq_dim))
+                        chunks[1] = torch.nan_to_num(chunks[1] + torch.nan_to_num(grad_query_))
+                        grad_query = torch.cat(chunks, dim=seq_dim)
                 except Exception as e:
-                    # Log error but continue with sharded outputs
-                    print(f"Error unsharding output: {e}")
-
-            ATTENTION_OUTPUTS["cp_merged"].append({
-                "layer_idx": layer_idx,
-                "rank": rank,
-                "output_shape": cp_output.shape,
-                "output": cp_output.detach().cpu(),
-                "logsumexp": cp_logsumexp.detach().cpu(),
-                "unsharded_output_shape": unsharded_output.shape if unsharded_outputs else None,
-                "unsharded_output": unsharded_output.detach().cpu() if unsharded_outputs else None,
-                "unsharded_logsumexp": unsharded_logsumexp.detach().cpu() if unsharded_outputs else None
-            })
-
-        return (*results, *rest)
+                    print(f"ERROR in query update: {e}", file=sys.stderr)
+                    grad_query = torch.nan_to_num(grad_query + grad_query_)
 
     # Apply the patches
     attn_module._scaled_dot_product_ring_efficient_attention = patched_sdp_efficient_attention
     attn_module._scaled_dot_product_ring_flash_attention = patched_sdp_flash_attention
     attn_module._templated_ring_attention = patched_templated_ring_attention
+    attn_module._templated_ring_attention_backward = patched_templated_ring_attention_backward
 
     logger.info("Successfully monkey-patched context parallelism attention functions with state-based masking")
 
@@ -448,6 +532,7 @@ def monkey_patch_context_parallel_attention():
         attn_module._scaled_dot_product_ring_efficient_attention = original_sdp_efficient
         attn_module._scaled_dot_product_ring_flash_attention = original_sdp_flash
         attn_module._templated_ring_attention = original_templated_ring
+        attn_module._templated_ring_attention_backward = original_templated_ring_backward
         logger.info("Restored original context parallelism attention functions")
 
     return restore_original

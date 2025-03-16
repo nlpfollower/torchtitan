@@ -18,8 +18,9 @@ import torch.nn as nn
 import torch.distributed as dist
 
 class ReferenceModel(nn.Module):
-    def __init__(self, model_parts, device_mesh, stages=None, pp_rank=None, pp_size=None):
+    def __init__(self, model_config, model_parts, device_mesh, stages=None, pp_rank=None, pp_size=None):
         super().__init__()
+        self.model_config = model_config
         self.model_parts = nn.ModuleList(model_parts)
         self.device_mesh = device_mesh
         self.stages = stages
@@ -135,6 +136,7 @@ def build_reference_model(job_config, tokenizer):
     pp_rank = pp_mesh.get_local_rank() if pp_mesh else None
     pp_size = pp_mesh.size() if pp_mesh else None
     return ReferenceModel(
+        model_config,
         reference_model_parts,
         reference_mesh,
         stages=stages,

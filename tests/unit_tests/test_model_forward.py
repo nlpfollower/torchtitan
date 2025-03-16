@@ -17,7 +17,7 @@ from tests.unit_tests.test_utils import run_torchrun
 from torchtitan.config_manager import JobConfig
 from torchtitan.datasets.tokenizer import build_tokenizer
 from torchtitan.logging import init_logger, logger
-from torchtitan.utils import device_type, gather_dtensor
+from torchtitan.utils import device_type, gather_dtensor, set_default_dtype
 from torchtitan.models.reference_model import build_reference_model
 from torchtitan.models.llama import attention_utils
 from torchtitan.datasets.hh_dataset import build_hh_data_loader
@@ -37,7 +37,6 @@ def parse_args():
                         help="Directory to save output logits")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--run_test", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--trace_attn", action="store_true", help="Trace attention operations")
     parser.add_argument("--trace_dir", type=str, help="Directory to save attention traces")
     return parser.parse_args()
 
@@ -63,11 +62,12 @@ def setup_job_config(args):
     job_config.training.dataset_type = "custom"
     job_config.training.dataset = "hh"
     job_config.training.use_attention_mask = True
-    job_config.evaluation.batch_size = 2
+    job_config.evaluation.batch_size = 4
     job_config.experimental.pipeline_parallel_microbatches = 1
-    job_config.training.batch_size = 2
+    job_config.training.batch_size = 1
     job_config.training.dataset_mode = "sft"
     job_config.training.dataset_packing = True
+    job_config.training.mixed_precision_param = "bfloat16"
     return job_config
 
 def properly_gather_logits(logits, world_mesh, cp_enabled):
@@ -125,9 +125,9 @@ def run_forward_pass():
     torch.set_num_threads(num_threads_per_rank)
     logger.info(f"Torch new num threads: {torch.get_num_threads()}")
 
-    # if rank == 0:
-    #     print("Hello from rank 0")
-    #     pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    if rank == 0:
+        print("Hello from rank 0")
+        pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
 
     args = parse_args()
     job_config = setup_job_config(args)
@@ -170,19 +170,6 @@ def run_forward_pass():
     # Set up context parallelism context manager if CP is enabled
     cp_enabled = job_config.experimental.context_parallel_degree > 1
     optional_context_parallel_ctx = None
-
-    if args.trace_attn:
-        trace_dir = args.trace_dir or os.path.join(args.output_dir, "attention_traces")
-        os.makedirs(trace_dir, exist_ok=True)
-
-        if cp_enabled:
-            # Enable CP attention tracing
-            context.enable_attention_tracing(trace_dir)
-        else:
-            # Enable standard attention tracing
-            attention_utils.enable_attention_tracing(trace_dir)
-
-        logger.info(f"Enabled attention tracing to {trace_dir}")
 
     if cp_enabled:
         world_mesh = model.device_mesh
@@ -296,7 +283,8 @@ def run_forward_pass():
 def main():
     args = parse_args()
     if args.run_test:
-        run_forward_pass()
+        with set_default_dtype(torch.float32):
+            run_forward_pass()
     else:
         run_torchrun(__file__, args)
 

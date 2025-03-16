@@ -14,38 +14,6 @@ from torch.nn.attention.flex_attention import (
 
 flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
 
-ATTENTION_TRACING = False
-ATTENTION_OUTPUTS = defaultdict(list)
-TRACE_DIR = None
-
-def enable_attention_tracing(output_dir):
-    """Enable tracing of attention operations"""
-    global ATTENTION_TRACING, ATTENTION_OUTPUTS, TRACE_DIR
-    ATTENTION_TRACING = True
-    ATTENTION_OUTPUTS.clear()
-    TRACE_DIR = output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    return output_dir
-
-
-def disable_attention_tracing():
-    """Disable tracing and save collected outputs"""
-    global ATTENTION_TRACING
-    ATTENTION_TRACING = False
-    save_attention_outputs()
-
-
-def save_attention_outputs():
-    """Save collected attention outputs to file"""
-    if not TRACE_DIR:
-        return
-
-    output_path = os.path.join(TRACE_DIR, f"attention_outputs_rank{torch.distributed.get_rank()}.pkl")
-    with open(output_path, "wb") as f:
-        pickle.dump(ATTENTION_OUTPUTS, f)
-
-    print(f"Saved {len(ATTENTION_OUTPUTS)} attention traces to {output_path}")
-
 def create_block_document_causal_mask(document_ids: torch.Tensor):
     batch_size, max_seq_len = document_ids.shape
     device = document_ids.device
@@ -130,32 +98,6 @@ def sdpa_or_flex_attention() -> Callable:
                 else:
                     output = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-                if ATTENTION_TRACING:
-                    layer_idx = getattr(torch, '_current_layer_idx', -1)
-
-                    # Only trace detailed data for layer 0
-                    if layer_idx == 0:
-                        if "dp_detailed" not in ATTENTION_OUTPUTS:
-                            ATTENTION_OUTPUTS["dp_detailed"] = []
-
-                        ATTENTION_OUTPUTS["dp_detailed"].append({
-                            "layer_idx": layer_idx,
-                            "q": q.detach().cpu(),
-                            "k": k.detach().cpu(),
-                            "mask": mask.detach().cpu() if mask is not None else None,
-                            "output": output.detach().cpu()
-                        })
-
-                    # Keep regular output tracing for all layers
-                    if "dp" not in ATTENTION_OUTPUTS:
-                        ATTENTION_OUTPUTS["dp"] = []
-
-                    ATTENTION_OUTPUTS["dp"].append({
-                        "layer_idx": layer_idx,
-                        "output_shape": output.shape,
-                        "mask_shape": mask.shape if mask is not None else None,
-                        "output": output.detach().cpu()
-                    })
                 return output
 
     return _attention_call

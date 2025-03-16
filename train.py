@@ -406,9 +406,9 @@ def main(job_config: JobConfig):
             optional_context_parallel_ctx = (
                 utils.create_context_parallel_ctx(
                     cp_mesh=world_mesh["cp"],
-                    cp_buffers=[input_ids, labels] + [m.freqs_cis for m in model_parts],
-                    cp_seq_dims=[1, 1] + [0 for _ in model_parts],
-                    cp_no_restore_buffers={input_ids, labels},
+                    cp_buffers=[input_ids] + [m.freqs_cis for m in model_parts],
+                    cp_seq_dims=[1] + [0 for _ in model_parts],
+                    cp_no_restore_buffers={input_ids},
                     cp_rotate_method=job_config.experimental.context_parallel_rotate_method,
                 )
                 if parallel_dims.cp_enabled
@@ -422,6 +422,104 @@ def main(job_config: JobConfig):
                 batch_size=job_config.training.batch_size,
                 n_microbatches=job_config.experimental.pipeline_parallel_microbatches
             )
+
+            def unshard_with_grad(sharded_tensor, mesh, seq_dim=1):
+                """
+                Unshards a tensor preserving gradient flow through distributed operations.
+                """
+
+                # Custom autograd function with robust gradient handling
+                class RoundRobinGatherFunction(torch.autograd.Function):
+                    @staticmethod
+                    def forward(ctx, input_tensor, group, rank, world_size, seq_dim):
+                        # Save context for backward
+                        ctx.group = group
+                        ctx.rank = rank
+                        ctx.world_size = world_size
+                        ctx.seq_dim = seq_dim
+
+                        # Get the sharded tensor shape for later use in backward
+                        ctx.sharded_shape = input_tensor.shape
+
+                        # Ensure input is contiguous for gathering
+                        input_tensor = input_tensor.contiguous()
+
+                        # Step 1: All-gather from all processes
+                        gathered_tensors = [torch.zeros_like(input_tensor) for _ in range(world_size)]
+                        torch.distributed.all_gather(gathered_tensors, input_tensor, group=group)
+
+                        # Step 2: Split each gathered tensor into its two chunks
+                        # (Because each rank's tensor already contains 2 chunks)
+                        all_chunks = []
+                        for tensor in gathered_tensors:
+                            chunks = tensor.chunk(2, dim=seq_dim)
+                            all_chunks.extend(chunks)
+
+                        # Step 3: Reorder chunks according to round-robin pattern
+                        ordered_chunks = [None] * (world_size * 2)
+                        for i, chunk in enumerate(all_chunks):
+                            if i % 2 == 0:
+                                # First half of each rank's data goes to position i//2
+                                ordered_chunks[i // 2] = chunk
+                            else:
+                                # Second half goes to position (world_size*2 - 1 - i//2)
+                                ordered_chunks[world_size * 2 - 1 - (i // 2)] = chunk
+
+                        # Step 4: Concatenate reordered chunks into final tensor
+                        result = torch.cat(ordered_chunks, dim=seq_dim)
+
+                        # Save the mapping info for backward pass
+                        ctx.chunk_positions = {}
+                        for i in range(world_size):
+                            # Record where each rank's chunks ended up in the final order
+                            ctx.chunk_positions[i] = (i, world_size * 2 - i - 1)
+
+                        return result
+
+                    @staticmethod
+                    def backward(ctx, grad_output):
+                        # Extract saved context
+                        rank = ctx.rank
+                        world_size = ctx.world_size
+                        seq_dim = ctx.seq_dim
+                        sharded_shape = ctx.sharded_shape
+
+                        # Handle case where grad is None (unlikely but possible)
+                        if grad_output is None:
+                            return None, None, None, None, None
+
+                        # Get chunk size
+                        grad_chunk_size = sharded_shape[seq_dim] // 2
+
+                        # Find positions of this rank's chunks in the full gradient
+                        pos1, pos2 = ctx.chunk_positions[rank]
+
+                        # Extract this rank's gradient chunks
+                        start1 = pos1 * grad_chunk_size
+                        start2 = pos2 * grad_chunk_size
+
+                        # Get the two chunks that belong to this rank
+                        grad_chunk1 = grad_output.narrow(seq_dim, start1, grad_chunk_size)
+                        grad_chunk2 = grad_output.narrow(seq_dim, start2, grad_chunk_size)
+
+                        # Combine the chunks in the same order they were in the sharded input
+                        grad_for_rank = torch.cat([grad_chunk1, grad_chunk2], dim=seq_dim).contiguous()
+
+                        # Check for NaN/Inf but don't modify - preserve gradient flow
+                        if torch.isnan(grad_for_rank).any() or torch.isinf(grad_for_rank).any():
+                            print(f"Warning: Rank {rank} detected NaN/Inf in gradients during unsharding")
+
+                        # Return gradient for this rank's input, None for other arguments
+                        return grad_for_rank, None, None, None, None
+
+                # Get the mesh properties
+                cp_world_size = mesh.size()
+                cp_rank = mesh.get_local_rank()
+
+                # Apply the custom autograd function
+                return RoundRobinGatherFunction.apply(
+                    sharded_tensor, mesh.get_group(), cp_rank, cp_world_size, seq_dim
+                )
 
             reference_logits = None
             if job_config.reference_model.enabled:
@@ -458,9 +556,10 @@ def main(job_config: JobConfig):
                 with train_context(optional_context_parallel_ctx):
                     forward_start = time.perf_counter()
                     logits = model(input_ids, mask=forward_mask)
+                    unsharded_logits = unshard_with_grad(logits, world_mesh["cp"], seq_dim=1)
                     forward_time = time.perf_counter() - forward_start
 
-                    loss = loss_fn(logits, labels, reference_logits, document_ids)
+                    loss = loss_fn(unsharded_logits, labels, reference_logits, document_ids)
                     # Free memory before backward pass
                     del logits
 
