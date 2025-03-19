@@ -13,6 +13,7 @@ import torch
 from lxml.html.diff import token
 
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.distributed.tensor.experimental._attention import context_parallel_unshard
 
 from torchtitan import utils
 from torchtitan.checkpoint import CheckpointManager, TrainState
@@ -50,9 +51,9 @@ def main(job_config: JobConfig):
     local_rank = int(os.environ.get("LOCAL_RANK"))
     rank = int(os.environ.get("RANK"))
     logger.info(f"rank {rank} and local rank {local_rank}")
-    if rank == 0:
-        print("Hello from rank 0")
-        pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
+    # if rank == 0:
+    #     print("Hello from rank 0")
+    #     pydevd_pycharm.settrace('localhost', port=6791, stdoutToServer=True, stderrToServer=True)
     # if rank == 1:
     #     print("Hello from rank 1")
     #     pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
@@ -395,25 +396,33 @@ def main(job_config: JobConfig):
             labels = labels.to(device_type)
             optimizers.zero_grad()
 
-            # Process attention mask for CP if needed
-            forward_mask = attention_mask
-            if parallel_dims.cp_enabled and attention_mask is not None:
-                attention_mask = shard_attention_mask(attention_mask, world_mesh["cp"])
-                forward_mask = None
-
             # apply context parallelism if cp is enabled
             # ensure CP handles the separate freqs_cis buffer for each pp stage
-            optional_context_parallel_ctx = (
-                utils.create_context_parallel_ctx(
+            if parallel_dims.cp_enabled:
+                # Initialize buffers, sequence dimensions, and no-restore buffers with input_ids
+                cp_buffers = [input_ids]
+                cp_seq_dims = [1]
+                cp_no_restore_buffers = {input_ids}
+
+                # Only add attention_mask if it is not None
+                if attention_mask is not None:
+                    cp_buffers.append(attention_mask)
+                    cp_seq_dims.append(2)
+                    cp_no_restore_buffers.add(attention_mask)
+
+                # Append the freqs_cis from each model part
+                cp_buffers.extend([m.freqs_cis for m in model.model_parts])
+                cp_seq_dims.extend([0 for _ in model.model_parts])
+
+                optional_context_parallel_ctx = utils.create_context_parallel_ctx(
                     cp_mesh=world_mesh["cp"],
-                    cp_buffers=[input_ids] + [m.freqs_cis for m in model_parts],
-                    cp_seq_dims=[1] + [0 for _ in model_parts],
-                    cp_no_restore_buffers={input_ids},
+                    cp_buffers=cp_buffers,
+                    cp_seq_dims=cp_seq_dims,
+                    cp_no_restore_buffers=cp_no_restore_buffers,
                     cp_rotate_method=job_config.experimental.context_parallel_rotate_method,
                 )
-                if parallel_dims.cp_enabled
-                else None
-            )
+            else:
+                optional_context_parallel_ctx = None
 
             # Set state tensors (important for both PP and non-PP paths)
             state.set_state_tensors(
@@ -524,7 +533,7 @@ def main(job_config: JobConfig):
             reference_logits = None
             if job_config.reference_model.enabled:
                 with torch.no_grad():
-                    reference_logits = reference_model(input_ids, forward_mask)
+                    reference_logits = reference_model(input_ids, attention_mask)
                     state.set_state_tensors(reference_logits=reference_logits)
 
             if parallel_dims.pp_enabled:
@@ -538,9 +547,9 @@ def main(job_config: JobConfig):
                     # Pass mask as a regular keyword argument - it will be automatically
                     # split into microbatches by PyTorch's pipeline implementation
                     if has_first_stage:
-                        pp_schedule.step(input_ids, target=targets, losses=losses, mask=forward_mask)
+                        pp_schedule.step(input_ids, target=targets, losses=losses, mask=attention_mask)
                     else:
-                        pp_schedule.step(target=targets, losses=losses, mask=forward_mask)
+                        pp_schedule.step(target=targets, losses=losses, mask=attention_mask)
 
                 model_timers.append(time.perf_counter() - pp_step_start)
 
@@ -555,7 +564,7 @@ def main(job_config: JobConfig):
                 # Non-PP forward / backward
                 with train_context(optional_context_parallel_ctx):
                     forward_start = time.perf_counter()
-                    logits = model(input_ids, mask=forward_mask)
+                    logits = model(input_ids, mask=attention_mask)
                     unsharded_logits = unshard_with_grad(logits, world_mesh["cp"], seq_dim=1)
                     forward_time = time.perf_counter() - forward_start
 

@@ -18,7 +18,11 @@ from typing import Any, Callable, Optional, Union
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
+from torch._guards import detect_fake_mode
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor._op_schema import OpStrategy, OpSchema, PlacementList, RuntimeSchemaInfo
 from torch.distributed.tensor.experimental._attention import (
     _templated_ring_attention,
     _scaled_dot_product_ring_efficient_attention,
@@ -61,13 +65,6 @@ def _get_mask_chunk(local_mask, q_chunk, i, rank, size):
     assert _cp_options.enable_load_balance, "This implementation requires load balancing to be enabled"
     assert _cp_options.rotate_method == _RotateMethod.ALL_GATHER, "Only ALL_GATHER rotation method is supported"
     assert local_mask.dim() == 4, "Mask must be 4D (batch, heads, q_seq, kv_seq)"
-    # Get the number of heads from the query tensor
-    num_heads_q = q_chunk.size(1)
-
-    # If mask has only 1 head but query has multiple, broadcast the mask
-    if local_mask.size(1) == 1 and num_heads_q > 1:
-        # Expand the mask to match the number of heads
-        local_mask = local_mask.expand(-1, num_heads_q, -1, -1)
 
     # Calculate sequence length per rank
     full_seq_len = local_mask.size(3)
@@ -120,10 +117,14 @@ def monkey_patch_context_parallel_attention():
     """
     # Store original methods for reference and restoration
     import torch.distributed.tensor.experimental._attention as attn_module
+    import torch.distributed.tensor._ops._matrix_ops as _matrix_ops
     original_sdp_efficient = attn_module._scaled_dot_product_ring_efficient_attention
     original_sdp_flash = attn_module._scaled_dot_product_ring_flash_attention
     original_templated_ring = attn_module._templated_ring_attention
     original_templated_ring_backward = attn_module._templated_ring_attention_backward
+    original_sdpa_handler = attn_module._sdpa_handler
+    original_sdpa_strategy = _matrix_ops.scaled_dot_product_efficient_attention_strategy
+    original_sdpa_backward_strategy = _matrix_ops.scaled_dot_product_efficient_attention_backward_strategy
 
     # Patched version of _scaled_dot_product_ring_efficient_attention that supports state-based masks
     def patched_sdp_efficient_attention(
@@ -152,7 +153,7 @@ def monkey_patch_context_parallel_attention():
             query=query,
             key=key,
             value=value,
-            is_causal=is_causal,
+            is_causal=True,
             attn_bias=attn_bias,  # Pass through explicitly provided mask if available
             dropout_p=dropout_p,
             scale=scale,
@@ -345,6 +346,7 @@ def monkey_patch_context_parallel_attention():
         """Patched backward pass for templated ring attention with robust gradient handling"""
         # Use stderr to ensure logs are visible in distributed environment
         # Log current state for debugging
+        is_causal = True
         import sys
         pg = mesh.get_group() if hasattr(mesh, "get_group") else mesh
         rank = dist.get_rank(pg)
@@ -441,12 +443,6 @@ def monkey_patch_context_parallel_attention():
 
                 # Call backward op with sanitized inputs
                 # Replace NaN in inputs
-                q = torch.nan_to_num(q)
-                k = torch.nan_to_num(k)
-                v = torch.nan_to_num(v)
-                out_ = torch.nan_to_num(out_)
-                lse = torch.nan_to_num(lse)
-                dout = torch.nan_to_num(dout)
 
                 # Call backward with float32 precision
                 grad_query_, grad_key_, grad_value_, *rest = op(
@@ -464,8 +460,8 @@ def monkey_patch_context_parallel_attention():
             ROUND_ROBIN_CYCLE = 2
             if i == 0:
                 # Direct addition with sanitization
-                grad_key = torch.nan_to_num(grad_key + grad_key_)
-                grad_value = torch.nan_to_num(grad_value + grad_value_)
+                grad_key = grad_key + grad_key_
+                grad_value =grad_value + grad_value_
             else:
                 # Exchange gradients
                 next_grad_kv = dkv_rotater.next_buffer()
@@ -477,10 +473,10 @@ def monkey_patch_context_parallel_attention():
                 grad_value = next_grad_kv[pointer:pointer + grad_value.numel()].reshape(grad_value.shape)
 
                 # Replace any NaN/Inf
-                grad_key = torch.nan_to_num(grad_key)
-                grad_value = torch.nan_to_num(grad_value)
+                grad_key = grad_key
+                grad_value = grad_value
 
-                # CRITICAL FIX: Custom _partial_update that's numerically stable
+
                 if i <= rank and _cp_options.enable_load_balance:
                     grad_key = _partial_update(
                         grad_key,
@@ -499,62 +495,201 @@ def monkey_patch_context_parallel_attention():
                         add=True,
                     )
                 else:
-                    grad_key = torch.nan_to_num(grad_key + grad_key_)
-                    grad_value = torch.nan_to_num(grad_value + grad_value_)
+                    grad_key = grad_key + grad_key_
+                    grad_value = grad_value + grad_value_
 
             # Exchange gradients with sanitization
             next_grad_kv = torch.cat([grad_key.flatten(), grad_value.flatten()])
-            next_grad_kv = torch.nan_to_num(next_grad_kv)
             dkv_rotater.exchange_buffers(next_grad_kv)
 
             # Update query gradient with special handling
             if i <= rank or not _cp_options.enable_load_balance:
-                # Direct add with sanitization
-                grad_query = torch.nan_to_num(grad_query + grad_query_)
+                grad_query += grad_query_
             else:
-                # Special handling for the problematic case
-                try:
-                    if i == 1:  # Special focus on iteration 1
-                        chunks = list(grad_query.chunk(ROUND_ROBIN_CYCLE, dim=seq_dim))
-                        chunks[1] = torch.nan_to_num(chunks[1] + torch.nan_to_num(grad_query_))
-                        # Extra safety: clip any potential explosions
-                        if torch.max(torch.abs(chunks[1])) > 1e4:
-                            max_val = torch.max(torch.abs(chunks[1]))
-                            scale = 1e4 / max_val
-                            chunks[1] = chunks[1] * scale
-                        grad_query = torch.cat(chunks, dim=seq_dim)
-                    else:
-                        # Normal partial update with sanitization
-                        chunks = list(grad_query.chunk(ROUND_ROBIN_CYCLE, dim=seq_dim))
-                        chunks[1] = torch.nan_to_num(chunks[1] + torch.nan_to_num(grad_query_))
-                        grad_query = torch.cat(chunks, dim=seq_dim)
-                except Exception as e:
-                    print(f"ERROR in query update: {e}", file=sys.stderr)
-                    grad_query = torch.nan_to_num(grad_query + grad_query_)
+                grad_query = _partial_update(
+                    grad_query,
+                    grad_query_,
+                    dim=seq_dim,
+                    n_chunks=ROUND_ROBIN_CYCLE,
+                    idx=1,
+                    add=True,
+                )
 
         # Final processing with careful conversion
-        # print(f"DEBUG: Finalizing gradients", file=sys.stderr)
         next_grad_kv = dkv_rotater.next_buffer()
-        next_grad_kv = torch.nan_to_num(next_grad_kv)
+        next_grad_kv = next_grad_kv
 
         # Extract final gradients
-        pointer = 0
-        grad_key = next_grad_kv[pointer:pointer + grad_key.numel()].reshape(grad_key.shape)
-        pointer += grad_key.numel()
-        grad_value = next_grad_kv[pointer:pointer + grad_value.numel()].reshape(grad_value.shape)
+        grad_key = next_grad_kv[:grad_key.numel()].reshape(grad_key.shape)
+        grad_value = next_grad_kv[grad_value.numel():].reshape(grad_value.shape)
 
         # Final sanitization and conversion to original dtype
-        grad_query = torch.nan_to_num(grad_query).to(query.dtype)
-        grad_key = torch.nan_to_num(grad_key).to(key.dtype)
-        grad_value = torch.nan_to_num(grad_value).to(value.dtype)
+        grad_query = grad_query.to(query.dtype)
+        grad_key = grad_key.to(key.dtype)
+        grad_value = grad_value.to(value.dtype)
 
         return (grad_query, grad_key, grad_value, *rest)
 
-    # Apply the patches
+    @_matrix_ops.register_op_strategy(
+        aten._scaled_dot_product_efficient_attention.default,
+        schema_info=RuntimeSchemaInfo(4),
+    )
+    def patched_scaled_dot_product_efficient_attention_strategy(
+            mesh: DeviceMesh, op_schema: OpSchema
+    ) -> OpStrategy:
+        # Original implementation with modifications for attn_bias
+        q_input_strategy = op_schema.args_schema[0]
+        assert isinstance(q_input_strategy, OpStrategy)
+
+        has_attn_bias = op_schema.args_schema[3] is not None
+        compute_log_sumexp = op_schema.args_schema[4]
+
+        single_mesh_dim_strategies: list[PlacementList] = []
+
+        # Full replication strategy
+        all_replicate: PlacementList = [
+            Replicate(),
+            Replicate(),
+            None,
+            None,
+            Replicate(),
+            Replicate(),
+            Replicate(),
+        ]
+        if has_attn_bias:
+            all_replicate.append(Replicate())  # attn bias
+
+        # Context Parallelism: shards on the sequence dim
+        sequence_dim_sharding = [
+            Shard(2),  # output
+            Shard(2),  # logsumexp
+            None,  # philox_seed
+            None,  # philox_offset
+            Shard(2),  # q
+            Shard(2),  # k
+            Shard(2),  # v
+        ]
+
+        # Add attention bias sharding if present
+        if has_attn_bias:
+            sequence_dim_sharding.append(Shard(2))  # attn_bias also sharded on seq dim
+
+        # Add strategies to the list
+        single_mesh_dim_strategies.append(sequence_dim_sharding)
+        single_mesh_dim_strategies.append(all_replicate)
+
+        # Tensor parallelism: shards on the heads dim
+        qkv_sharding = Shard(1)
+        output_sharding = Shard(1)
+        logsumexp_sharding = Shard(1) if compute_log_sumexp else Replicate()
+
+        num_heads_dim_sharding = [
+            output_sharding,
+            logsumexp_sharding,
+            None,
+            None,
+            qkv_sharding,
+            qkv_sharding,
+            qkv_sharding,
+        ]
+        if has_attn_bias:
+            num_heads_dim_sharding.append(Shard(1))
+
+        single_mesh_dim_strategies.append(num_heads_dim_sharding)
+
+        return _matrix_ops.expand_to_full_mesh_op_strategy(
+            mesh,
+            op_schema,
+            single_mesh_dim_strategies,
+            input_index=4,
+        )
+
+    @_matrix_ops.register_op_strategy(aten._scaled_dot_product_efficient_attention_backward.default)
+    def patched_scaled_dot_product_efficient_attention_backward_strategy(
+            mesh: DeviceMesh, op_schema: OpSchema
+    ) -> OpStrategy:
+        q_input_strategy = op_schema.args_schema[1]
+        assert isinstance(q_input_strategy, OpStrategy)
+
+        # Check if attention bias is present
+        has_attn_bias = op_schema.args_schema[4] is not None
+
+        single_mesh_dim_strategies = []
+
+        # Fully replicated strategy
+        all_replicate: PlacementList = [Replicate()] * (12 + has_attn_bias)
+        if not has_attn_bias:
+            all_replicate[3] = None  # grad bias is None if attn_bias is not present
+        single_mesh_dim_strategies.append(all_replicate)
+
+        # Tensor parallelism (heads dimension) strategy
+        grad_output_sharding = Shard(1)
+        qkv_sharding = Shard(1)
+        output_sharding = Shard(1)
+        logsumexp_sharding = Shard(1)
+        grad_qkv_sharding = Shard(1)
+        grad_bias_sharding = Shard(1) if has_attn_bias else None
+
+        num_heads_dim_sharding: PlacementList = [
+            grad_qkv_sharding,  # grad_q
+            grad_qkv_sharding,  # grad_k
+            grad_qkv_sharding,  # grad_v
+            grad_bias_sharding,  # grad_bias (or None)
+            grad_output_sharding,  # grad_output
+            qkv_sharding,  # q
+            qkv_sharding,  # k
+            qkv_sharding,  # v
+            # Position for optional attn_bias
+            output_sharding,  # output
+            logsumexp_sharding,  # logsumexp
+        ]
+
+        # Input sharding of attn_bias on heads dim if present
+        if has_attn_bias:
+            num_heads_dim_sharding.insert(8, Shard(1))  # attn_bias sharded on heads dim
+
+        # Add remaining scalar tensor inputs
+        num_heads_dim_sharding.extend([Replicate(), Replicate()])  # philox_seed, philox_offset
+
+        single_mesh_dim_strategies.append(num_heads_dim_sharding)
+
+        # Context Parallelism (sequence dimension) strategy
+        seq_dim_sharding: PlacementList = [
+            Shard(2),  # grad_q
+            Shard(2),  # grad_k
+            Shard(2),  # grad_v
+            None,  # grad_bias
+            Shard(2),  # grad_output
+            Shard(2),  # q
+            Shard(2),  # k
+            Shard(2),  # v
+            Shard(2),  # output
+            Shard(2),  # logsumexp
+        ]
+
+        # Insert attn_bias sharding on sequence dim if present
+        if has_attn_bias:
+            seq_dim_sharding.insert(8, Shard(2))
+
+        # Add remaining tensors
+        seq_dim_sharding.extend([Replicate(), Replicate()])   # philox_seed, philox_offset
+
+        single_mesh_dim_strategies.append(seq_dim_sharding)
+
+        return _matrix_ops.expand_to_full_mesh_op_strategy(
+            mesh,
+            op_schema,
+            single_mesh_dim_strategies,
+            input_index=4,
+        )
+
+    # Apply all patches
     attn_module._scaled_dot_product_ring_efficient_attention = patched_sdp_efficient_attention
     attn_module._scaled_dot_product_ring_flash_attention = patched_sdp_flash_attention
     attn_module._templated_ring_attention = patched_templated_ring_attention
     attn_module._templated_ring_attention_backward = patched_templated_ring_attention_backward
+    _matrix_ops.scaled_dot_product_efficient_attention_strategy = patched_scaled_dot_product_efficient_attention_strategy
+    _matrix_ops.scaled_dot_product_efficient_attention_backward_strategy = patched_scaled_dot_product_efficient_attention_backward_strategy
 
     logger.info("Successfully monkey-patched context parallelism attention functions with state-based masking")
 
@@ -564,6 +699,17 @@ def monkey_patch_context_parallel_attention():
         attn_module._scaled_dot_product_ring_flash_attention = original_sdp_flash
         attn_module._templated_ring_attention = original_templated_ring
         attn_module._templated_ring_attention_backward = original_templated_ring_backward
+        attn_module._sdpa_handler = original_sdpa_handler
+        _matrix_ops.scaled_dot_product_efficient_attention_strategy = original_sdpa_strategy
+        _matrix_ops.scaled_dot_product_efficient_attention_backward_strategy = original_sdpa_backward_strategy
+
+        @_matrix_ops.register_op_strategy(aten._scaled_dot_product_efficient_attention_backward.default)
+        def _restore_strategy(mesh, op_schema):
+            return original_sdpa_strategy(mesh, op_schema)
+
+        @_matrix_ops.register_op_strategy(aten._scaled_dot_product_efficient_attention_backward.default)
+        def _restore_backward_strategy(mesh, op_schema):
+            return original_sdpa_backward_strategy(mesh, op_schema)
         logger.info("Restored original context parallelism attention functions")
 
     return restore_original

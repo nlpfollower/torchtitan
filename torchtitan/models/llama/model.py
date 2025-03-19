@@ -180,7 +180,6 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask = None,
-        layer_idx = None,
     ):
         """
         Forward pass of the attention module.
@@ -193,9 +192,6 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        # Store layer index for tracing
-        if layer_idx is not None:
-            torch._current_layer_idx = layer_idx
 
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -333,7 +329,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, layer_idx=self.layer_id)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 

@@ -175,17 +175,28 @@ def run_forward_pass():
         world_mesh = model.device_mesh
         cp_mesh = world_mesh["cp"]
 
-        # If CP is enabled and mask exists, use sharded mask and set argument to None
-        if attention_mask is not None:
-            attention_mask = context.shard_attention_mask(attention_mask, cp_mesh)
-
         # Create CP context with appropriate buffers
         if hasattr(model, 'model_parts'):
+            # Initialize buffers, sequence dimensions, and no-restore buffers with input_ids
+            cp_buffers = [input_ids]
+            cp_seq_dims = [1]
+            cp_no_restore_buffers = {input_ids}
+
+            # Only add attention_mask if it is not None
+            if attention_mask is not None:
+                cp_buffers.append(attention_mask)
+                cp_seq_dims.append(2)
+                cp_no_restore_buffers.add(attention_mask)
+
+            # Append the freqs_cis from each model part
+            cp_buffers.extend([m.freqs_cis for m in model.model_parts])
+            cp_seq_dims.extend([0 for _ in model.model_parts])
+
             optional_context_parallel_ctx = utils.create_context_parallel_ctx(
                 cp_mesh=cp_mesh,
-                cp_buffers=[input_ids] + [m.freqs_cis for m in model.model_parts],
-                cp_seq_dims=[1] + [0 for _ in model.model_parts],
-                cp_no_restore_buffers={input_ids},
+                cp_buffers=cp_buffers,
+                cp_seq_dims=cp_seq_dims,
+                cp_no_restore_buffers=cp_no_restore_buffers,
                 cp_rotate_method=job_config.experimental.context_parallel_rotate_method,
             )
 
