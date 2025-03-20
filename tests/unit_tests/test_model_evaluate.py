@@ -59,7 +59,6 @@ def setup_job_config(args):
     job_config.training.dataset_type = "custom"
     job_config.training.dataset = "hh"
     job_config.training.loss_function = "classification_with_packing"
-    job_config.training.use_attention_mask = True
     job_config.evaluation.batch_size = 2
     job_config.experimental.pipeline_parallel_microbatches = 2
     job_config.training.batch_size = 2

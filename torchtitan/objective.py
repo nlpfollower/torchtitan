@@ -96,8 +96,8 @@ class Objective:
                 shifted_labels = labels[:, 1:].contiguous()
 
                 # Compute token-level losses for policy logits
-                loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
-                token_loss = loss_fn(
+                ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+                token_loss = ce_loss_fn(
                     shifted_logits.reshape(-1, shifted_logits.size(-1)),
                     shifted_labels.reshape(-1)
                 ).view(batch_size, -1)
@@ -108,7 +108,7 @@ class Objective:
                     shifted_ref_logits = reference_logits[:, :-1, :].contiguous()
 
                     # Compute token-level losses for reference logits
-                    reference_token_loss = loss_fn(
+                    reference_token_loss = ce_loss_fn(
                         shifted_ref_logits.reshape(-1, shifted_ref_logits.size(-1)),
                         shifted_labels.reshape(-1)
                     ).view(batch_size, -1)
@@ -198,49 +198,76 @@ class Objective:
         """
         cp_rank, cp_world_size, cp_group = cp_info['rank'], cp_info['world_size'], cp_info['group']
         logit_start, logit_end = indices['logit_start'], indices['logit_end']
+        full_seq_len = cp_info['full_seq_len']
 
         # Create custom autograd function for token loss unsharding with gradient support
         class LossParallelUnshard(torch.autograd.Function):
             @staticmethod
             def forward(ctx, tensor, rank, world_size, group, start_idx, end_idx, full_seq_len):
-                # Ensure input is contiguous
-                tensor = tensor.contiguous()
+                # Calculate the expected shard size that is consistent across all ranks
+                shard_size = (full_seq_len + world_size - 1) // world_size
+
+                # Get the actual shape of the input tensor
+                batch_size, actual_shard_len = tensor.shape
+
+                # Prepare tensor for all_gather - ensure consistent shapes across ranks
+                gather_tensor = tensor
+
+                # If this is the last rank and needs padding (due to -1 for causal prediction)
+                if rank == world_size - 1 and actual_shard_len < shard_size:
+                    # Create padded tensor with the same size as other ranks
+                    padded_tensor = torch.zeros(
+                        (batch_size, shard_size),
+                        device=tensor.device,
+                        dtype=tensor.dtype
+                    )
+
+                    # Copy actual data into padded tensor
+                    padded_tensor[:, :actual_shard_len] = tensor
+                    gather_tensor = padded_tensor
+
+                # Ensure tensor is contiguous for all_gather
+                gather_tensor = gather_tensor.contiguous()
 
                 # Gather sharded tensors from all ranks
-                gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+                gathered_tensors = [torch.zeros_like(gather_tensor) for _ in range(world_size)]
+                torch.distributed.all_gather(gathered_tensors, gather_tensor, group=group)
 
-                # Perform all-gather operation
-                torch.distributed.all_gather(gathered_tensors, tensor, group=group)
+                # Create empty tensor for full sequence result
+                full_tensor = torch.zeros(
+                    (batch_size, full_seq_len - 1),  # -1 for causal prediction
+                    device=tensor.device,
+                    dtype=tensor.dtype
+                )
 
-                # Create empty tensor for full sequence
-                full_tensor_shape = list(tensor.shape)
-                full_tensor_shape[1] = full_seq_len - 1  # -1 because we're predicting shifts
-
-                full_tensor = torch.zeros(full_tensor_shape, device=tensor.device, dtype=tensor.dtype)
-
-                # Fill in the full tensor with gathered shards
+                # Fill the full tensor with gathered data from each rank
                 for i, shard in enumerate(gathered_tensors):
-                    # Calculate shard boundaries
-                    # world_size - 1 to round up
-                    shard_size = (full_seq_len + world_size - 1) // world_size
+                    # Calculate the position of this shard in the full sequence
                     shard_start = i * shard_size
-                    shard_end = min(shard_start + shard_size, full_seq_len)
 
-                    # For the last rank, adjust if needed
-                    if i == world_size - 1 and shard_end == full_seq_len:
-                        shard_end -= 1
+                    # For the last rank, determine valid length (may be truncated)
+                    if i == world_size - 1:
+                        # Calculate end position (adjust for causal modeling)
+                        shard_end = min(shard_start + shard_size, full_seq_len)
 
-                    # If shard is empty, skip
-                    if shard_end <= shard_start:
-                        continue
+                        # Skip if there's no valid data
+                        if shard_end <= shard_start:
+                            continue
 
-                    # Calculate corresponding shifted positions (for causal modeling)
-                    target_start = shard_start
-                    target_len = shard_end - shard_start
+                        # Adjust for causal modeling (last position has no next token)
+                        if shard_end == full_seq_len:
+                            shard_end -= 1
 
-                    # Place this shard's data in the right position
-                    slice_len = min(target_len, shard.shape[1])
-                    full_tensor[:, target_start:target_start + slice_len] = shard[:, :slice_len]
+                        # Calculate valid length for this shard
+                        valid_shard_len = shard_end - shard_start
+
+                        # Copy only valid data (ignore padding)
+                        full_tensor[:, shard_start:shard_end] = shard[:, :valid_shard_len]
+                    else:
+                        # For non-last ranks, copy the full shard (bounded by sequence length)
+                        shard_end = min(shard_start + shard_size, full_seq_len - 1)
+                        valid_shard_len = shard_end - shard_start
+                        full_tensor[:, shard_start:shard_end] = shard[:, :valid_shard_len]
 
                 # Save context for backward
                 ctx.rank = rank
@@ -249,25 +276,30 @@ class Objective:
                 ctx.start_idx = start_idx
                 ctx.end_idx = end_idx
                 ctx.shard_size = end_idx - start_idx
+                ctx.tensor_shape = tensor.shape
 
                 return full_tensor
 
             @staticmethod
             def backward(ctx, grad_output):
                 # Extract saved context
+                rank = ctx.rank
                 start_idx = ctx.start_idx
                 end_idx = ctx.end_idx
+                original_shape = ctx.tensor_shape
 
-                # Extract gradient for this rank's shard
+                # Extract gradient for just this rank's portion
                 grad_for_shard = grad_output[:, start_idx:end_idx].contiguous()
+
+                # Ensure gradient matches the original tensor shape
+                if grad_for_shard.shape[1] != original_shape[1]:
+                    # This can happen for the last rank where we truncated
+                    grad_for_shard = grad_for_shard[:, :original_shape[1]]
 
                 # Return gradient for input tensor, None for other arguments
                 return grad_for_shard, None, None, None, None, None, None
 
-        # Get full sequence length from labels
-        full_seq_len = cp_info['full_seq_len']
-
-        # Apply unsharding to token loss with gradient support
+        # Apply unsharding with gradient support
         unsharded_token_loss = LossParallelUnshard.apply(
             token_loss, cp_rank, cp_world_size, cp_group,
             logit_start, logit_end, full_seq_len

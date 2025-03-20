@@ -57,6 +57,12 @@ def main(job_config: JobConfig):
     # if rank == 1:
     #     print("Hello from rank 1")
     #     pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
+    # if rank == 2:
+    #     print("Hello from rank 1")
+    #     pydevd_pycharm.settrace('localhost', port=6793, stdoutToServer=True, stderrToServer=True)
+    # if rank == 3:
+    #     print("Hello from rank 1")
+    #     pydevd_pycharm.settrace('localhost', port=6794, stdoutToServer=True, stderrToServer=True)
 
     if job_config.experimental.custom_model_path:
         utils.import_module_from_path(job_config.experimental.custom_model_path)
@@ -419,8 +425,8 @@ def main(job_config: JobConfig):
                     cp_no_restore_buffers.add(attention_mask)
 
                 # Append the freqs_cis from each model part
-                cp_buffers.extend([m.freqs_cis for m in model.model_parts])
-                cp_seq_dims.extend([0 for _ in model.model_parts])
+                cp_buffers.extend([m.freqs_cis for m in model_parts])
+                cp_seq_dims.extend([0 for _ in model_parts])
 
                 optional_context_parallel_ctx = utils.create_context_parallel_ctx(
                     cp_mesh=world_mesh["cp"],
