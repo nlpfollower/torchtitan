@@ -691,7 +691,7 @@ def monkey_patch_context_parallel_attention():
     _matrix_ops.scaled_dot_product_efficient_attention_strategy = patched_scaled_dot_product_efficient_attention_strategy
     _matrix_ops.scaled_dot_product_efficient_attention_backward_strategy = patched_scaled_dot_product_efficient_attention_backward_strategy
 
-    logger.info("Successfully monkey-patched context parallelism attention functions with state-based masking")
+    # logger.info("Successfully monkey-patched context parallelism attention functions with state-based masking")
 
     # Return a function to restore the original implementations if needed
     def restore_original():
@@ -710,7 +710,7 @@ def monkey_patch_context_parallel_attention():
         @_matrix_ops.register_op_strategy(aten._scaled_dot_product_efficient_attention_backward.default)
         def _restore_backward_strategy(mesh, op_schema):
             return original_sdpa_backward_strategy(mesh, op_schema)
-        logger.info("Restored original context parallelism attention functions")
+        # logger.info("Restored original context parallelism attention functions")
 
     return restore_original
 

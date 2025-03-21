@@ -414,13 +414,13 @@ def monkey_patch_pipeline_schedule():
     _PipelineSchedule._maybe_compute_loss = patched_maybe_compute_loss
     _PipelineSchedule._compute_loss = patched_compute_loss
 
-    logger.info("Successfully monkey-patched PipelineSchedule loss computation methods")
+    # logger.info("Successfully monkey-patched PipelineSchedule loss computation methods")
 
     # Return a function to restore the original if needed
     def restore_original():
         _PipelineSchedule._maybe_compute_loss = original_maybe_compute_loss
         _PipelineSchedule._compute_loss = original_compute_loss
-        logger.info("Restored original PipelineSchedule methods")
+        # logger.info("Restored original PipelineSchedule methods")
 
     return restore_original
 
@@ -489,11 +489,11 @@ def monkey_patch_pipeline_stage():
 
     # Apply the patch directly to the class - this is the key fix
     _PipelineStageBase.forward_one_chunk = patched_forward_one_chunk
-    logger.info("Successfully monkey-patched _PipelineStageBase.forward_one_chunk")
+    # logger.info("Successfully monkey-patched _PipelineStageBase.forward_one_chunk")
 
     # Return a function to restore the original if needed
     def restore_original():
         _PipelineStageBase.forward_one_chunk = original_forward_one_chunk
-        logger.info("Restored original _PipelineStageBase.forward_one_chunk")
+        # logger.info("Restored original _PipelineStageBase.forward_one_chunk")
 
     return restore_original

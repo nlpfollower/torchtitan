@@ -121,188 +121,227 @@ class Objective:
     @staticmethod
     def _compute_cp_token_loss(logits, labels, cp_info):
         """
-        Computes token-level cross entropy efficiently for context parallel shards.
+        Computes token-level cross entropy efficiently for context parallel shards with round-robin pattern.
 
-        For causal language modeling with CP:
-        - Each token at position i predicts the token at position i+1
-        - The last CP rank must exclude its last logit (no label to predict)
-        - We calculate exact indices to map between sharded logits and full labels
+        In the round-robin pattern:
+        - Each rank r gets two non-contiguous chunks: (r, 2*world_size-1-r)
+        - Each rank's logits tensor already contains these two concatenated chunks
+        - We need to map these logits to the correct label positions for causal modeling
 
         Args:
             logits: Sharded logits [batch_size, shard_seq_len, vocab_size]
             labels: Full unsharded labels [batch_size, full_seq_len]
-            cp_info: Dict containing 'rank' and 'world_size'
+            cp_info: Dict containing 'rank', 'world_size', and 'full_seq_len'
 
         Returns:
-            token_loss: Token-level cross entropy loss [batch_size, shard_seq_len or shard_seq_len-1]
-            token_mask: Boolean mask of valid tokens (not -100) [batch_size, shard_seq_len or shard_seq_len-1]
+            token_loss: Token-level cross entropy loss [batch_size, shard_seq_len]
+            indices: Dict with mapping information for unsharding
         """
         batch_size, shard_seq_len, vocab_size = logits.shape
         cp_rank, cp_world_size = cp_info['rank'], cp_info['world_size']
+        full_seq_len = cp_info['full_seq_len']
 
-        # Calculate sequence partition for this rank
-        full_seq_len = labels.shape[1]
-        shard_size = (full_seq_len + cp_world_size - 1) // cp_world_size  # Ceiling division
+        # Calculate chunk size for the round-robin pattern
+        # Each rank gets 2 chunks, each of size chunk_size
+        chunk_size = full_seq_len // (2 * cp_world_size)
 
-        # Calculate logit positions for this rank
-        logit_start_idx = cp_rank * shard_size
-        logit_end_idx = min(logit_start_idx + shard_size, full_seq_len)
+        # Calculate the positions of this rank's two chunks in the full sequence
+        chunk1_start = cp_rank * chunk_size  # First chunk starts at rank*chunk_size
+        chunk2_start = (2 * cp_world_size - 1 - cp_rank) * chunk_size  # Second chunk position
 
-        # For the last CP rank, we need to exclude the last logit position
-        # since there's no corresponding label to predict
-        if cp_rank == cp_world_size - 1 and logit_end_idx == full_seq_len:
-            logit_end_idx -= 1
+        # For causal modeling, label positions are shifted by +1
+        chunk1_label_start = chunk1_start + 1
+        chunk2_label_start = chunk2_start + 1
 
-        # Calculate the corresponding label positions (shift by +1 for causal modeling)
-        label_start_idx = logit_start_idx + 1
-        label_end_idx = logit_end_idx + 1
+        # In round-robin pattern, rank 0 always gets the last chunk as its second chunk
+        # Split logits into the two chunks they represent
+        first_chunk_size = chunk_size
+        second_chunk_size = chunk_size
 
-        # For the last rank, we need to truncate the logits tensor
-        if cp_rank == cp_world_size - 1:
-            # Only use logits that have corresponding labels
-            usable_seq_len = logit_end_idx - logit_start_idx
-            logits = logits[:, :usable_seq_len].contiguous()
+        # Adjust second chunk size for rank 0 which contains the last position
+        if cp_rank == 0:
+            second_chunk_size -= 1  # Last position has no next token for prediction
 
-        # Extract exactly the labels that correspond to this shard's logits
-        target_labels = labels[:, label_start_idx:label_end_idx].contiguous()
+        # Split the logits into the two chunks
+        logits_chunk1 = logits[:, :first_chunk_size].contiguous()
+        logits_chunk2 = logits[:, first_chunk_size:first_chunk_size + second_chunk_size].contiguous()
 
-        # Compute token-level cross entropy
+        # Extract the corresponding label sections for each chunk
+        labels_chunk1 = labels[:, chunk1_label_start:chunk1_label_start + first_chunk_size].contiguous()
+        labels_chunk2 = labels[:, chunk2_label_start:chunk2_label_start + second_chunk_size].contiguous()
+
+        # Compute token-level cross entropy for each chunk
         loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
-        token_loss = loss_fn(
-            logits.reshape(-1, vocab_size),
-            target_labels.reshape(-1)
+
+        # Process first chunk
+        token_loss_chunk1 = loss_fn(
+            logits_chunk1.reshape(-1, vocab_size),
+            labels_chunk1.reshape(-1)
         ).view(batch_size, -1)
+
+        # Process second chunk
+        token_loss_chunk2 = loss_fn(
+            logits_chunk2.reshape(-1, vocab_size),
+            labels_chunk2.reshape(-1)
+        ).view(batch_size, -1)
+
+        # Concatenate the token losses from both chunks
+        token_loss = torch.cat([token_loss_chunk1, token_loss_chunk2], dim=1)
 
         # Store indices for unsharding
         indices = {
-            'logit_start': logit_start_idx,
-            'logit_end': logit_end_idx,
-            'label_start': label_start_idx,
-            'label_end': label_end_idx
+            'chunk1_start': chunk1_start,
+            'chunk1_end': chunk1_start + first_chunk_size,
+            'chunk2_start': chunk2_start,
+            'chunk2_end': chunk2_start + second_chunk_size,
+            'chunk_size': chunk_size
         }
 
         return token_loss, indices
 
-    @staticmethod
     def _unshard_loss_parallel(token_loss, cp_info, indices):
         """
-        Unshards token-level losses across CP ranks with gradient support.
+        Unshards token-level losses across CP ranks with gradient support for round-robin pattern.
 
         Args:
             token_loss: Sharded token losses [batch_size, shard_seq_len]
             cp_info: Dict with CP info including 'rank', 'world_size', and 'group'
-            indices: Dict with start/end indices for this shard
+            indices: Dict with chunk mapping information
 
         Returns:
             unsharded_token_loss: Full sequence token losses [batch_size, seq_len-1]
         """
         cp_rank, cp_world_size, cp_group = cp_info['rank'], cp_info['world_size'], cp_info['group']
-        logit_start, logit_end = indices['logit_start'], indices['logit_end']
         full_seq_len = cp_info['full_seq_len']
+        chunk_size = indices['chunk_size']
 
         # Create custom autograd function for token loss unsharding with gradient support
-        class LossParallelUnshard(torch.autograd.Function):
+        class RoundRobinLossUnshard(torch.autograd.Function):
             @staticmethod
-            def forward(ctx, tensor, rank, world_size, group, start_idx, end_idx, full_seq_len):
-                # Calculate the expected shard size that is consistent across all ranks
-                shard_size = (full_seq_len + world_size - 1) // world_size
+            def forward(ctx, tensor, rank, world_size, group, indices, full_seq_len):
+                # Extract indices
+                chunk1_start = indices['chunk1_start']
+                chunk1_end = indices['chunk1_end']
+                chunk2_start = indices['chunk2_start']
+                chunk2_end = indices['chunk2_end']
+                chunk_size = indices['chunk_size']
 
                 # Get the actual shape of the input tensor
                 batch_size, actual_shard_len = tensor.shape
 
-                # Prepare tensor for all_gather - ensure consistent shapes across ranks
-                gather_tensor = tensor
+                # Split the token loss into its two constituent chunks
+                first_chunk_size = chunk1_end - chunk1_start
+                second_chunk_size = chunk2_end - chunk2_start
 
-                # If this is the last rank and needs padding (due to -1 for causal prediction)
-                if rank == world_size - 1 and actual_shard_len < shard_size:
-                    # Create padded tensor with the same size as other ranks
-                    padded_tensor = torch.zeros(
-                        (batch_size, shard_size),
-                        device=tensor.device,
-                        dtype=tensor.dtype
-                    )
+                loss_chunk1 = tensor[:, :first_chunk_size].contiguous()
+                loss_chunk2 = tensor[:, first_chunk_size:].contiguous()
 
-                    # Copy actual data into padded tensor
-                    padded_tensor[:, :actual_shard_len] = tensor
-                    gather_tensor = padded_tensor
-
-                # Ensure tensor is contiguous for all_gather
-                gather_tensor = gather_tensor.contiguous()
-
-                # Gather sharded tensors from all ranks
-                gathered_tensors = [torch.zeros_like(gather_tensor) for _ in range(world_size)]
-                torch.distributed.all_gather(gathered_tensors, gather_tensor, group=group)
-
-                # Create empty tensor for full sequence result
-                full_tensor = torch.zeros(
-                    (batch_size, full_seq_len - 1),  # -1 for causal prediction
+                # Pad both chunks to ensure consistent sizes across ranks
+                padded_chunk1 = torch.zeros(
+                    (batch_size, chunk_size),
+                    device=tensor.device,
+                    dtype=tensor.dtype
+                )
+                padded_chunk2 = torch.zeros(
+                    (batch_size, chunk_size),
                     device=tensor.device,
                     dtype=tensor.dtype
                 )
 
-                # Fill the full tensor with gathered data from each rank
-                for i, shard in enumerate(gathered_tensors):
-                    # Calculate the position of this shard in the full sequence
-                    shard_start = i * shard_size
+                padded_chunk1[:, :first_chunk_size] = loss_chunk1
+                padded_chunk2[:, :second_chunk_size] = loss_chunk2
 
-                    # For the last rank, determine valid length (may be truncated)
-                    if i == world_size - 1:
-                        # Calculate end position (adjust for causal modeling)
-                        shard_end = min(shard_start + shard_size, full_seq_len)
+                # Concatenate the padded chunks for all_gather
+                gather_tensor = torch.cat([padded_chunk1, padded_chunk2], dim=1).contiguous()
 
-                        # Skip if there's no valid data
-                        if shard_end <= shard_start:
-                            continue
+                # Gather sharded tensors from all ranks
+                gathered_size = gather_tensor.size()
+                gathered_list = [torch.zeros_like(gather_tensor) for _ in range(world_size)]
+                torch.distributed.all_gather(gathered_list, gather_tensor, group=group)
 
-                        # Adjust for causal modeling (last position has no next token)
-                        if shard_end == full_seq_len:
-                            shard_end -= 1
+                # Create empty tensor for full sequence result (minus 1 for causal prediction)
+                full_token_loss = torch.zeros(
+                    (batch_size, full_seq_len - 1),
+                    device=tensor.device,
+                    dtype=tensor.dtype
+                )
 
-                        # Calculate valid length for this shard
-                        valid_shard_len = shard_end - shard_start
+                # Extract and place all chunks correctly
+                for i, gathered_tensor in enumerate(gathered_list):
+                    # Split the gathered tensor back into its two chunks
+                    g_chunk1 = gathered_tensor[:, :chunk_size]
+                    g_chunk2 = gathered_tensor[:, chunk_size:]
 
-                        # Copy only valid data (ignore padding)
-                        full_tensor[:, shard_start:shard_end] = shard[:, :valid_shard_len]
-                    else:
-                        # For non-last ranks, copy the full shard (bounded by sequence length)
-                        shard_end = min(shard_start + shard_size, full_seq_len - 1)
-                        valid_shard_len = shard_end - shard_start
-                        full_tensor[:, shard_start:shard_end] = shard[:, :valid_shard_len]
+                    # Calculate positions for this rank's chunks
+                    rank_chunk1_start = i * chunk_size
+                    rank_chunk1_end = rank_chunk1_start + chunk_size
+
+                    rank_chunk2_start = (2 * world_size - 1 - i) * chunk_size
+                    rank_chunk2_end = rank_chunk2_start + chunk_size
+
+                    # Special case: last position in sequence has no next token to predict
+                    # In round-robin, only rank 0's second chunk can contain the last position
+                    if i == 0 and rank_chunk2_end == full_seq_len:
+                        rank_chunk2_end = full_seq_len - 1
+
+                    # Copy valid parts of each chunk to the full tensor
+                    if rank_chunk1_end > rank_chunk1_start:
+                        valid_size = rank_chunk1_end - rank_chunk1_start
+                        full_token_loss[:, rank_chunk1_start:rank_chunk1_end] = g_chunk1[:, :valid_size]
+
+                    if rank_chunk2_end > rank_chunk2_start:
+                        valid_size = rank_chunk2_end - rank_chunk2_start
+                        full_token_loss[:, rank_chunk2_start:rank_chunk2_end] = g_chunk2[:, :valid_size]
 
                 # Save context for backward
                 ctx.rank = rank
-                ctx.world_size = world_size
-                ctx.group = group
-                ctx.start_idx = start_idx
-                ctx.end_idx = end_idx
-                ctx.shard_size = end_idx - start_idx
+                ctx.chunk1_start = chunk1_start
+                ctx.chunk1_end = chunk1_end
+                ctx.chunk2_start = chunk2_start
+                ctx.chunk2_end = chunk2_end
                 ctx.tensor_shape = tensor.shape
 
-                return full_tensor
+                return full_token_loss
 
             @staticmethod
             def backward(ctx, grad_output):
                 # Extract saved context
                 rank = ctx.rank
-                start_idx = ctx.start_idx
-                end_idx = ctx.end_idx
+                chunk1_start = ctx.chunk1_start
+                chunk1_end = ctx.chunk1_end
+                chunk2_start = ctx.chunk2_start
+                chunk2_end = ctx.chunk2_end
                 original_shape = ctx.tensor_shape
 
-                # Extract gradient for just this rank's portion
-                grad_for_shard = grad_output[:, start_idx:end_idx].contiguous()
+                # Extract gradient for this rank's chunks
+                grad_chunk1 = grad_output[:, chunk1_start:chunk1_end].contiguous()
+                grad_chunk2 = grad_output[:, chunk2_start:chunk2_end].contiguous()
+
+                # Concatenate the two chunk gradients
+                grad_for_shard = torch.cat([grad_chunk1, grad_chunk2], dim=1)
 
                 # Ensure gradient matches the original tensor shape
                 if grad_for_shard.shape[1] != original_shape[1]:
-                    # This can happen for the last rank where we truncated
-                    grad_for_shard = grad_for_shard[:, :original_shape[1]]
+                    # Pad or truncate to match original shape
+                    if grad_for_shard.shape[1] < original_shape[1]:
+                        # Pad
+                        padded_grad = torch.zeros(
+                            original_shape,
+                            device=grad_for_shard.device,
+                            dtype=grad_for_shard.dtype
+                        )
+                        padded_grad[:, :grad_for_shard.shape[1]] = grad_for_shard
+                        grad_for_shard = padded_grad
+                    else:
+                        # Truncate
+                        grad_for_shard = grad_for_shard[:, :original_shape[1]]
 
                 # Return gradient for input tensor, None for other arguments
-                return grad_for_shard, None, None, None, None, None, None
+                return grad_for_shard, None, None, None, None, None
 
         # Apply unsharding with gradient support
-        unsharded_token_loss = LossParallelUnshard.apply(
-            token_loss, cp_rank, cp_world_size, cp_group,
-            logit_start, logit_end, full_seq_len
+        unsharded_token_loss = RoundRobinLossUnshard.apply(
+            token_loss, cp_rank, cp_world_size, cp_group, indices, full_seq_len
         )
 
         return unsharded_token_loss

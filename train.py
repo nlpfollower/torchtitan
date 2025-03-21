@@ -676,16 +676,25 @@ def evaluate(eval_components, job_config, current_step, metric_logger, stages_in
         pp_mesh = world_mesh["pp"]
         pp_size = pp_mesh.size()
 
+    # Set model to evaluation mode
     for model in model_parts:
         model.eval()
+
+    # Get train context for consistent behavior between training and evaluation
+    train_context = utils.get_train_context(
+        parallel_dims.loss_parallel_enabled,
+        job_config.experimental.enable_compiled_autograd,
+    )
 
     eval_losses = []
     eval_perplexities = []
 
     if hasattr(eval_data_loader, 'reset'):
         eval_data_loader.reset()
+
     eval_iterator = iter(eval_data_loader)
     is_eval_exhausted = torch.zeros(world_size, dtype=torch.bool, device=device_type)
+
     with PipelineEphemeralContext(stages) if parallel_dims.pp_enabled and stages else contextlib.nullcontext():
         with torch.no_grad():
             for _ in range(job_config.evaluation.num_samples):
@@ -698,7 +707,7 @@ def evaluate(eval_components, job_config, current_step, metric_logger, stages_in
                         logger.info(f"Rank {rank}: Evaluation data exhausted. Ending evaluation.")
                         break
                 except StopIteration:
-                    logger.warning("Evaluation data exhausted before reaching num_samples. Restarting iterator.")
+                    logger.warning("Evaluation data exhausted before reaching num_samples. Ending evaluation.")
                     break
 
                 # Extract batch data
@@ -718,46 +727,93 @@ def evaluate(eval_components, job_config, current_step, metric_logger, stages_in
                 if isinstance(eval_batch, dict) and 'document_ids' in eval_batch:
                     document_ids = eval_batch['document_ids'].to(device_type)
 
-                # Get reference model logits if enabled - same for both PP and non-PP paths
+                # Set state tensors (important for both PP and non-PP paths)
+                state.set_state_tensors(
+                    document_ids=document_ids,
+                    attention_mask=attention_mask,
+                    batch_size=job_config.evaluation.batch_size,
+                    n_microbatches=job_config.experimental.pipeline_parallel_microbatches
+                )
+
+                # Set up context parallel if enabled
+                if parallel_dims.cp_enabled:
+                    cp_mesh = world_mesh["cp"]
+
+                    # Initialize buffers, sequence dimensions, and no-restore buffers
+                    cp_buffers = [input_ids]
+                    cp_seq_dims = [1]
+                    cp_no_restore_buffers = {input_ids}
+
+                    # Only add attention_mask if it is not None
+                    if attention_mask is not None:
+                        cp_buffers.append(attention_mask)
+                        cp_seq_dims.append(2)
+                        cp_no_restore_buffers.add(attention_mask)
+
+                    # Append the freqs_cis from each model part
+                    cp_buffers.extend([m.freqs_cis for m in model_parts])
+                    cp_seq_dims.extend([0 for _ in model_parts])
+
+                    optional_context_parallel_ctx = utils.create_context_parallel_ctx(
+                        cp_mesh=cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=cp_seq_dims,
+                        cp_no_restore_buffers=cp_no_restore_buffers,
+                        cp_rotate_method=job_config.experimental.context_parallel_rotate_method,
+                    )
+                else:
+                    optional_context_parallel_ctx = None
+
+                # Get reference model logits if enabled
                 reference_logits = None
                 if job_config.reference_model.enabled and reference_model is not None:
-                    reference_logits = reference_model(input_ids, attention_mask)
+                    with torch.no_grad():
+                        reference_logits = reference_model(input_ids, attention_mask)
+                        # Set reference logits in state for context parallel
+                        if parallel_dims.cp_enabled:
+                            state.set_state_tensors(reference_logits=reference_logits)
 
                 # Handle pipeline parallel and standard forward paths
-                if parallel_dims.pp_enabled and stages:
-                    # Use the unified pipeline_forward implementation
-                    output, has_last_stage = pipeline_forward(
-                        stages=stages,
-                        pp_size=pp_size,
-                        inputs=input_ids,
-                        mask=attention_mask,
-                        stages_initialized=stages_initialized,
-                    )
+                with train_context(optional_context_parallel_ctx):
+                    if parallel_dims.pp_enabled and stages:
+                        # Use the unified pipeline_forward implementation
+                        output, has_last_stage = pipeline_forward(
+                            stages=stages,
+                            pp_size=pp_size,
+                            inputs=input_ids,
+                            mask=attention_mask,
+                            stages_initialized=stages_initialized,
+                        )
 
-                    # Initialize loss with zeros
-                    loss = torch.zeros(1, dtype=torch.float32, device=device_type)
+                        # Initialize loss with zeros
+                        loss = torch.zeros(1, dtype=torch.float32, device=device_type)
 
-                    # Compute loss only if we have the last stage
-                    if has_last_stage and output is not None:
-                        loss = loss_fn(output, labels, reference_logits, document_ids)
-                else:
-                    # Standard non-pipeline forward pass
-                    logits = model_parts[0](input_ids, mask=attention_mask)
+                        # Compute loss only if we have the last stage
+                        if has_last_stage and output is not None:
+                            loss = loss_fn(output, labels, reference_logits, document_ids)
+                    else:
+                        # Standard non-pipeline forward pass
+                        logits = model_parts[0](input_ids, mask=attention_mask)
 
-                    # Apply the appropriate loss function depending on reference model configuration
-                    loss = loss_fn(logits, labels, reference_logits, document_ids)
+                        # Apply the loss function
+                        loss = loss_fn(logits, labels, reference_logits, document_ids)
 
+                # Calculate perplexity from loss
                 perplexity = torch.exp(loss)
-                if parallel_dims.dp_enabled:
-                    loss, perplexity = (
-                        utils.dist_mean(loss, world_mesh["dp_cp"]),
-                        utils.dist_mean(perplexity, world_mesh["dp_cp"]),
-                    )
-                else:
-                    loss, perplexity = loss.item(), perplexity.item()
-                eval_losses.append(loss)
-                eval_perplexities.append(perplexity)
 
+                # Aggregate metrics across data parallel ranks
+                if parallel_dims.dp_enabled or parallel_dims.cp_enabled:
+                    # Use the combined dp_cp mesh for reduction
+                    loss_val = utils.dist_mean(loss.detach(), world_mesh["dp_cp"])
+                    perplexity_val = utils.dist_mean(perplexity.detach(), world_mesh["dp_cp"])
+                else:
+                    loss_val = loss.item()
+                    perplexity_val = perplexity.item()
+
+                eval_losses.append(loss_val)
+                eval_perplexities.append(perplexity_val)
+
+    # Calculate average metrics
     avg_loss, avg_perplexity = 0, 0
     if len(eval_losses) > 0:
         avg_loss = sum(eval_losses) / len(eval_losses)
@@ -765,12 +821,15 @@ def evaluate(eval_components, job_config, current_step, metric_logger, stages_in
 
     logger.info(f"Evaluation at step {current_step}: Loss: {avg_loss:.4f}, Perplexity: {avg_perplexity:.4f}")
 
+    # Log metrics
     metrics = {
         "eval/loss": avg_loss,
         "eval/perplexity": avg_perplexity,
+        "eval/num_samples": len(eval_losses),
     }
     metric_logger.log(metrics, step=current_step)
 
+    # Set model back to training mode
     for model in model_parts:
         model.train()
 
