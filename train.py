@@ -33,7 +33,7 @@ from torchtitan.model_converter import build_model_converters
 from torchtitan.parallelisms import ParallelDims
 from torchtitan.parallelisms.context import shard_attention_mask
 from torchtitan.parallelisms.pipeline import pipeline_forward, \
-    monkey_patch_pipeline_stage, monkey_patch_pipeline_schedule, PipelineEphemeralContext
+    monkey_patch_pipeline_schedule, PipelineEphemeralContext
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from torchtitan import state
 
@@ -46,7 +46,6 @@ def main(job_config: JobConfig):
 
     # Apply the pipeline schedule and stage monkey patches before any pipeline initialization
     restore_fn_pipeline_schedule = monkey_patch_pipeline_schedule()
-    restore_fn_pipeline_stage = monkey_patch_pipeline_stage()
 
     local_rank = int(os.environ.get("LOCAL_RANK"))
     rank = int(os.environ.get("RANK"))

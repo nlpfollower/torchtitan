@@ -13,7 +13,7 @@ N_MICROBATCHES = None
 
 # Context Parallel information
 CP_RANK = None
-CP_WORLD_SIZE = None
+CP_WORLD_SIZE = 0
 CP_GROUP = None
 CP_MESH = None
 

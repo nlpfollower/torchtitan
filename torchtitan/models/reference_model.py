@@ -7,12 +7,13 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from torchdata.nodes import Stateful
 
+from torchtitan import state
 from torchtitan.models import model_name_to_cls, models_config
 from torchtitan.models.llama import pipeline_llama, parallelize_llama
 from torchtitan.parallelisms import ParallelDims
 from torchtitan.checkpoint import CheckpointManager, ModelWrapper
 from torchtitan.parallelisms.pipeline import pipeline_forward
-from torchtitan.utils import get_device_info, set_determinism
+from torchtitan.utils import get_device_info, set_determinism, create_context_parallel_ctx
 from scripts.generate._generation import generate, generate_next_token
 import torch.nn as nn
 import torch.distributed as dist
@@ -26,6 +27,14 @@ class ReferenceModel(nn.Module):
         self.stages = stages
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.cp_enabled = "cp" in device_mesh
+
+        # Store CP-specific information if enabled
+        if self.cp_enabled:
+            self.cp_mesh = device_mesh["cp"]
+            self.cp_rotate_method = None  # Will be set during forward calls
+        else:
+            self.cp_mesh = None
 
         # Get pipeline order if applicable
         if stages and len(stages) > 0:
@@ -34,15 +43,52 @@ class ReferenceModel(nn.Module):
             # Map stage indices to actual stage objects for this rank
             self.stage_map = {stage.stage_index: stage for stage in stages}
             self.has_last_stage = any(stage.is_last for stage in stages)
+        else:
+            self.has_last_stage = True
+
         self._stages_initialized = False
 
     def forward(self, x, mask=None):
-        if self.stages:
-            return self._pipeline_forward(x, mask)
+        # Setup context parallel context if CP is enabled
+        if self.cp_enabled:
+            cp_ctx = self._create_cp_context(x, mask)
         else:
-            for part in self.model_parts:
-                x = part(x, mask=mask)
-            return x
+            cp_ctx = None
+
+        # Use the CP context for forward pass
+        with cp_ctx:
+            if self.stages:
+                return self._pipeline_forward(x, mask)
+            else:
+                for part in self.model_parts:
+                    x = part(x, mask=mask)
+                return x
+
+    def _create_cp_context(self, input_ids, attention_mask=None):
+        """Create context parallel context for reference model forward pass."""
+        # Initialize buffers, sequence dimensions, and no-restore buffers
+        cp_buffers = [input_ids]
+        cp_seq_dims = [1]
+        cp_no_restore_buffers = {input_ids}
+
+        # Only add attention_mask if it is not None
+        if attention_mask is not None:
+            cp_buffers.append(attention_mask)
+            cp_seq_dims.append(2)
+            cp_no_restore_buffers.add(attention_mask)
+
+        # Append the freqs_cis from each model part
+        cp_buffers.extend([m.freqs_cis for m in self.model_parts])
+        cp_seq_dims.extend([0 for _ in self.model_parts])
+
+        # Create CP context - use the same rotation method as the main model
+        return create_context_parallel_ctx(
+            cp_mesh=self.cp_mesh,
+            cp_buffers=cp_buffers,
+            cp_seq_dims=cp_seq_dims,
+            cp_no_restore_buffers=cp_no_restore_buffers,
+            cp_rotate_method=self.cp_rotate_method,
+        )
 
     def _pipeline_forward(self, x, mask=None):
         """Execute forward pass through pipeline stages in correct sequence."""
@@ -56,6 +102,10 @@ class ReferenceModel(nn.Module):
         self._stages_initialized = True
         return output if has_last_stage else None
 
+    def set_cp_rotate_method(self, method):
+        """Set the CP rotation method to ensure consistency with main model."""
+        self.cp_rotate_method = method
+
     def generate(self, input_ids, max_new_tokens, temperature=1.0, top_k=None, seed=None):
         return generate(self, input_ids, max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k, seed=seed)
 
@@ -65,6 +115,9 @@ class ReferenceModel(nn.Module):
 def build_reference_model(job_config, tokenizer):
     device_type, _ = get_device_info()
     device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+
+    # Check if context parallel is enabled
+    cp_enabled = job_config.experimental.context_parallel_degree > 1
 
     # Create a separate parallel dimension for the reference model
     world_size = (job_config.reference_model.data_parallel_shard_degree *
@@ -133,9 +186,14 @@ def build_reference_model(job_config, tokenizer):
     )
     checkpoint.load(step=0, checkpoint_path=job_config.reference_model.checkpoint_path)
 
+    # Setup CP info in state if enabled
+    # Note: don't setup cp state info, since it's shared across training and reference models
+
     pp_rank = pp_mesh.get_local_rank() if pp_mesh else None
     pp_size = pp_mesh.size() if pp_mesh else None
-    return ReferenceModel(
+
+    # Create the reference model with CP flag
+    ref_model = ReferenceModel(
         model_config,
         reference_model_parts,
         reference_mesh,
@@ -143,6 +201,12 @@ def build_reference_model(job_config, tokenizer):
         pp_rank=pp_rank,
         pp_size=pp_size
     )
+
+    # Set the CP rotation method if CP is enabled
+    if cp_enabled:
+        ref_model.set_cp_rotate_method(job_config.experimental.context_parallel_rotate_method)
+
+    return ref_model
 
 class MinimalOptimizersContainer(Stateful):
     def __init__(self, model):
