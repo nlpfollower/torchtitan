@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 from typing import Optional, Any
 
 import torch
@@ -27,7 +28,7 @@ class ReferenceModel(nn.Module):
         self.stages = stages
         self.pp_rank = pp_rank
         self.pp_size = pp_size
-        self.cp_enabled = "cp" in device_mesh
+        self.cp_enabled = "cp" in device_mesh.mesh_dim_names if device_mesh.mesh_dim_names is not None else False
 
         # Store CP-specific information if enabled
         if self.cp_enabled:
@@ -50,10 +51,7 @@ class ReferenceModel(nn.Module):
 
     def forward(self, x, mask=None):
         # Setup context parallel context if CP is enabled
-        if self.cp_enabled:
-            cp_ctx = self._create_cp_context(x, mask)
-        else:
-            cp_ctx = None
+        cp_ctx = self._create_cp_context(x, mask) if self.cp_enabled else nullcontext()
 
         # Use the CP context for forward pass
         with cp_ctx:
