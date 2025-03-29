@@ -36,7 +36,7 @@ class ParallelFileSystemReader(StorageReader):
             self,
             path: Union[str, os.PathLike],
             _extension_registry: Optional[ExtensionRegistry] = None,
-            num_threads: int = 0,  # 0 means use default (all available cores)
+            num_threads: int = 0,  # 0 means use system default thread count
             batch_size: int = 32,  # Process this many requests in a batch
     ) -> None:
         super().__init__()
@@ -45,12 +45,20 @@ class ParallelFileSystemReader(StorageReader):
         self.storage_data: Dict[MetadataIndex, _StorageInfo] = {}
         self.load_id = _generate_uuid()
         self.transforms = _StorageReaderTransforms(_extension_registry)
+
+        # Use CPU count if num_threads is not specified
+        if num_threads <= 0:
+            import multiprocessing
+            num_threads = multiprocessing.cpu_count()
+
         self.num_threads = num_threads
         self.batch_size = batch_size
 
         # Ensure FAST_LOADER_AVAILABLE is True
         if not FAST_LOADER_AVAILABLE:
             raise RuntimeError("fast_tensor_loader is required but not available")
+
+        logger.info(f"Initialized parallel file reader with {self.num_threads} threads")
 
     def _slice_file(self, file, sinfo: _StorageInfo) -> IO[bytes]:
         return cast(IO[bytes], _create_file_view(file, sinfo.offset, sinfo.length))

@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.logging import init_logger, logger
 from torchtitan.models.file_reader import ParallelFileSystemReader
+from torchtitan.models.multi_file_reader import create_optimized_reader
 from torchtitan.optimizer import LRSchedulersContainer, OptimizersContainer
 from torchtitan.utils import GarbageCollection
 
@@ -464,7 +465,7 @@ class CheckpointManager:
         dcp.load(
             states_to_load,
             checkpoint_id=checkpoint_id,
-            storage_reader=ParallelFileSystemReader(checkpoint_id),
+            storage_reader=create_optimized_reader(checkpoint_id),
         )
         states.update(states_to_load)
         logger.info(
