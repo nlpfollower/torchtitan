@@ -1,4 +1,6 @@
-// fast_tensor_loader.cpp with native C++ file reading
+// fast_tensor_loader.cpp
+// Optimized tensor loader that uses shared memory for fast access
+
 #include <torch/extension.h>
 #include <iostream>
 #include <vector>
@@ -6,128 +8,187 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
-#include <fstream>
 #include <memory>
 #include <string>
-#include <unistd.h> // For getpid()
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+// Global constants
+#define SHM_META_KEY_BASE 9000  // Base key for metadata segments
+#define SHM_DATA_KEY_BASE 10000 // Base key for data segments
 
 // Mutex for thread-safe console output
 std::mutex cout_mutex;
 
-// Function for logging with thread safety
-void safe_log(const std::string& message) {
-    std::lock_guard<std::mutex> lock(cout_mutex);
-    std::cout << message << std::endl;
+// Log levels
+enum LogLevel {
+    DEBUG,
+    INFO,
+    WARNING,
+    ERROR
+};
+
+// Current log level (can be changed at runtime)
+LogLevel current_log_level = INFO;
+
+// Function for logging with thread safety and log levels
+void log(LogLevel level, const std::string& message) {
+    if (level >= current_log_level) {
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        const char* level_str = "";
+        switch (level) {
+            case DEBUG:   level_str = "DEBUG"; break;
+            case INFO:    level_str = "INFO"; break;
+            case WARNING: level_str = "WARNING"; break;
+            case ERROR:   level_str = "ERROR"; break;
+        }
+
+        auto now = std::chrono::system_clock::now();
+        auto now_c = std::chrono::system_clock::to_time_t(now);
+        char time_buf[20];
+        std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&now_c));
+
+        std::cout << "[" << time_buf << "][" << level_str << "] " << message << std::endl;
+    }
 }
 
-// C++ implementation of the Python _ReaderView
-class FileView {
+// Structure to store file metadata in shared memory
+struct FileMetadata {
+    size_t file_size;
+    uint32_t checksum;
+    char filepath[256];  // Fixed-size buffer for filepath
+};
+
+// Generate a unique key for a filepath, using only the basename
+int generate_file_key(const std::string& filepath, int base_key) {
+    // Extract substring after the last forward slash, if present
+    size_t pos = filepath.rfind('/');
+    std::string basename = (pos == std::string::npos) ? filepath : filepath.substr(pos + 1);
+
+    // Simple hash function to get a number from the basename
+    uint32_t hash = 0;
+    for (char c : basename) {
+        hash = hash * 31 + c;
+    }
+    return base_key + (hash % 1000); // Keep keys within a reasonable range
+}
+
+// Class for accessing data from shared memory
+class SharedMemoryAccess {
 private:
     std::string filepath;
-    int64_t offset;
-    int64_t length;
+    int meta_shmid;
+    int data_shmid;
+    FileMetadata* metadata;
+    void* data;
+    bool is_attached;
 
 public:
-    FileView(const std::string& path, int64_t off, int64_t len)
-        : filepath(path), offset(off), length(len) {}
+    SharedMemoryAccess(const std::string& path)
+        : filepath(path), meta_shmid(-1), data_shmid(-1),
+          metadata(nullptr), data(nullptr), is_attached(false)
+    {
+        // Generate keys based on filepath
+        int meta_key = generate_file_key(filepath, SHM_META_KEY_BASE);
+        int data_key = generate_file_key(filepath, SHM_DATA_KEY_BASE);
 
-    // Read the entire content into a string
-    std::string read_all() const {
-        try {
-            // Open the file in binary mode
-            std::ifstream file(filepath, std::ios::binary);
-            if (!file) {
-                throw std::runtime_error("Failed to open file: " + filepath);
-            }
-
-            // Seek to the offset
-            file.seekg(offset);
-            if (!file) {
-                throw std::runtime_error("Failed to seek to offset " + std::to_string(offset));
-            }
-
-            // Allocate buffer for the data
-            std::string buffer(length, '\0');
-
-            // Read the data
-            file.read(&buffer[0], length);
-            if (file.fail() && !file.eof()) {
-                throw std::runtime_error("Failed to read data");
-            }
-
-            // Resize the buffer to the actual number of bytes read
-            buffer.resize(file.gcount());
-
-            return buffer;
-        } catch (const std::exception& e) {
-            std::lock_guard<std::mutex> lock(cout_mutex);
-            std::cout << "Error reading file: " << e.what() << std::endl;
-            return "";
+        // Access metadata shared memory
+        meta_shmid = shmget(meta_key, sizeof(FileMetadata), 0666);
+        if (meta_shmid == -1) {
+            throw std::runtime_error("Failed to find metadata shared memory for " + filepath +
+                                     " (key=" + std::to_string(meta_key) +
+                                     "). Is model_mapper running?");
         }
+
+        // Attach to metadata
+        metadata = (FileMetadata*)shmat(meta_shmid, NULL, 0);
+        if (metadata == (void*)-1) {
+            throw std::runtime_error("Failed to attach to metadata shared memory for " + filepath);
+        }
+
+        // Check if the filepath in metadata matches our request
+        if (std::string(metadata->filepath) != filepath) {
+            shmdt(metadata);
+            throw std::runtime_error("Filepath mismatch in shared memory metadata. Expected: " +
+                                     filepath + ", Got: " + metadata->filepath);
+        }
+
+        // Access data shared memory
+        data_shmid = shmget(data_key, metadata->file_size, 0666);
+        if (data_shmid == -1) {
+            shmdt(metadata);
+            throw std::runtime_error("Failed to find data shared memory for " + filepath +
+                                     " (key=" + std::to_string(data_key) + ")");
+        }
+
+        // Attach to data
+        data = shmat(data_shmid, NULL, 0);
+        if (data == (void*)-1) {
+            shmdt(metadata);
+            throw std::runtime_error("Failed to attach to data shared memory for " + filepath);
+        }
+
+        is_attached = true;
+        log(DEBUG, "Successfully attached to shared memory for " + filepath);
+    }
+
+    ~SharedMemoryAccess() {
+        if (is_attached) {
+            if (data != nullptr) {
+                shmdt(data);
+            }
+            if (metadata != nullptr) {
+                shmdt(metadata);
+            }
+        }
+    }
+
+    // Get a slice of data from the shared memory
+    std::string get_data_slice(size_t offset, size_t length) const {
+        if (!is_attached) {
+            throw std::runtime_error("Not attached to shared memory");
+        }
+
+        // Log the access attempt
+        log(DEBUG, "Accessing shared memory with offset=" + std::to_string(offset) +
+                  " length=" + std::to_string(length) +
+                  " for file=" + filepath);
+
+        // Verify bounds
+        if (offset + length > metadata->file_size) {
+            throw std::runtime_error("Requested region exceeds file size");
+        }
+
+        // Create a string from the data slice
+        char* data_ptr = static_cast<char*>(data) + offset;
+        return std::string(data_ptr, length);
+    }
+
+    // Get file size from metadata
+    size_t get_file_size() const {
+        if (!is_attached || metadata == nullptr) {
+            throw std::runtime_error("Not attached to shared memory");
+        }
+        return metadata->file_size;
+    }
+
+    // Check if we're successfully attached
+    bool is_valid() const {
+        return is_attached && metadata != nullptr && data != nullptr;
     }
 };
 
-// Extract file information from Python fileobj
-bool extract_file_info(py::object fileobj, std::string& filepath, int64_t& offset, int64_t& length) {
-    py::gil_scoped_acquire gil;  // Acquire GIL for Python operations
-
-    try {
-        // Check if it's a _ReaderView
-        if (py::hasattr(fileobj, "offset") && py::hasattr(fileobj, "len") && py::hasattr(fileobj, "base_stream")) {
-            offset = fileobj.attr("offset").cast<int64_t>();
-            length = fileobj.attr("len").cast<int64_t>();
-
-            // Get the base_stream for the file path
-            py::object base_stream = fileobj.attr("base_stream");
-
-            // Try to get name attribute (common for file objects)
-            if (py::hasattr(base_stream, "name")) {
-                filepath = base_stream.attr("name").cast<std::string>();
-                return true;
-            }
-        }
-
-        // Standard file objects
-        if (py::hasattr(fileobj, "name")) {
-            filepath = fileobj.attr("name").cast<std::string>();
-
-            // Get current position
-            int64_t current_pos = 0;
-            if (py::hasattr(fileobj, "tell")) {
-                current_pos = fileobj.attr("tell")().cast<int64_t>();
-            }
-
-            // Reset to beginning
-            if (py::hasattr(fileobj, "seek")) {
-                fileobj.attr("seek")(0, 0);  // Seek to beginning
-            }
-
-            // Get file size
-            fileobj.attr("seek")(0, 2);  // Seek to end
-            length = fileobj.attr("tell")().cast<int64_t>();  // Get file size
-
-            // Reset position
-            fileobj.attr("seek")(current_pos, 0);  // Restore position
-
-            offset = 0;  // Default offset is 0 for regular files
-            return true;
-        }
-
-        // If we get here, we couldn't extract the file info
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "Could not extract file info from Python object" << std::endl;
-        return false;
-    } catch (const std::exception& e) {
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "Error extracting file info: " << e.what() << std::endl;
-        return false;
-    }
-}
-
-// Original function for loading from memory buffer
-torch::Tensor fast_load_tensor_from_memory(const std::string& data,
-                                           const std::vector<int64_t>& offsets,
-                                           const std::vector<int64_t>& lengths) {
+// Function for loading tensor from memory buffer
+torch::Tensor load_tensor_from_memory(
+    const std::string& data,
+    const std::vector<int64_t>& offsets,
+    const std::vector<int64_t>& lengths
+) {
     try {
         // Convert string data to vector<char> as required by pickle_load
         std::vector<char> data_vec(data.begin(), data.end());
@@ -137,7 +198,7 @@ torch::Tensor fast_load_tensor_from_memory(const std::string& data,
 
         // Try to convert to tensor
         if (!ivalue.isTensor()) {
-            safe_log("Loaded data is not a tensor");
+            log(ERROR, "Loaded data is not a tensor");
             return torch::Tensor();
         }
 
@@ -152,18 +213,16 @@ torch::Tensor fast_load_tensor_from_memory(const std::string& data,
 
         return tensor;
     } catch (const c10::Error& e) {
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "Error in tensor deserialization: " << e.what() << std::endl;
+        log(ERROR, "Error in tensor deserialization: " + std::string(e.what()));
         return torch::Tensor(); // Return empty tensor
     } catch (const std::exception& e) {
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "Exception in fast_load_tensor_from_memory: " << e.what() << std::endl;
+        log(ERROR, "Exception in load_tensor_from_memory: " + std::string(e.what()));
         return torch::Tensor(); // Return empty tensor
     }
 }
 
-// Structure to hold file information
-struct FileInfo {
+// Structure to hold file information passed from Python
+struct FileDataRequest {
     std::string filepath;
     int64_t offset;
     int64_t length;
@@ -172,66 +231,32 @@ struct FileInfo {
     std::vector<int64_t> tensor_lengths;
 };
 
-// Parallel processing function
-std::vector<torch::Tensor> fast_load_tensors_parallel(
-    const std::vector<py::object>& fileobjs,
-    const std::vector<std::vector<int64_t>>& offsets_list,
-    const std::vector<std::vector<int64_t>>& lengths_list,
-    int num_threads = -1) {
-
+// Parallel processing function using shared memory
+std::vector<torch::Tensor> load_tensors_parallel(
+    const std::vector<FileDataRequest>& file_requests,
+    int num_threads = -1
+) {
     // Determine thread count
     if (num_threads <= 0) {
         num_threads = std::thread::hardware_concurrency();
     }
     num_threads = std::max(1, num_threads);
 
-    size_t batch_size = fileobjs.size();
-    safe_log("Processing " + std::to_string(batch_size) + " tensors with " +
-             std::to_string(num_threads) + " threads (PID: " +
-             std::to_string(getpid()) + ")");
+    size_t request_count = file_requests.size();
+    log(INFO, "Processing " + std::to_string(request_count) + " tensors with " +
+         std::to_string(num_threads) + " threads (PID: " +
+         std::to_string(getpid()) + ")");
 
     // Prepare output vector
-    std::vector<torch::Tensor> results(batch_size);
+    std::vector<torch::Tensor> results(request_count);
 
-    // Extract file info from all fileobjs (with GIL)
-    std::vector<FileInfo> file_infos;
-    {
-        py::gil_scoped_acquire gil;
-
-        for (size_t i = 0; i < batch_size; ++i) {
-            std::string filepath;
-            int64_t offset = 0;
-            int64_t length = 0;
-
-            if (extract_file_info(fileobjs[i], filepath, offset, length)) {
-                FileInfo info;
-                info.filepath = filepath;
-                info.offset = offset;
-                info.length = length;
-                info.index = i;
-                info.tensor_offsets = (i < offsets_list.size()) ? offsets_list[i] : std::vector<int64_t>();
-                info.tensor_lengths = (i < lengths_list.size()) ? lengths_list[i] : std::vector<int64_t>();
-                file_infos.push_back(std::move(info));
-            } else {
-                // Log extraction failure
-                std::lock_guard<std::mutex> lock(cout_mutex);
-                std::cout << "Failed to extract file info for index " << i << std::endl;
-            }
-        }
-    }
-
-    safe_log("Extracted info for " + std::to_string(file_infos.size()) +
-             " files out of " + std::to_string(batch_size));
-
-    // No GIL needed beyond this point - process files in parallel
-
-    // Process files in parallel
-    std::atomic<size_t> file_index(0);
+    // Process requests in parallel
+    std::atomic<size_t> request_index(0);
     std::vector<std::thread> threads;
 
     // Create worker threads
     for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back([&file_infos, &results, &file_index]() {
+        threads.emplace_back([&file_requests, &results, &request_index]() {
             // Get thread ID for logging
             auto thread_id = std::this_thread::get_id();
             std::stringstream ss;
@@ -239,46 +264,46 @@ std::vector<torch::Tensor> fast_load_tensors_parallel(
             std::string thread_id_str = ss.str();
 
             while (true) {
-                // Get next file atomically
-                size_t idx = file_index.fetch_add(1);
-                if (idx >= file_infos.size()) {
-                    break;  // No more files
+                // Get next request atomically
+                size_t idx = request_index.fetch_add(1);
+                if (idx >= file_requests.size()) {
+                    break;  // No more requests
                 }
 
-                const FileInfo& info = file_infos[idx];
+                const FileDataRequest& req = file_requests[idx];
                 auto start_time = std::chrono::high_resolution_clock::now();
 
                 try {
-                    // Create FileView and read data
-                    FileView view(info.filepath, info.offset, info.length);
-                    std::string data = view.read_all();
+                    // Access the file data from shared memory
+                    SharedMemoryAccess shm_access(req.filepath);
+
+                    // Get the slice of data we need
+                    std::string data = shm_access.get_data_slice(req.offset, req.length);
 
                     if (!data.empty()) {
                         // Process the data
-                        torch::Tensor tensor = fast_load_tensor_from_memory(
-                            data, info.tensor_offsets, info.tensor_lengths
+                        torch::Tensor tensor = load_tensor_from_memory(
+                            data, req.tensor_offsets, req.tensor_lengths
                         );
 
                         // Store the result
-                        results[info.index] = tensor;
+                        results[req.index] = tensor;
 
                         auto end_time = std::chrono::high_resolution_clock::now();
                         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                             end_time - start_time
                         ).count();
 
-                        std::lock_guard<std::mutex> lock(cout_mutex);
-                        std::cout << "Thread " << thread_id_str << " processed tensor " << info.index
-                                  << " in " << duration << "ms" << std::endl;
+                        log(DEBUG, "Thread " + thread_id_str + " processed tensor " +
+                                  std::to_string(req.index) + " in " + std::to_string(duration) + "ms");
                     } else {
-                        std::lock_guard<std::mutex> lock(cout_mutex);
-                        std::cout << "Thread " << thread_id_str << " got empty data for file "
-                                  << info.index << std::endl;
+                        log(WARNING, "Thread " + thread_id_str + " got empty data for file " +
+                                    req.filepath + " at index " + std::to_string(req.index));
                     }
                 } catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lock(cout_mutex);
-                    std::cout << "Thread " << thread_id_str << " error processing file "
-                              << info.index << ": " << e.what() << std::endl;
+                    log(ERROR, "Thread " + thread_id_str + " error processing file " +
+                                req.filepath + " at index " + std::to_string(req.index) +
+                                ": " + e.what());
                 }
             }
         });
@@ -289,29 +314,66 @@ std::vector<torch::Tensor> fast_load_tensors_parallel(
         thread.join();
     }
 
-    // Handle any fileobjs that we couldn't process with native C++
-    std::vector<size_t> unprocessed_indices;
-    for (size_t i = 0; i < batch_size; ++i) {
+    // Check for any unprocessed tensors
+    size_t failed_count = 0;
+    for (size_t i = 0; i < request_count; ++i) {
         if (!results[i].defined()) {
-            throw std::runtime_error("Failed to process tensor " + std::to_string(i));
+            failed_count++;
         }
     }
 
-    safe_log("All tensors processed");
+    if (failed_count > 0) {
+        log(WARNING, std::to_string(failed_count) + " tensors failed to process");
+    } else {
+        log(INFO, "All tensors processed successfully");
+    }
+
     return results;
 }
 
+// Set the log level (can be called from Python)
+void set_log_level(const std::string& level) {
+    if (level == "DEBUG") {
+        current_log_level = DEBUG;
+    } else if (level == "INFO") {
+        current_log_level = INFO;
+    } else if (level == "WARNING") {
+        current_log_level = WARNING;
+    } else if (level == "ERROR") {
+        current_log_level = ERROR;
+    } else {
+        log(WARNING, "Unknown log level: " + level + ". Using INFO.");
+        current_log_level = INFO;
+    }
+    log(INFO, "Log level set to " + level);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fast_load_tensor_from_memory", &fast_load_tensor_from_memory,
-          "Fast tensor loading from memory buffer",
+    // Define the FileDataRequest class for Python
+    py::class_<FileDataRequest>(m, "FileDataRequest")
+        .def(py::init<>())
+        .def_readwrite("filepath", &FileDataRequest::filepath)
+        .def_readwrite("offset", &FileDataRequest::offset)
+        .def_readwrite("length", &FileDataRequest::length)
+        .def_readwrite("index", &FileDataRequest::index)
+        .def_readwrite("tensor_offsets", &FileDataRequest::tensor_offsets)
+        .def_readwrite("tensor_lengths", &FileDataRequest::tensor_lengths);
+
+    // Expose the load_tensor_from_memory function
+    m.def("load_tensor_from_memory", &load_tensor_from_memory,
+          "Load tensor from memory buffer",
           py::arg("data"),
           py::arg("offsets") = std::vector<int64_t>(),
           py::arg("lengths") = std::vector<int64_t>());
 
-    m.def("fast_load_tensors_parallel", &fast_load_tensors_parallel,
-          "Load multiple tensors in parallel",
-          py::arg("fileobjs"),
-          py::arg("offsets_list") = std::vector<std::vector<int64_t>>(),
-          py::arg("lengths_list") = std::vector<std::vector<int64_t>>(),
+    // Expose the load_tensors_parallel function
+    m.def("load_tensors_parallel", &load_tensors_parallel,
+          "Load multiple tensors in parallel using shared memory",
+          py::arg("file_requests"),
           py::arg("num_threads") = -1);
+
+    // Expose the set_log_level function
+    m.def("set_log_level", &set_log_level,
+          "Set the log level (DEBUG, INFO, WARNING, ERROR)",
+          py::arg("level"));
 }
