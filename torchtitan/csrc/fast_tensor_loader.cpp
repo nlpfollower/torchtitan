@@ -331,6 +331,120 @@ std::vector<torch::Tensor> load_tensors_parallel(
     return results;
 }
 
+
+// New structure that includes the destination tensor
+struct TensorCopyRequest {
+    std::string filepath;
+    int64_t offset;
+    int64_t length;
+    size_t index;
+    std::vector<int64_t> tensor_offsets;
+    std::vector<int64_t> tensor_lengths;
+    torch::Tensor destination_tensor;  // This will hold a reference to the target tensor
+};
+
+// Function that loads and copies tensors directly to their destination
+bool load_and_copy_tensors_parallel(
+    std::vector<TensorCopyRequest>& requests,
+    int num_threads = -1
+) {
+    // Determine thread count
+    if (num_threads <= 0) {
+        num_threads = std::thread::hardware_concurrency();
+    }
+    num_threads = std::max(1, num_threads);
+
+    size_t request_count = requests.size();
+    log(INFO, "Processing " + std::to_string(request_count) + " tensors with " +
+         std::to_string(num_threads) + " threads (PID: " +
+         std::to_string(getpid()) + ")");
+
+    // Process requests in parallel
+    std::atomic<size_t> request_index(0);
+    std::atomic<size_t> success_count(0);
+    std::vector<std::thread> threads;
+
+    // Create worker threads
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([&requests, &request_index, &success_count]() {
+            // Get thread ID for logging
+            auto thread_id = std::this_thread::get_id();
+            std::stringstream ss;
+            ss << thread_id;
+            std::string thread_id_str = ss.str();
+
+            while (true) {
+                // Get next request atomically
+                size_t idx = request_index.fetch_add(1);
+                if (idx >= requests.size()) {
+                    break;  // No more requests
+                }
+
+                TensorCopyRequest& req = requests[idx];
+                auto start_time = std::chrono::high_resolution_clock::now();
+
+                try {
+                    // Access the file data from shared memory
+                    SharedMemoryAccess shm_access(req.filepath);
+
+                    // Get the slice of data we need
+                    std::string data = shm_access.get_data_slice(req.offset, req.length);
+
+                    if (!data.empty()) {
+                        // Process the data - load into CPU tensor
+                        torch::Tensor cpu_tensor = load_tensor_from_memory(
+                            data, req.tensor_offsets, req.tensor_lengths
+                        );
+
+                        if (cpu_tensor.defined() && cpu_tensor.numel() > 0) {
+                            // Verify tensor sizes match
+                            if (cpu_tensor.sizes() != req.destination_tensor.sizes()) {
+                                log(ERROR, "Size mismatch for tensor " + std::to_string(idx) +
+                                          ": source " + std::to_string(cpu_tensor.numel()) +
+                                          " vs destination " + std::to_string(req.destination_tensor.numel()));
+                                continue;
+                            }
+
+                            // Simpler approach: just use copy_ without explicit stream handling
+                            // For CUDA tensors, this will use the current CUDA stream
+                            req.destination_tensor.copy_(cpu_tensor);
+                            success_count++;
+
+                            auto end_time = std::chrono::high_resolution_clock::now();
+                            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                end_time - start_time
+                            ).count();
+
+                            log(DEBUG, "Thread " + thread_id_str + " processed tensor " +
+                                      std::to_string(idx) + " in " + std::to_string(duration) + "ms");
+                        } else {
+                            log(WARNING, "Failed to load tensor data for file " + req.filepath);
+                        }
+                    } else {
+                        log(WARNING, "Thread " + thread_id_str + " got empty data for file " +
+                                    req.filepath + " at index " + std::to_string(idx));
+                    }
+                } catch (const std::exception& e) {
+                    log(ERROR, "Thread " + thread_id_str + " error processing file " +
+                                req.filepath + " at index " + std::to_string(idx) +
+                                ": " + e.what());
+                }
+            }
+        });
+    }
+
+    // Wait for all threads to complete
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // Report completion
+    log(INFO, "Completed processing " + std::to_string(success_count.load()) +
+             " out of " + std::to_string(request_count) + " tensors");
+
+    return success_count.load() == request_count;
+}
+
 // Set the log level (can be called from Python)
 void set_log_level(const std::string& level) {
     if (level == "DEBUG") {
@@ -376,4 +490,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_log_level", &set_log_level,
           "Set the log level (DEBUG, INFO, WARNING, ERROR)",
           py::arg("level"));
+
+    // Add to PYBIND11_MODULE
+    py::class_<TensorCopyRequest>(m, "TensorCopyRequest")
+        .def(py::init<>())
+        .def_readwrite("filepath", &TensorCopyRequest::filepath)
+        .def_readwrite("offset", &TensorCopyRequest::offset)
+        .def_readwrite("length", &TensorCopyRequest::length)
+        .def_readwrite("index", &TensorCopyRequest::index)
+        .def_readwrite("tensor_offsets", &TensorCopyRequest::tensor_offsets)
+        .def_readwrite("tensor_lengths", &TensorCopyRequest::tensor_lengths)
+        .def_readwrite("destination_tensor", &TensorCopyRequest::destination_tensor);
+
+    m.def("load_and_copy_tensors_parallel", &load_and_copy_tensors_parallel,
+        "Load and directly copy multiple tensors to their destinations in parallel",
+        py::arg("requests"),
+        py::arg("num_threads") = -1);
 }
