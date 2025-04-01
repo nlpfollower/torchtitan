@@ -26,13 +26,14 @@ std::mutex shm_mutex;
 
 // Structure to store tensor metadata in shared memory
 struct TensorMetadata {
-    int64_t offset;      // Offset in original file
-    int64_t length;      // Length in original file
-    int64_t dtype;       // PyTorch dtype
-    int64_t ndim;        // Number of dimensions
-    int64_t dims[8];     // Dimensions (up to 8D)
-    bool is_preloaded;   // Whether tensor was successfully loaded
-    char key[256];       // Tensor key (name)
+    int64_t offset;          // Offset in original file
+    int64_t length;          // Length in original file
+    int64_t dtype;           // PyTorch dtype
+    int64_t ndim;            // Number of dimensions
+    int64_t dims[8];         // Dimensions (up to 8D)
+    bool is_preloaded;       // Whether tensor was successfully loaded
+    char key[256];           // Tensor key (name)
+    size_t shm_offset;       // NEW: Offset within shared memory segment
 };
 
 // Structure to store file metadata in shared memory
@@ -509,6 +510,9 @@ bool preload_file_tensors(
 
                     // Check if we have enough space left
                     if (current_offset + tensor_sizes[i] <= total_tensor_size) {
+                        // Store the current shared memory offset before copying
+                        tensor_metadata[i].shm_offset = current_offset;
+
                         // Copy to shared memory
                         memcpy(static_cast<char*>(tensor_data) + current_offset,
                                tensor.data_ptr(),

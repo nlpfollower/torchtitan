@@ -74,13 +74,14 @@ void set_log_level(const std::string& level) {
 
 // Structure to store tensor metadata in shared memory
 struct TensorMetadata {
-    int64_t offset;      // Offset in original file
-    int64_t length;      // Length in original file
-    int64_t dtype;       // PyTorch dtype
-    int64_t ndim;        // Number of dimensions
-    int64_t dims[8];     // Dimensions (up to 8D)
-    bool is_preloaded;   // Whether tensor was successfully loaded
-    char key[256];       // Tensor key (name)
+    int64_t offset;          // Offset in original file
+    int64_t length;          // Length in original file
+    int64_t dtype;           // PyTorch dtype
+    int64_t ndim;            // Number of dimensions
+    int64_t dims[8];         // Dimensions (up to 8D)
+    bool is_preloaded;       // Whether tensor was successfully loaded
+    char key[256];           // Tensor key (name)
+    size_t shm_offset;       // NEW: Offset within shared memory segment
 };
 
 // Structure for file metadata with tensor info
@@ -225,8 +226,8 @@ public:
                 auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
 
                 // Get pointer to this specific tensor in shared memory
-                // Each tensor has its own offset within the shared memory block
-                void* data_ptr = static_cast<char*>(tensor_data);
+                // Use shm_offset to find the correct position in shared memory
+                void* data_ptr = static_cast<char*>(tensor_data) + tensor_metadata[i].shm_offset;
 
                 // Create a zero-copy tensor that references shared memory
                 torch::Tensor tensor = torch::from_blob(
