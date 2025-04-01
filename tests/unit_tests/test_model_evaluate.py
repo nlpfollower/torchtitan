@@ -149,9 +149,9 @@ def evaluate(model, rank, world_size, eval_iter, loss_fn, world_mesh, device_typ
 def run_eval():
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if rank == 0:
-        print("Hello from rank 0")
-        pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    # if rank == 0:
+    #     print("Hello from rank 0")
+    #     pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     # if rank == 1:
     #     print("Hello from rank 1")
     #     pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
