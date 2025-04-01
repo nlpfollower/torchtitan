@@ -18,90 +18,6 @@ inline void atomic_add_seconds(std::atomic<uint64_t>& counter, double seconds) {
     counter.fetch_add(ns, std::memory_order_relaxed);
 }
 
-// Function to analyze tensor and get its size
-size_t analyze_tensor_size(const char* tensor_data, size_t length, TensorMetadata& metadata) {
-    if (tensor_data == nullptr || length == 0) {
-        return 0;
-    }
-
-    try {
-        // Create a copy with pre-allocated memory for pickle_load
-        std::vector<char> data_vec(tensor_data, tensor_data + length);
-
-        // Deserialize the tensor
-        auto ivalue = torch::pickle_load(data_vec);
-        if (!ivalue.isTensor()) {
-            return 0;
-        }
-
-        torch::Tensor tensor = ivalue.toTensor().cpu();
-        if (!tensor.defined()) {
-            return 0;
-        }
-
-        // Make contiguous if needed
-        if (!tensor.is_contiguous()) {
-            tensor = tensor.contiguous();
-        }
-
-        // Update metadata
-        metadata.dtype = static_cast<int64_t>(tensor.scalar_type());
-        metadata.ndim = tensor.dim();
-        for (int64_t d = 0; d < tensor.dim() && d < 8; d++) {
-            metadata.dims[d] = tensor.size(d);
-        }
-
-        // Return tensor size in bytes
-        return tensor.nbytes();
-    } catch (const c10::Error& e) {
-        log(ERROR, "PyTorch error analyzing tensor: " + std::string(e.what()));
-    } catch (const std::exception& e) {
-        log(ERROR, "Exception analyzing tensor: " + std::string(e.what()));
-    } catch (...) {
-        log(ERROR, "Unknown error analyzing tensor");
-    }
-
-    return 0;
-}
-
-// Function to load tensor into shared memory
-bool load_tensor_to_shared_memory(const char* tensor_data, size_t length,
-                                void* shm_data, size_t shm_offset) {
-    try {
-        // Create a vector for pickle_load
-        std::vector<char> data_vec(tensor_data, tensor_data + length);
-
-        // Deserialize the tensor
-        auto ivalue = torch::pickle_load(data_vec);
-        if (!ivalue.isTensor()) {
-            return false;
-        }
-
-        torch::Tensor tensor = ivalue.toTensor().cpu();
-        if (!tensor.defined()) {
-            return false;
-        }
-
-        // Make contiguous if needed
-        if (!tensor.is_contiguous()) {
-            tensor = tensor.contiguous();
-        }
-
-        // Copy to shared memory
-        memcpy(static_cast<char*>(shm_data) + shm_offset, tensor.data_ptr(), tensor.nbytes());
-
-        return true;
-    } catch (const c10::Error& e) {
-        log(ERROR, "PyTorch error loading tensor: " + std::string(e.what()));
-    } catch (const std::exception& e) {
-        log(ERROR, "Exception loading tensor: " + std::string(e.what()));
-    } catch (...) {
-        log(ERROR, "Unknown error loading tensor");
-    }
-
-    return false;
-}
-
 // Primary tensor loading function - broken into manageable steps
 bool preload_file_tensors(const std::string& filepath,
                         const std::vector<py::dict>& tensor_infos,
@@ -132,7 +48,7 @@ bool preload_file_tensors(const std::string& filepath,
         return false;
     }
 
-    // 4. Determine thread count
+    // 4. Determine thread count and initial shared memory size
     int worker_threads = (num_threads > 0) ? num_threads : std::thread::hardware_concurrency();
     worker_threads = std::min(worker_threads, std::max(1, tensor_count / 10 + 1));
 
@@ -182,81 +98,19 @@ bool preload_file_tensors(const std::string& filepath,
         tensor_metadata[i].key[sizeof(tensor_metadata[i].key) - 1] = '\0';
     }
 
-    // 9. Create and configure thread pool
-    ThreadPool pool(worker_threads);
-    std::mutex tensor_sizes_mutex;
-    std::atomic<size_t> total_tensor_size(0);
-    std::vector<size_t> tensor_sizes(tensor_count, 0);
+    // 9. Estimate initial shared memory size (use file size with buffer as rough estimate)
+    size_t file_size = mapped_file.size();
+    size_t estimated_size = file_size * 1.5; // 50% buffer as a rough estimate
 
-    // === FIRST PASS: Calculate tensor sizes ===
-    std::vector<std::future<size_t>> size_futures;
+    // Ensure a minimum size (e.g., 10MB) and cap at a maximum reasonable size
+    estimated_size = std::max(estimated_size, static_cast<size_t>(10 * 1024 * 1024));
 
-    for (int i = 0; i < tensor_count; i++) {
-        size_futures.push_back(pool.enqueue([&, i]() {
-            auto task_start = std::chrono::high_resolution_clock::now();
+    log(INFO, "Allocating initial shared memory segment of " +
+             std::to_string(estimated_size / (1024 * 1024)) + "MB for tensor data");
 
-            // Get tensor data
-            auto read_start = std::chrono::high_resolution_clock::now();
-            const char* tensor_data = mapped_file.get_tensor_data(tensor_offsets[i], tensor_lengths[i]);
-            auto read_end = std::chrono::high_resolution_clock::now();
-            double read_ms = std::chrono::duration<double, std::milli>(read_end - read_start).count();
-            atomic_add_seconds(g_stats.read_time_ns, read_ms / 1000.0);
-
-            if (!tensor_data) {
-                return size_t(0);
-            }
-
-            // Calculate tensor size
-            auto deserialize_start = std::chrono::high_resolution_clock::now();
-            size_t tensor_size = analyze_tensor_size(tensor_data, tensor_lengths[i], tensor_metadata[i]);
-            auto deserialize_end = std::chrono::high_resolution_clock::now();
-            double deserialize_ms = std::chrono::duration<double, std::milli>(deserialize_end - deserialize_start).count();
-            atomic_add_seconds(g_stats.deserialize_time_ns, deserialize_ms / 1000.0);
-
-            // Log slow processing
-            auto task_end = std::chrono::high_resolution_clock::now();
-            double task_ms = std::chrono::duration<double, std::milli>(task_end - task_start).count();
-            if (task_ms > 1000) {
-                log(WARNING, "Slow tensor size calculation for tensor " + std::to_string(i) +
-                           ": " + std::to_string(task_ms) + "ms");
-            }
-
-            return tensor_size;
-        }));
-    }
-
-    // Wait for all size calculations and collect results
-    for (int i = 0; i < tensor_count; i++) {
-        tensor_sizes[i] = size_futures[i].get();
-        if (tensor_sizes[i] > 0) {
-            total_tensor_size.fetch_add(tensor_sizes[i]);
-        }
-
-        if ((i+1) % 100 == 0 || (i+1) == tensor_count) {
-            log(INFO, "Size calculation progress: " + std::to_string(i+1) + "/" +
-                     std::to_string(tensor_count) + " tensors");
-        }
-    }
-
-    // 10. Calculate final size with safety buffer
-    if (total_tensor_size.load() == 0) {
-        log(ERROR, "No valid tensors found in " + filepath);
-        SharedMemory::detach_segment(shmaddr);
-        return false;
-    }
-
-    size_t final_size = total_tensor_size.load() + (total_tensor_size.load() / 50); // 2% buffer
-
-    log(INFO, "Size calculation complete. Total tensor data size: " +
-             std::to_string(final_size / (1024 * 1024)) + "MB");
-
-    // 11. Create shared memory for tensor data
-    log(INFO, "Creating shared memory segment of " +
-             std::to_string(final_size / (1024 * 1024)) + "MB for tensor data");
-
-    // Use huge pages for large allocations
-    bool use_huge_pages = (final_size >= 1024 * 1024 * 1024); // 1GB threshold
-    int tensor_data_shmid = SharedMemory::create_segment(tensor_data_key, final_size, use_huge_pages);
+    // 10. Create shared memory for tensor data
+    bool use_huge_pages = (estimated_size >= 1024 * 1024 * 1024); // 1GB threshold
+    int tensor_data_shmid = SharedMemory::create_segment(tensor_data_key, estimated_size, use_huge_pages);
 
     if (tensor_data_shmid == -1) {
         log(ERROR, "Failed to create tensor data shared memory: " +
@@ -265,7 +119,7 @@ bool preload_file_tensors(const std::string& filepath,
         return false;
     }
 
-    // 12. Attach to tensor data segment
+    // 11. Attach to tensor data segment
     void* tensor_data = SharedMemory::attach_segment(tensor_data_shmid);
     if (tensor_data == (void*)-1) {
         log(ERROR, "Failed to attach to tensor data shared memory");
@@ -273,102 +127,169 @@ bool preload_file_tensors(const std::string& filepath,
         return false;
     }
 
-    // 13. Second pass: Load tensors into shared memory
-    std::atomic<size_t> current_offset(0);
+    // 12. Setup for single-pass loading
+    ThreadPool pool(worker_threads);
     std::atomic<int> success_count(0);
-    std::vector<std::future<bool>> load_futures;
+    std::mutex offset_mutex; // Only for offset calculation
+    std::atomic<size_t> current_offset(0);
 
+    // Add a completion barrier to ensure all threads finish before resources are released
+    std::atomic<int> active_tasks(0);
+    std::condition_variable completion_cv;
+    std::mutex completion_mutex;
+
+    // 13. Process tensors in a single pass
+    std::vector<std::future<void>> futures;
     for (int i = 0; i < tensor_count; i++) {
-        // Skip tensors with zero size (failed analysis)
-        if (tensor_sizes[i] == 0) {
-            continue;
-        }
-
-        // Reserve space in shared memory (atomic operation)
-        size_t offset = current_offset.fetch_add(tensor_sizes[i]);
-
-        // Check if we have enough space
-        if (offset + tensor_sizes[i] > final_size) {
-            log(ERROR, "Not enough shared memory for tensor " + std::to_string(i));
-            continue;
-        }
-
-        // Update metadata with offset
-        {
-            std::lock_guard<std::mutex> lock(tensor_sizes_mutex);
-            tensor_metadata[i].shm_offset = offset;
-        }
-
-        // Queue loading task
-        load_futures.push_back(pool.enqueue([&, i, offset]() {
+        active_tasks.fetch_add(1);
+        futures.push_back(pool.enqueue([&, i]() {
             auto task_start = std::chrono::high_resolution_clock::now();
+            bool task_succeeded = false;
 
-            // Get tensor data from memory-mapped file
-            auto read_start = std::chrono::high_resolution_clock::now();
-            const char* tensor_data_ptr = mapped_file.get_tensor_data(tensor_offsets[i], tensor_lengths[i]);
-            auto read_end = std::chrono::high_resolution_clock::now();
-            double read_ms = std::chrono::duration<double, std::milli>(read_end - read_start).count();
-            atomic_add_seconds(g_stats.read_time_ns, read_ms / 1000.0);
+            try {
+                // Get tensor data from memory-mapped file
+                auto read_start = std::chrono::high_resolution_clock::now();
+                const char* tensor_data_ptr = mapped_file.get_tensor_data(tensor_offsets[i], tensor_lengths[i]);
+                auto read_end = std::chrono::high_resolution_clock::now();
+                double read_ms = std::chrono::duration<double, std::milli>(read_end - read_start).count();
+                atomic_add_seconds(g_stats.read_time_ns, read_ms / 1000.0);
 
-            if (!tensor_data_ptr) {
-                return false;
-            }
-
-            // Load tensor into shared memory
-            auto deserialize_start = std::chrono::high_resolution_clock::now();
-            bool success = load_tensor_to_shared_memory(
-                tensor_data_ptr, tensor_lengths[i],
-                tensor_data, offset
-            );
-            auto deserialize_end = std::chrono::high_resolution_clock::now();
-            double deserialize_ms = std::chrono::duration<double, std::milli>(deserialize_end - deserialize_start).count();
-            atomic_add_seconds(g_stats.deserialize_time_ns, deserialize_ms / 1000.0);
-
-            if (success) {
-                // Update metadata to mark as preloaded
-                {
-                    std::lock_guard<std::mutex> lock(tensor_sizes_mutex);
-                    tensor_metadata[i].is_preloaded = true;
+                if (!tensor_data_ptr) {
+                    log(ERROR, "Failed to access tensor data for tensor " + std::to_string(i));
+                    return;
                 }
-                success_count.fetch_add(1);
+
+                // CONCURRENT PART: Deserialize the tensor
+                auto deserialize_start = std::chrono::high_resolution_clock::now();
+                std::vector<char> data_vec(tensor_data_ptr, tensor_data_ptr + tensor_lengths[i]);
+                torch::Tensor tensor;
+
+                try {
+                    auto ivalue = torch::pickle_load(data_vec);
+                    if (ivalue.isTensor()) {
+                        tensor = ivalue.toTensor().cpu();
+                    } else {
+                        log(ERROR, "Deserialized data is not a tensor for tensor " + std::to_string(i));
+                        return;
+                    }
+                } catch (const c10::Error& e) {
+                    log(ERROR, "PyTorch error deserializing tensor " + std::to_string(i) +
+                            ": " + e.what());
+                    return;
+                }
+
+                auto deserialize_end = std::chrono::high_resolution_clock::now();
+                double deserialize_ms = std::chrono::duration<double, std::milli>(deserialize_end - deserialize_start).count();
+                atomic_add_seconds(g_stats.deserialize_time_ns, deserialize_ms / 1000.0);
+
+                if (!tensor.defined()) {
+                    log(ERROR, "Failed to create tensor from deserialized data for tensor " + std::to_string(i));
+                    return;
+                }
+
+                // Make sure tensor is contiguous
+                if (!tensor.is_contiguous()) {
+                    tensor = tensor.contiguous();
+                }
+
+                // Calculate tensor size
+                size_t tensor_size = tensor.nbytes();
+
+                // Update metadata (thread-safe part)
+                {
+                    tensor_metadata[i].dtype = static_cast<int64_t>(tensor.scalar_type());
+                    tensor_metadata[i].ndim = tensor.dim();
+                    for (int64_t d = 0; d < tensor.dim() && d < 8; d++) {
+                        tensor_metadata[i].dims[d] = tensor.size(d);
+                    }
+                }
+
+                // MINIMIZED LOCK: Only calculate offset under lock
+                size_t offset;
+                {
+                    std::lock_guard<std::mutex> lock(offset_mutex);
+
+                    // Check if we have enough space left
+                    size_t required_offset = current_offset.load() + tensor_size;
+                    if (required_offset > estimated_size) {
+                        log(ERROR, "Not enough shared memory for tensor " + std::to_string(i) +
+                                 ". Consider using a larger initial allocation.");
+                        return;
+                    }
+
+                    // Get current offset and increment atomically
+                    offset = current_offset.load();
+
+                    // Update offsets - this is all we need the lock for
+                    current_offset.fetch_add(tensor_size);
+
+                    // Update tensor metadata that depends on offset
+                    tensor_metadata[i].shm_offset = offset;
+                }
+
+                // PARALLEL COPY: Actually copy the data after releasing the lock
+                auto copy_start = std::chrono::high_resolution_clock::now();
+
+                // Access tensor_data safely - it's a shared resource
+                if (tensor_data) {
+                    // Copy tensor data to shared memory (no lock needed)
+                    memcpy(static_cast<char*>(tensor_data) + offset, tensor.data_ptr(), tensor_size);
+
+                    // Mark as preloaded - no lock needed since we're only writing to our assigned slot
+                    tensor_metadata[i].is_preloaded = true;
+                    success_count.fetch_add(1);
+                    task_succeeded = true;
+                }
+
+                auto copy_end = std::chrono::high_resolution_clock::now();
+                double copy_ms = std::chrono::duration<double, std::milli>(copy_end - copy_start).count();
+                atomic_add_seconds(g_stats.copy_time_ns, copy_ms / 1000.0);
+
+                // Log slow processing
+                auto task_end = std::chrono::high_resolution_clock::now();
+                double task_ms = std::chrono::duration<double, std::milli>(task_end - task_start).count();
+                if (task_ms > 1000) {
+                    log(WARNING, "Slow tensor processing for tensor " + std::to_string(i) +
+                               ": " + std::to_string(task_ms) + "ms");
+                }
+            } catch (const std::exception& e) {
+                log(ERROR, "Exception in tensor processing thread for tensor " + std::to_string(i) +
+                         ": " + e.what());
+            } catch (...) {
+                log(ERROR, "Unknown exception in tensor processing thread for tensor " + std::to_string(i));
             }
 
-            // Log slow processing
-            auto task_end = std::chrono::high_resolution_clock::now();
-            double task_ms = std::chrono::duration<double, std::milli>(task_end - task_start).count();
-            if (task_ms > 1000) {
-                log(WARNING, "Slow tensor loading for tensor " + std::to_string(i) +
-                           ": " + std::to_string(task_ms) + "ms");
+            // Notify that this task is complete
+            int remaining = active_tasks.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                // This was the last task
+                std::unique_lock<std::mutex> lock(completion_mutex);
+                completion_cv.notify_all();
             }
-
-            return success;
         }));
 
         // Log progress periodically
         if ((i+1) % 100 == 0 || (i+1) == tensor_count) {
-            log(INFO, "Queued tensor loading: " + std::to_string(i+1) + "/" +
+            log(INFO, "Queued tensor processing: " + std::to_string(i+1) + "/" +
                      std::to_string(tensor_count) + " tensors");
         }
     }
 
-    // 14. Wait for all loading tasks to complete
-    int progress_counter = 0;
-    for (auto& future : load_futures) {
-        future.get();
-        progress_counter++;
-
-        if (progress_counter % 100 == 0 || progress_counter == load_futures.size()) {
-            log(INFO, "Tensor loading progress: " + std::to_string(progress_counter) + "/" +
-                     std::to_string(load_futures.size()) + " tensors");
-        }
+    // 14. Wait for all tasks to complete and track progress
+    {
+        std::unique_lock<std::mutex> lock(completion_mutex);
+        completion_cv.wait(lock, [&]() { return active_tasks.load() == 0; });
     }
 
+    // Now safe to check results and clean up
+    int total_success = success_count.load();
+
     // 15. Update final metadata
-    file_metadata->preloaded_count = success_count.load();
+    file_metadata->preloaded_count = total_success;
     file_metadata->tensor_data_size = current_offset.load();
 
     // 16. Update global stats
-    g_stats.preloaded_count += success_count.load();
+    g_stats.preloaded_count += total_success;
     g_stats.total_memory += current_offset.load();
 
     // 17. Clean up resources
@@ -379,13 +300,13 @@ bool preload_file_tensors(const std::string& filepath,
     auto end_time = std::chrono::high_resolution_clock::now();
     double elapsed_seconds = std::chrono::duration<double>(end_time - start_time).count();
 
-    log(INFO, "Successfully preloaded " + std::to_string(success_count.load()) +
+    log(INFO, "Successfully preloaded " + std::to_string(total_success) +
              " of " + std::to_string(tensor_count) + " tensors from " + filepath +
              " (" + std::to_string(current_offset.load() / (1024 * 1024)) + "MB) in " +
              std::to_string(elapsed_seconds) + " seconds (" +
-             std::to_string(success_count.load() / elapsed_seconds) + " tensors/sec)");
+             std::to_string(total_success > 0 ? total_success / elapsed_seconds : 0) + " tensors/sec)");
 
-    return success_count.load() > 0;
+    return total_success > 0;
 }
 
 // Global preloader function for multiple files
