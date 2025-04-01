@@ -18,13 +18,25 @@ setup(
         # Fast tensor loader
         cpp_extension.CppExtension(
             name='fast_tensor_loader',
-            sources=['fast_tensor_loader.cpp'],
+            sources=[
+                'tensor_common.cpp',
+                'thread_pool.cpp',
+                'memory_mapped_file.cpp',
+                'shared_memory.cpp',
+                'fast_tensor_loader.cpp'
+            ],
             extra_compile_args=extra_compile_args,
         ),
         # Tensor preloader extension
         cpp_extension.CppExtension(
             name='tensor_preloader',
-            sources=['tensor_preloader.cpp'],
+            sources=[
+                'tensor_common.cpp',
+                'thread_pool.cpp',
+                'memory_mapped_file.cpp',
+                'shared_memory.cpp',
+                'tensor_preloader.cpp'
+            ],
             extra_compile_args=extra_compile_args,
         ),
     ],
