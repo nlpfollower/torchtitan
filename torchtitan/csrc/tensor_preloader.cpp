@@ -116,24 +116,70 @@ std::vector<char> read_file(const std::string& filepath) {
 // Deserialize a tensor from memory
 torch::Tensor load_tensor_from_memory(const char* data, size_t length) {
     try {
-        if (data == nullptr || length == 0) {
-            log(ERROR, "Invalid data pointer or zero length");
+        log(DEBUG, "Starting to deserialize tensor of length " + std::to_string(length) + " bytes");
+
+        // Validate input data
+        if (data == nullptr) {
+            log(ERROR, "Null data pointer passed to load_tensor_from_memory");
             return torch::Tensor();
         }
 
-        // Create a copy to avoid potential memory access issues
-        std::vector<char> data_vec(data, data + length);
+        if (length == 0) {  // 20GB sanity check
+            log(ERROR, "Invalid length passed to load_tensor_from_memory: " + std::to_string(length));
+            return torch::Tensor();
+        }
 
-        torch::IValue ivalue = torch::pickle_load(data_vec);
+        log(DEBUG, "Creating data vector");
+        // Create a copy with pre-allocated memory
+        std::vector<char> data_vec;
+        try {
+            data_vec.reserve(length);  // Pre-allocate to avoid reallocation
+            log(DEBUG, "Data vector reserved with capacity " + std::to_string(data_vec.capacity()));
+            data_vec.assign(data, data + length);
+            log(DEBUG, "Data copied to vector, size: " + std::to_string(data_vec.size()));
+        } catch (const std::exception& e) {
+            log(ERROR, "Exception during data vector creation: " + std::string(e.what()));
+            return torch::Tensor();
+        }
 
+        log(DEBUG, "Starting pickle_load");
+        // This is where most deserialization errors happen
+        torch::IValue ivalue;
+        try {
+            ivalue = torch::pickle_load(data_vec);
+            log(DEBUG, "pickle_load completed successfully");
+        } catch (const c10::Error& e) {
+            log(ERROR, "PyTorch error during pickle_load: " + std::string(e.what()));
+            return torch::Tensor();
+        } catch (const std::exception& e) {
+            log(ERROR, "Standard exception during pickle_load: " + std::string(e.what()));
+            return torch::Tensor();
+        } catch (...) {
+            log(ERROR, "Unknown exception during pickle_load");
+            return torch::Tensor();
+        }
+
+        // Check if the deserialized object is a tensor
         if (!ivalue.isTensor()) {
             log(ERROR, "Deserialized data is not a tensor");
             return torch::Tensor();
         }
 
-        return ivalue.toTensor().cpu();
+        log(DEBUG, "Converting to tensor");
+        torch::Tensor tensor;
+        try {
+            tensor = ivalue.toTensor().cpu();
+            log(DEBUG, "Successfully created tensor with shape: [" +
+                 std::to_string(tensor.dim()) + "D, size " +
+                 std::to_string(tensor.nbytes()) + " bytes]");
+        } catch (const std::exception& e) {
+            log(ERROR, "Exception during tensor conversion: " + std::string(e.what()));
+            return torch::Tensor();
+        }
+
+        return tensor;
     } catch (const c10::Error& e) {
-        log(ERROR, "Error in tensor deserialization: " + std::string(e.what()));
+        log(ERROR, "PyTorch error in tensor deserialization: " + std::string(e.what()));
         return torch::Tensor();
     } catch (const std::exception& e) {
         log(ERROR, "Exception in load_tensor_from_memory: " + std::string(e.what()));
@@ -188,15 +234,13 @@ void cleanup_file_shared_memory(const std::string& filepath) {
 }
 
 // Preload tensors from a file
+// Modify preload_file_tensors to use a fully incremental approach
 bool preload_file_tensors(
     const std::string& filepath,
     const std::vector<py::dict>& tensor_infos,
     int num_threads
 ) {
     try {
-        // First, clean up any existing shared memory for this file
-        cleanup_file_shared_memory(filepath);
-
         // Count the tensors for this file
         int tensor_count = tensor_infos.size();
         g_stats.total_count += tensor_count;
@@ -208,28 +252,27 @@ bool preload_file_tensors(
 
         log(INFO, "Preloading " + std::to_string(tensor_count) + " tensors from " + filepath);
 
-        // Generate shared memory keys for this file
+        // Generate shared memory keys
         int tensor_meta_key = generate_file_key(filepath, SHM_TENSOR_META_KEY_BASE);
         int tensor_data_key = generate_file_key(filepath, SHM_TENSOR_KEY_BASE);
+
+        // Clean up existing segments
+        cleanup_file_shared_memory(filepath);
 
         // Create shared memory for tensor metadata
         int tensor_meta_shmid = shmget(tensor_meta_key,
                                       sizeof(TensorMetadata) * tensor_count + sizeof(FileMetadata),
                                       IPC_CREAT | 0666);
         if (tensor_meta_shmid == -1) {
-            log(ERROR, "Failed to create tensor metadata shared memory for " + filepath +
-                      " (errno: " + std::to_string(errno) + ")");
+            log(ERROR, "Failed to create tensor metadata shared memory");
             return false;
         }
-
-        // Register for cleanup
         register_shm_segment(tensor_meta_shmid);
 
         // Attach to tensor metadata segment
         void* shmaddr = shmat(tensor_meta_shmid, NULL, 0);
         if (shmaddr == (void*)-1) {
-            log(ERROR, "Failed to attach to tensor metadata shared memory for " + filepath +
-                      " (errno: " + std::to_string(errno) + ")");
+            log(ERROR, "Failed to attach to tensor metadata shared memory");
             shmctl(tensor_meta_shmid, IPC_RMID, NULL);
             return false;
         }
@@ -243,120 +286,111 @@ bool preload_file_tensors(
         file_metadata->preloaded_count = 0;
         file_metadata->tensor_data_size = 0;
 
-        // Read the entire file
-        auto start_time = std::chrono::high_resolution_clock::now();
-        std::vector<char> file_data = read_file(filepath);
-        auto read_end_time = std::chrono::high_resolution_clock::now();
-        auto read_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            read_end_time - start_time
-        ).count();
+        // First pass: Calculate sizes without loading all tensors at once
+        log(INFO, "Starting first pass to calculate sizes");
 
-        log(INFO, "Read " + std::to_string(file_data.size() / (1024 * 1024)) +
-                 "MB from " + filepath + " in " + std::to_string(read_duration) + "ms");
+        // Open the file for streaming reads instead of loading it all at once
+        std::ifstream file(filepath, std::ios::binary);
+        if (!file.is_open()) {
+            log(ERROR, "Failed to open file: " + filepath);
+            shmdt(shmaddr);
+            shmctl(tensor_meta_shmid, IPC_RMID, NULL);
+            return false;
+        }
 
-        // First pass: Load all tensors to calculate total shared memory needed
+        // Initialize metadata from tensor info
         size_t total_tensor_size = 0;
-        std::vector<torch::Tensor> tensors(tensor_count);
         std::vector<size_t> tensor_sizes(tensor_count, 0);
 
-        // Process each tensor to get its size
-        auto deserialize_start = std::chrono::high_resolution_clock::now();
+        // Process in batches of a few tensors at a time
+        const int BATCH_SIZE = 8;
+        std::vector<char> buffer;
 
-        // Determine thread count
-        int thread_count = num_threads > 0 ? num_threads : std::thread::hardware_concurrency();
-        thread_count = std::min(thread_count, tensor_count); // Don't use more threads than tensors
+        // First pass - determine sizes by reading small batches
+        for (int i = 0; i < tensor_count; i++) {
+            try {
+                py::dict info = tensor_infos[i];
+                int64_t offset = py::cast<int64_t>(info["offset"]);
+                int64_t length = py::cast<int64_t>(info["length"]);
+                std::string key = py::cast<std::string>(info["key"]);
 
-        log(INFO, "Using " + std::to_string(thread_count) + " threads for tensor loading");
+                log(DEBUG, "First pass: Processing tensor " + std::to_string(i) +
+                         " [" + key + "] offset=" + std::to_string(offset) +
+                         ", length=" + std::to_string(length));
 
-        // Distribute tensors among threads
-        std::vector<std::thread> threads;
-        std::mutex tensor_mutex;
+                // Initialize tensor metadata
+                tensor_metadata[i].offset = offset;
+                tensor_metadata[i].length = length;
+                tensor_metadata[i].is_preloaded = false;
+                strncpy(tensor_metadata[i].key, key.c_str(), sizeof(tensor_metadata[i].key) - 1);
+                tensor_metadata[i].key[sizeof(tensor_metadata[i].key) - 1] = '\0';
 
-        // Calculate ranges for each thread
-        size_t tensors_per_thread = (tensor_count + thread_count - 1) / thread_count;
+                // We'll manually seek to the correct position for each tensor
+                file.seekg(offset);
 
-        for (int t = 0; t < thread_count; t++) {
-            threads.emplace_back([&, t]() {
-                size_t start_idx = t * tensors_per_thread;
-                size_t end_idx = std::min(start_idx + tensors_per_thread, static_cast<size_t>(tensor_count));
-
-                for (size_t i = start_idx; i < end_idx; i++) {
+                // Resize buffer if needed - avoid frequent reallocations
+                if (buffer.size() < length) {
                     try {
-                        // Get tensor info
-                        py::dict info = tensor_infos[i];
-                        int64_t offset = py::cast<int64_t>(info["offset"]);
-                        int64_t length = py::cast<int64_t>(info["length"]);
-                        std::string key = py::cast<std::string>(info["key"]);
-
-                        // Validate
-                        if (offset < 0 || length <= 0 || offset + length > file_data.size()) {
-                            log(WARNING, "Invalid tensor parameters: offset=" + std::to_string(offset) +
-                                        ", length=" + std::to_string(length) +
-                                        ", filesize=" + std::to_string(file_data.size()));
-                            continue;
-                        }
-
-                        // Initialize tensor metadata
-                        tensor_metadata[i].offset = offset;
-                        tensor_metadata[i].length = length;
-                        tensor_metadata[i].is_preloaded = false;
-
-                        // Copy key with truncation if needed
-                        strncpy(tensor_metadata[i].key, key.c_str(), sizeof(tensor_metadata[i].key) - 1);
-                        tensor_metadata[i].key[sizeof(tensor_metadata[i].key) - 1] = '\0';
-
-                        // Deserialize the tensor
-                        torch::Tensor tensor = load_tensor_from_memory(
-                            file_data.data() + offset, length);
-
-                        if (tensor.defined()) {
-                            // Make contiguous if needed
-                            if (!tensor.is_contiguous()) {
-                                tensor = tensor.contiguous();
-                            }
-
-                            // Store the tensor and its size
-                            {
-                                std::lock_guard<std::mutex> lock(tensor_mutex);
-                                tensors[i] = tensor;
-                                tensor_sizes[i] = tensor.nbytes();
-                                total_tensor_size += tensor_sizes[i];
-                            }
-
-                            // Update tensor metadata
-                            tensor_metadata[i].dtype = static_cast<int64_t>(tensor.scalar_type());
-                            tensor_metadata[i].ndim = tensor.dim();
-
-                            for (int64_t d = 0; d < tensor.dim() && d < 8; d++) {
-                                tensor_metadata[i].dims[d] = tensor.size(d);
-                            }
-                        } else {
-                            log(WARNING, "Failed to deserialize tensor at offset " +
-                                        std::to_string(offset));
-                        }
+                        buffer.resize(length);
                     } catch (const std::exception& e) {
-                        log(ERROR, "Thread " + std::to_string(t) + " exception processing tensor " +
-                            std::to_string(i) + ": " + std::string(e.what()));
-                    } catch (...) {
-                        log(ERROR, "Thread " + std::to_string(t) + " unknown exception processing tensor " +
-                            std::to_string(i));
+                        log(ERROR, "Failed to allocate buffer for tensor " +
+                                 std::to_string(i) + ": " + e.what());
+                        continue;
                     }
                 }
-            });
+
+                // Read the tensor data
+                if (!file.read(buffer.data(), length)) {
+                    log(ERROR, "Failed to read data for tensor " + std::to_string(i));
+                    continue;
+                }
+
+                // Deserialize the tensor
+                torch::Tensor tensor;
+                try {
+                    tensor = load_tensor_from_memory(buffer.data(), length);
+                } catch (const std::exception& e) {
+                    log(ERROR, "Failed to deserialize tensor " + std::to_string(i) +
+                             ": " + e.what());
+                    continue;
+                }
+
+                if (tensor.defined()) {
+                    if (!tensor.is_contiguous()) {
+                        tensor = tensor.contiguous();
+                    }
+
+                    // Update metadata
+                    tensor_metadata[i].dtype = static_cast<int64_t>(tensor.scalar_type());
+                    tensor_metadata[i].ndim = tensor.dim();
+                    for (int64_t d = 0; d < tensor.dim() && d < 8; d++) {
+                        tensor_metadata[i].dims[d] = tensor.size(d);
+                    }
+
+                    // Store size and update total
+                    tensor_sizes[i] = tensor.nbytes();
+                    total_tensor_size += tensor_sizes[i];
+
+                    log(DEBUG, "Tensor " + std::to_string(i) + " processed, size=" +
+                             std::to_string(tensor_sizes[i]) + " bytes");
+                } else {
+                    log(WARNING, "Failed to deserialize tensor " + std::to_string(i));
+                }
+
+                // Free memory explicitly - this forces tensor to be deallocated
+                tensor = torch::Tensor();
+
+                // Log progress periodically
+                if (i % 10 == 0 || i == tensor_count - 1) {
+                    log(INFO, "First pass progress: " + std::to_string(i+1) + "/" +
+                             std::to_string(tensor_count) + " tensors");
+                }
+
+            } catch (const std::exception& e) {
+                log(ERROR, "Exception processing tensor " + std::to_string(i) +
+                         " in first pass: " + e.what());
+            }
         }
-
-        // Wait for all threads to complete
-        for (auto& thread : threads) {
-            thread.join();
-        }
-
-        auto deserialize_end = std::chrono::high_resolution_clock::now();
-        auto deserialize_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deserialize_end - deserialize_start
-        ).count();
-
-        log(INFO, "Deserialized " + std::to_string(tensors.size()) +
-                 " tensors in " + std::to_string(deserialize_duration) + "ms");
 
         if (total_tensor_size == 0) {
             log(ERROR, "No valid tensors found in " + filepath);
@@ -365,88 +399,165 @@ bool preload_file_tensors(
             return false;
         }
 
+        // Add some padding to be safe
+        total_tensor_size += (total_tensor_size / 20); // Add 5% extra
+
+        log(INFO, "First pass complete. Total tensor data size: " +
+                 std::to_string(total_tensor_size / (1024 * 1024)) + "MB");
+
         // Create shared memory for tensor data
         log(INFO, "Creating shared memory segment of " +
                  std::to_string(total_tensor_size / (1024 * 1024)) + "MB for tensor data");
 
         int tensor_data_shmid = shmget(tensor_data_key, total_tensor_size, IPC_CREAT | 0666);
         if (tensor_data_shmid == -1) {
-            log(ERROR, "Failed to create tensor data shared memory for " + filepath +
-                      " (errno: " + std::to_string(errno) + ")");
+            log(ERROR, "Failed to create tensor data shared memory: " +
+                     std::to_string(errno));
             shmdt(shmaddr);
             shmctl(tensor_meta_shmid, IPC_RMID, NULL);
             return false;
         }
-
-        // Register for cleanup
         register_shm_segment(tensor_data_shmid);
 
         // Attach to tensor data segment
         void* tensor_data = shmat(tensor_data_shmid, NULL, 0);
         if (tensor_data == (void*)-1) {
-            log(ERROR, "Failed to attach to tensor data shared memory for " + filepath +
-                      " (errno: " + std::to_string(errno) + ")");
+            log(ERROR, "Failed to attach to tensor data shared memory");
             shmdt(shmaddr);
             shmctl(tensor_meta_shmid, IPC_RMID, NULL);
             shmctl(tensor_data_shmid, IPC_RMID, NULL);
             return false;
         }
 
-        // Second pass: Copy tensors to shared memory
-        file_metadata->tensor_data_size = total_tensor_size;
+        // Second pass - actually copy tensors to shared memory
+        log(INFO, "Starting second pass to copy tensors to shared memory");
+
+        // Reopen file for second pass
+        file.close();
+        file.open(filepath, std::ios::binary);
+        if (!file.is_open()) {
+            log(ERROR, "Failed to reopen file for second pass");
+            shmdt(shmaddr);
+            shmdt(tensor_data);
+            shmctl(tensor_meta_shmid, IPC_RMID, NULL);
+            shmctl(tensor_data_shmid, IPC_RMID, NULL);
+            return false;
+        }
+
         size_t current_offset = 0;
         int success_count = 0;
 
-        auto copy_start = std::chrono::high_resolution_clock::now();
-
         for (int i = 0; i < tensor_count; i++) {
-            torch::Tensor& tensor = tensors[i];
-            if (!tensor.defined()) {
-                continue;
+            try {
+                // Skip if we already know it's invalid
+                if (tensor_sizes[i] == 0) {
+                    continue;
+                }
+
+                int64_t offset = tensor_metadata[i].offset;
+                int64_t length = tensor_metadata[i].length;
+
+                log(DEBUG, "Second pass: Processing tensor " + std::to_string(i) +
+                         " offset=" + std::to_string(offset) +
+                         ", length=" + std::to_string(length));
+
+                // Seek to correct position
+                file.seekg(offset);
+
+                // Ensure buffer is large enough
+                if (buffer.size() < length) {
+                    try {
+                        buffer.resize(length);
+                    } catch (const std::exception& e) {
+                        log(ERROR, "Failed to allocate buffer for tensor " +
+                                 std::to_string(i) + ": " + e.what());
+                        continue;
+                    }
+                }
+
+                // Read the tensor data
+                if (!file.read(buffer.data(), length)) {
+                    log(ERROR, "Failed to read data for tensor " + std::to_string(i));
+                    continue;
+                }
+
+                // Deserialize and copy directly to shared memory
+                torch::Tensor tensor;
+                try {
+                    tensor = load_tensor_from_memory(buffer.data(), length);
+                } catch (const std::exception& e) {
+                    log(ERROR, "Failed to deserialize tensor " + std::to_string(i) +
+                             ": " + e.what());
+                    continue;
+                }
+
+                if (tensor.defined()) {
+                    if (!tensor.is_contiguous()) {
+                        tensor = tensor.contiguous();
+                    }
+
+                    // Verify tensor size matches expected size
+                    size_t actual_size = tensor.nbytes();
+                    if (actual_size != tensor_sizes[i]) {
+                        log(WARNING, "Tensor size mismatch for tensor " + std::to_string(i) +
+                                   ": expected=" + std::to_string(tensor_sizes[i]) +
+                                   ", actual=" + std::to_string(actual_size));
+
+                        // Use the larger of the two sizes
+                        tensor_sizes[i] = std::max(tensor_sizes[i], actual_size);
+                    }
+
+                    // Check if we have enough space left
+                    if (current_offset + tensor_sizes[i] <= total_tensor_size) {
+                        // Copy to shared memory
+                        memcpy(static_cast<char*>(tensor_data) + current_offset,
+                               tensor.data_ptr(),
+                               tensor_sizes[i]);
+
+                        // Update metadata
+                        tensor_metadata[i].is_preloaded = true;
+
+                        // Move pointer
+                        current_offset += tensor_sizes[i];
+                        success_count++;
+                    } else {
+                        log(ERROR, "Not enough shared memory for tensor " + std::to_string(i));
+                    }
+
+                    // Free memory explicitly
+                    tensor = torch::Tensor();
+                }
+
+                // Log progress periodically
+                if (i % 10 == 0 || i == tensor_count - 1) {
+                    log(INFO, "Second pass progress: " + std::to_string(i+1) + "/" +
+                             std::to_string(tensor_count) + " tensors");
+                }
+
+            } catch (const std::exception& e) {
+                log(ERROR, "Exception processing tensor " + std::to_string(i) +
+                         " in second pass: " + e.what());
             }
-
-            size_t tensor_size = tensor_sizes[i];
-            if (tensor_size == 0) {
-                continue;
-            }
-
-            // Copy to shared memory
-            memcpy(static_cast<char*>(tensor_data) + current_offset,
-                   tensor.data_ptr(),
-                   tensor_size);
-
-            // Update metadata with the offset in shared memory
-            tensor_metadata[i].is_preloaded = true;
-
-            // Move to next position in shared memory
-            current_offset += tensor_size;
-            success_count++;
         }
 
-        // Update statistics
+        // Update final metadata
         file_metadata->preloaded_count = success_count;
-        g_stats.preloaded_count += success_count;
-        g_stats.total_memory += total_tensor_size;
+        file_metadata->tensor_data_size = current_offset;
 
-        auto copy_end = std::chrono::high_resolution_clock::now();
-        auto copy_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            copy_end - copy_start
-        ).count();
+        // Update global stats
+        g_stats.preloaded_count += success_count;
+        g_stats.total_memory += current_offset;
 
         // Clean up
+        file.close();
         shmdt(shmaddr);
         shmdt(tensor_data);
 
-        auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            copy_end - start_time
-        ).count();
-
         log(INFO, "Successfully preloaded " + std::to_string(success_count) +
                  " of " + std::to_string(tensor_count) + " tensors from " + filepath +
-                 " (" + std::to_string(total_tensor_size / (1024 * 1024)) + "MB) " +
-                 "in " + std::to_string(total_duration) + "ms");
+                 " (" + std::to_string(current_offset / (1024 * 1024)) + "MB)");
 
-        return true;
+        return success_count > 0;
 
     } catch (const std::exception& e) {
         log(ERROR, "Error preloading tensors from " + filepath + ": " + e.what());
