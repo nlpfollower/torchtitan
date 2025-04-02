@@ -9,15 +9,34 @@ if os.name == 'nt':
     extra_compile_args = ['/std:c++17']
 
 setup(
-    name='fast_tensor_loader',
+    name='tensor_loading_extensions',
     version='0.1.0',
-    description='Fast tensor loading extension using PyTorch C++ API',
+    description='Fast tensor loading and preloading extensions using PyTorch C++ API',
     author='Your Name',
     author_email='your.email@example.com',
     ext_modules=[
+        # Fast tensor loader
         cpp_extension.CppExtension(
             name='fast_tensor_loader',
-            sources=['fast_tensor_loader.cpp'],
+            sources=[
+                'tensor_common.cpp',
+                'thread_pool.cpp',
+                'memory_mapped_file.cpp',
+                'shared_memory.cpp',
+                'fast_tensor_loader.cpp'
+            ],
+            extra_compile_args=extra_compile_args,
+        ),
+        # Tensor preloader extension
+        cpp_extension.CppExtension(
+            name='tensor_preloader',
+            sources=[
+                'tensor_common.cpp',
+                'thread_pool.cpp',
+                'memory_mapped_file.cpp',
+                'shared_memory.cpp',
+                'tensor_preloader.cpp'
+            ],
             extra_compile_args=extra_compile_args,
         ),
     ],
