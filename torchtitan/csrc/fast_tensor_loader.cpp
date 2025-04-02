@@ -7,6 +7,29 @@
 #include <sstream>
 #include <unistd.h>
 
+// Function to narrow tensor according to offsets and lengths
+torch::Tensor narrow_tensor_by_index(
+    torch::Tensor tensor,
+    const std::vector<int64_t>& offsets,
+    const std::vector<int64_t>& sizes
+) {
+    torch::Tensor narrowed_tensor = tensor;
+
+    // Make sure we have valid offsets and sizes
+    if (offsets.size() != sizes.size()) {
+        throw std::runtime_error("Offsets and sizes must have the same length");
+    }
+
+    // Apply narrowing for each dimension where size is smaller than tensor size
+    for (size_t idx = 0; idx < offsets.size() && idx < tensor.dim(); idx++) {
+        if (sizes[idx] < tensor.size(idx)) {
+            narrowed_tensor = narrowed_tensor.narrow(idx, offsets[idx], sizes[idx]);
+        }
+    }
+
+    return narrowed_tensor;
+}
+
 // SharedMemoryAccess implementation
 SharedMemoryAccess::SharedMemoryAccess(const std::string& path)
     : filepath(path),
@@ -204,7 +227,6 @@ bool load_and_copy_tensors_parallel(
     }
 
     // Worker function that processes tensors
-    auto loop_start_time = std::chrono::high_resolution_clock::now();
     auto process_tensors = [&](int thread_id) {
         // Get thread ID for logging
         std::stringstream ss;
@@ -261,6 +283,16 @@ bool load_and_copy_tensors_parallel(
 
                 // Get preloaded tensor
                 torch::Tensor cpu_tensor = shm_access->get_preloaded_tensor(req.offset);
+
+                // Apply narrowing based on tensor_offsets and tensor_lengths
+                if (!req.tensor_offsets.empty() && !req.tensor_lengths.empty()) {
+                    try {
+                        cpu_tensor = narrow_tensor_by_index(cpu_tensor, req.tensor_offsets, req.tensor_lengths);
+                    } catch (const std::exception& e) {
+                        throw std::runtime_error("Failed to narrow tensor: " + std::string(e.what()));
+                    }
+                }
+
                 thread_preloaded++;
 
                 stage_end = std::chrono::high_resolution_clock::now();
@@ -269,12 +301,22 @@ bool load_and_copy_tensors_parallel(
                 ).count();
                 thread_tensor_load += tensor_load_ms;
 
-                // Verify tensor sizes match
+                // Verify tensor sizes match after narrowing
                 if (cpu_tensor.sizes() != req.destination_tensor.sizes()) {
-                    throw std::runtime_error("Size mismatch for tensor: source " +
-                                          std::to_string(cpu_tensor.numel()) +
-                                          " vs destination " +
-                                          std::to_string(req.destination_tensor.numel()));
+                    std::stringstream ss;
+                    ss << "Size mismatch for tensor: source [";
+                    for (int i = 0; i < cpu_tensor.dim(); i++) {
+                        ss << cpu_tensor.size(i);
+                        if (i < cpu_tensor.dim() - 1) ss << ", ";
+                    }
+                    ss << "] vs destination [";
+                    for (int i = 0; i < req.destination_tensor.dim(); i++) {
+                        ss << req.destination_tensor.size(i);
+                        if (i < req.destination_tensor.dim() - 1) ss << ", ";
+                    }
+                    ss << "]";
+
+                    throw std::runtime_error(ss.str());
                 }
 
                 // STAGE 3: Copy the tensor to its destination
@@ -351,7 +393,7 @@ bool load_and_copy_tensors_parallel(
 
             // Log thread stats periodically
             if (processed_count >= 500) { // Every 500 tensors
-                log(INFO, rank_prefix + "[PRELOADER][INFO] Thread " + thread_id_str + " processed 500 tensors - " +
+                log(DEBUG, rank_prefix + "[PRELOADER][INFO] Thread " + thread_id_str + " processed 500 tensors - " +
                           "avg times: data_access=" + std::to_string(thread_data_access/processed_count) + "ms, " +
                           "tensor_load=" + std::to_string(thread_tensor_load/processed_count) + "ms, " +
                           "tensor_copy=" + std::to_string(thread_tensor_copy/processed_count) + "ms");
@@ -392,16 +434,6 @@ bool load_and_copy_tensors_parallel(
     for (auto& thread : threads) {
         thread.join();
     }
-
-    auto loop_end_time = std::chrono::high_resolution_clock::now();
-    auto total_loop_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        loop_end_time - loop_start_time
-    ).count();
-
-    // Detailed timing information for debugging performance
-    // Log every tensor for more detailed analysis
-    log(INFO, "[LOOP] Tensor total=" + std::to_string(total_loop_duration) + "ms");
-
 
     // For CUDA devices, synchronize to ensure all copies are complete
     for (int device_idx : cuda_devices) {
