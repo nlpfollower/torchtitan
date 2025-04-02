@@ -144,7 +144,8 @@ bool SharedMemoryAccess::has_tensors() const {
 // Function that loads and copies tensors directly to their destination
 bool load_and_copy_tensors_parallel(
     std::vector<TensorCopyRequest>& requests,
-    int num_threads
+    int num_threads = -1,
+    int streams_per_device = 4
 ) {
     // Determine thread count
     if (num_threads <= 0) {
@@ -172,7 +173,6 @@ bool load_and_copy_tensors_parallel(
 
     // Create streams for each CUDA device
     std::map<int, std::vector<c10::cuda::CUDAStream>> device_streams;
-    int streams_per_device = 4;  // Creating multiple streams per device
 
     // Find all unique CUDA devices
     std::set<int> cuda_devices;
@@ -204,11 +204,14 @@ bool load_and_copy_tensors_parallel(
     }
 
     // Worker function that processes tensors
+    auto loop_start_time = std::chrono::high_resolution_clock::now();
     auto process_tensors = [&](int thread_id) {
         // Get thread ID for logging
         std::stringstream ss;
         ss << std::this_thread::get_id();
         std::string thread_id_str = ss.str();
+
+        std::string rank_prefix = "rank" + std::to_string(thread_id) + "]:";
 
         // Thread local timing accumulators
         double thread_data_access = 0.0;
@@ -295,17 +298,17 @@ bool load_and_copy_tensors_parallel(
 
                         // Set this stream as current and do a non-blocking copy
                         c10::cuda::setCurrentCUDAStream(stream);
+                        cpu_tensor = cpu_tensor.pin_memory();
                         req.destination_tensor.copy_(cpu_tensor, /*non_blocking=*/true);
 
                         // Restore previous device
                         c10::cuda::set_device(prev_device);
                     } else {
-                        // Fallback to regular copy
-                        req.destination_tensor.copy_(cpu_tensor);
+                        throw std::runtime_error("CUDA streams not available for device " + std::to_string(device_idx));
                     }
                 } else {
                     // For CPU tensors, just do a regular copy
-                    req.destination_tensor.copy_(cpu_tensor);
+                    throw std::runtime_error("CPU tensor copy not implemented yet");
                 }
 
                 stage_end = std::chrono::high_resolution_clock::now();
@@ -322,23 +325,33 @@ bool load_and_copy_tensors_parallel(
                     end_time - start_time
                 ).count();
 
-                // Detailed timing information for debugging performance
-                if (idx % 100 == 0) { // Log every 100th tensor for less noise
-                    log(INFO, "Tensor " + std::to_string(idx) + " timing: " +
-                             "data_access=" + std::to_string(data_access_ms) + "ms, " +
-                             "tensor_load=" + std::to_string(tensor_load_ms) + "ms, " +
-                             "tensor_copy=" + std::to_string(tensor_copy_ms) + "ms, " +
-                             "total=" + std::to_string(total_duration) + "ms");
+                // Calculate tensor size in MB for transfer rate
+                double tensor_size_mb = (cpu_tensor.nbytes() / (1024.0 * 1024.0));
+
+                // Calculate transfer rate in MB/s
+                double transfer_rate_mbps = 0.0;
+                if (tensor_copy_ms > 0) {
+                    transfer_rate_mbps = tensor_size_mb / (tensor_copy_ms / 1000.0);
                 }
+
+                // Detailed timing information for debugging performance
+                // Log every tensor for more detailed analysis
+                log(DEBUG, rank_prefix + "[PRELOADER][INFO] Tensor " + std::to_string(idx) +
+                         " (size=" + std::to_string(tensor_size_mb) + " MB) timing: " +
+                         "data_access=" + std::to_string(data_access_ms) + "ms, " +
+                         "tensor_load=" + std::to_string(tensor_load_ms) + "ms, " +
+                         "tensor_copy=" + std::to_string(tensor_copy_ms) + "ms " +
+                         "(rate=" + std::to_string(transfer_rate_mbps) + " MB/s), " +
+                         "total=" + std::to_string(total_duration) + "ms");
             } catch (const std::exception& e) {
-                log(ERROR, "Thread " + thread_id_str + " error processing file " +
+                log(ERROR, rank_prefix + "[PRELOADER][ERROR] Thread " + thread_id_str + " error processing file " +
                           req.filepath + " at index " + std::to_string(idx) +
                           ": " + e.what());
             }
 
             // Log thread stats periodically
             if (processed_count >= 500) { // Every 500 tensors
-                log(INFO, "Thread " + thread_id_str + " processed 500 tensors - " +
+                log(INFO, rank_prefix + "[PRELOADER][INFO] Thread " + thread_id_str + " processed 500 tensors - " +
                           "avg times: data_access=" + std::to_string(thread_data_access/processed_count) + "ms, " +
                           "tensor_load=" + std::to_string(thread_tensor_load/processed_count) + "ms, " +
                           "tensor_copy=" + std::to_string(thread_tensor_copy/processed_count) + "ms");
@@ -380,6 +393,16 @@ bool load_and_copy_tensors_parallel(
         thread.join();
     }
 
+    auto loop_end_time = std::chrono::high_resolution_clock::now();
+    auto total_loop_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        loop_end_time - loop_start_time
+    ).count();
+
+    // Detailed timing information for debugging performance
+    // Log every tensor for more detailed analysis
+    log(INFO, "[LOOP] Tensor total=" + std::to_string(total_loop_duration) + "ms");
+
+
     // For CUDA devices, synchronize to ensure all copies are complete
     for (int device_idx : cuda_devices) {
         // Store current device
@@ -396,7 +419,6 @@ bool load_and_copy_tensors_parallel(
     }
 
     // Calculate averages
-    // Calculate averages
     double avg_data_access = 0.0, avg_tensor_load = 0.0, avg_tensor_copy = 0.0;
     size_t success_count_value = success_count.load();
     if (success_count_value > 0) {
@@ -406,28 +428,28 @@ bool load_and_copy_tensors_parallel(
     }
 
     // Report detailed completion stats
-    log(INFO, "Completed processing " + std::to_string(success_count_value) +
+    log(DEBUG, "[PRELOADER][SUMMARY] Completed processing " + std::to_string(success_count_value) +
              " out of " + std::to_string(request_count) + " tensors");
 
     // Report preloaded tensors count
-    log(INFO, "Preloaded tensors used: " + std::to_string(preloaded_count.load()));
+    log(DEBUG, "[PRELOADER][SUMMARY] Preloaded tensors used: " + std::to_string(preloaded_count.load()));
 
-    log(INFO, "Performance breakdown (average time per tensor):");
-    log(INFO, "  Data access:   " + std::to_string(avg_data_access) + "ms (" +
+    log(DEBUG, "[PRELOADER][SUMMARY] Performance breakdown (average time per tensor):");
+    log(DEBUG, "[PRELOADER][SUMMARY]   Data access:   " + std::to_string(avg_data_access) + "ms (" +
              std::to_string((avg_data_access / (avg_data_access + avg_tensor_load + avg_tensor_copy)) * 100) + "%)");
-    log(INFO, "  Tensor load:   " + std::to_string(avg_tensor_load) + "ms (" +
+    log(DEBUG, "[PRELOADER][SUMMARY]   Tensor load:   " + std::to_string(avg_tensor_load) + "ms (" +
              std::to_string((avg_tensor_load / (avg_data_access + avg_tensor_load + avg_tensor_copy)) * 100) + "%)");
-    log(INFO, "  Tensor copy:   " + std::to_string(avg_tensor_copy) + "ms (" +
+    log(DEBUG, "[PRELOADER][SUMMARY]   Tensor copy:   " + std::to_string(avg_tensor_copy) + "ms (" +
              std::to_string((avg_tensor_copy / (avg_data_access + avg_tensor_load + avg_tensor_copy)) * 100) + "%)");
-    log(INFO, "  Total:         " + std::to_string(avg_data_access + avg_tensor_load + avg_tensor_copy) + "ms");
+    log(DEBUG, "[PRELOADER][SUMMARY]   Total:         " + std::to_string(avg_data_access + avg_tensor_load + avg_tensor_copy) + "ms");
 
     double total_time = total_data_access_time + total_tensor_load_time + total_tensor_copy_time;
-    log(INFO, "Total time breakdown:");
-    log(INFO, "  Data access:   " + std::to_string(total_data_access_time) + "ms (" +
+    log(DEBUG, "[PRELOADER][SUMMARY] Total time breakdown:");
+    log(DEBUG, "[PRELOADER][SUMMARY]   Data access:   " + std::to_string(total_data_access_time) + "ms (" +
              std::to_string((total_data_access_time / total_time) * 100) + "%)");
-    log(INFO, "  Tensor load:   " + std::to_string(total_tensor_load_time) + "ms (" +
+    log(DEBUG, "[PRELOADER][SUMMARY]   Tensor load:   " + std::to_string(total_tensor_load_time) + "ms (" +
              std::to_string((total_tensor_load_time / total_time) * 100) + "%)");
-    log(INFO, "  Tensor copy:   " + std::to_string(total_tensor_copy_time) + "ms (" +
+    log(DEBUG, "[PRELOADER][SUMMARY]   Tensor copy:   " + std::to_string(total_tensor_copy_time) + "ms (" +
              std::to_string((total_tensor_copy_time / total_time) * 100) + "%)");
 
     return success_count_value == request_count;
@@ -454,10 +476,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("tensor_lengths", &TensorCopyRequest::tensor_lengths)
         .def_readwrite("destination_tensor", &TensorCopyRequest::destination_tensor);
 
-    m.def("load_and_copy_tensors_parallel", &load_and_copy_tensors_parallel,
-        "Load and directly copy multiple tensors to their destinations in parallel",
-        py::arg("requests"),
-        py::arg("num_threads") = -1);
+    m.def("load_and_copy_tensors_parallel",
+      static_cast<bool (*)(std::vector<TensorCopyRequest>&, int, int)>(&load_and_copy_tensors_parallel),
+      "Load and directly copy multiple tensors to their destinations in parallel",
+      py::arg("requests"),
+      py::arg("num_threads") = -1,
+      py::arg("streams_per_device") = 4);
 
     // Expose the set_log_level function
     m.def("set_log_level", &set_log_level,

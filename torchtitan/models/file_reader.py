@@ -49,6 +49,7 @@ class OptimizedFileSystemReader(StorageReader):
             path: Union[str, os.PathLike],
             _extension_registry: Optional[ExtensionRegistry] = None,
             num_threads: int = 0,  # 0 means use system default thread count
+            cuda_streams: int = 4,
     ) -> None:
         super().__init__()
         self.fs = FileSystem()
@@ -67,6 +68,7 @@ class OptimizedFileSystemReader(StorageReader):
             num_threads = multiprocessing.cpu_count()
 
         self.num_threads = num_threads
+        self.cuda_streams = cuda_streams
 
         # Ensure FAST_LOADER_AVAILABLE is True
         if not FAST_LOADER_AVAILABLE:
@@ -165,7 +167,7 @@ class OptimizedFileSystemReader(StorageReader):
         # Process all tensors in parallel using shared memory with direct copy
         loading_start = time.time()
         success = fast_tensor_loader.load_and_copy_tensors_parallel(
-            batch_requests, self.num_threads
+            batch_requests, self.num_threads, self.cuda_streams
         )
         loading_time = time.time() - loading_start
 

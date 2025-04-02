@@ -465,7 +465,7 @@ class CheckpointManager:
         dcp.load(
             states_to_load,
             checkpoint_id=checkpoint_id,
-            storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16),
+            storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
         )
         states.update(states_to_load)
         logger.info(
