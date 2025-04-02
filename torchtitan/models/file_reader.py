@@ -1,15 +1,14 @@
 import os
 import time
-import io
 import logging
-from typing import Union, Optional, IO, cast, List, Dict, Any
+from typing import Union, Optional, List, Dict
 
 from torch.distributed.checkpoint import StorageReader
 from torch.distributed.checkpoint._extension import ExtensionRegistry
 from torch.distributed.checkpoint.filesystem import FileSystem, _StorageInfo, _generate_uuid, _StorageReaderTransforms
 from torch.distributed.checkpoint.metadata import MetadataIndex
 import torch
-from torch import Tensor, Future
+from torch import Future
 import pickle
 from torch.distributed.checkpoint.planner import LoadPlan, LoadPlanner, LoadItemType, ReadItem
 from torch.distributed.checkpoint.metadata import Metadata, StorageMeta
@@ -50,7 +49,6 @@ class OptimizedFileSystemReader(StorageReader):
             path: Union[str, os.PathLike],
             _extension_registry: Optional[ExtensionRegistry] = None,
             num_threads: int = 0,  # 0 means use system default thread count
-            batch_size: int = 200,  # Process tensors in batches to control memory usage
     ) -> None:
         super().__init__()
         self.fs = FileSystem()
@@ -69,14 +67,12 @@ class OptimizedFileSystemReader(StorageReader):
             num_threads = multiprocessing.cpu_count()
 
         self.num_threads = num_threads
-        self.batch_size = batch_size
 
         # Ensure FAST_LOADER_AVAILABLE is True
         if not FAST_LOADER_AVAILABLE:
             raise RuntimeError("fast_tensor_loader with direct GPU copy is required but not available")
 
-        logger.info(
-            f"Initialized optimized file reader with {self.num_threads} threads and batch_size={self.batch_size}")
+        logger.info(f"Initialized optimized file reader with {self.num_threads} threads")
 
     def reset(self, checkpoint_id: Union[str, os.PathLike, None] = None) -> None:
         """Reset the reader state, optionally changing the checkpoint path."""
@@ -103,7 +99,7 @@ class OptimizedFileSystemReader(StorageReader):
         if len(byte_io_items) > 0:
             raise ValueError("Byte IO items are not supported in this optimized reader")
 
-        # Process tensor items in parallel using shared memory with direct device copy
+        # Process all tensor items in parallel using shared memory with direct device copy
         tensor_start = time.time()
         self._process_tensor_items_direct_copy(tensor_items, planner)
         tensor_time = time.time() - tensor_start
@@ -139,9 +135,8 @@ class OptimizedFileSystemReader(StorageReader):
 
         # Prepare requests for all files
         all_requests = []
-        for filepath, item_group in enumerate(file_groups.items()):
-            filepath, items_metadata = item_group
-            for item, item_md in items_metadata:
+        for filepath, item_group in file_groups.items():
+            for item, item_md in item_group:
                 try:
                     # Get the destination tensor first - this is the target for the copy
                     destination_tensor = planner.resolve_tensor(item).detach()
@@ -160,43 +155,39 @@ class OptimizedFileSystemReader(StorageReader):
                 except Exception as e:
                     logger.error(f"Error preparing tensor request: {e}")
 
-        # Process in batches to control memory usage
         total_requests = len(all_requests)
-        logger.info(f"Processing {total_requests} tensor requests in batches of {self.batch_size}")
+        logger.info(f"Processing {total_requests} tensor requests all at once")
 
-        start_idx = 0
-        while start_idx < total_requests:
-            end_idx = min(start_idx + self.batch_size, total_requests)
-            batch = all_requests[start_idx:end_idx]
+        # Extract just the request objects and commit items
+        batch_requests = [req for req, _ in all_requests]
+        batch_items = [item for _, item in all_requests]
 
-            logger.info(f"Processing batch {start_idx}-{end_idx} of {total_requests}")
-            batch_start_time = time.time()
+        # Process all tensors in parallel using shared memory with direct copy
+        loading_start = time.time()
+        success = fast_tensor_loader.load_and_copy_tensors_parallel(
+            batch_requests, self.num_threads
+        )
+        loading_time = time.time() - loading_start
 
-            # Extract just the request objects and commit items for this batch
-            batch_requests = [req for req, _ in batch]
-            batch_items = [item for _, item in batch]
+        # Log detailed timing information
+        logger.info(f"fast_tensor_loader processing completed in {loading_time:.6f}s "
+                   f"({total_requests / loading_time:.1f} tensors/sec)")
 
-            # Process all tensors in parallel using shared memory with direct copy
-            success = fast_tensor_loader.load_and_copy_tensors_parallel(
-                batch_requests, self.num_threads
-            )
+        # No need to call copy_ since it's already done in C++
+        # Just notify the planner that the tensors are ready
+        commit_start = time.time()
+        for i, item in enumerate(batch_items):
+            try:
+                # Get the destination tensor again
+                destination_tensor = planner.resolve_tensor(item).detach()
 
-            # No need to call copy_ since it's already done in C++
-            # Just notify the planner that the tensors are ready
-            for i, item in enumerate(batch_items):
-                try:
-                    # Get the destination tensor again
-                    destination_tensor = planner.resolve_tensor(item).detach()
+                # Commit the tensor (doesn't actually copy again, just updates planner state)
+                planner.commit_tensor(item, destination_tensor)
+            except Exception as e:
+                logger.error(f"Error committing tensor: {e}")
+        commit_time = time.time() - commit_start
 
-                    # Commit the tensor (doesn't actually copy again, just updates planner state)
-                    planner.commit_tensor(item, destination_tensor)
-                except Exception as e:
-                    logger.error(f"Error committing tensor: {e}")
-
-            batch_time = time.time() - batch_start_time
-            logger.info(f"Batch processed in {batch_time:.6f}s ({(end_idx - start_idx) / batch_time:.1f} tensors/sec)")
-
-            start_idx = end_idx
+        logger.info(f"Planner commit completed in {commit_time:.6f}s")
 
     # Implementing the abstract functions in StorageReader
     def read_metadata(self) -> Metadata:
