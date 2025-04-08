@@ -1,6 +1,7 @@
 """
-Checkpoint Preloader - Python module to extract tensor metadata from checkpoints
-and pass it to C++ extension for preloading into shared memory.
+Checkpoint Preloader - Python module to:
+1. Extract tensor metadata from checkpoints
+2. Preload tensors into shared memory
 """
 import os
 import pickle
@@ -9,7 +10,8 @@ import time
 import sys
 import signal
 import atexit
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
+import torch
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -19,7 +21,7 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Import C++ extension for tensor preloading
+# Import C++ extensions
 try:
     import tensor_preloader
     PRELOADER_EXT_AVAILABLE = True
@@ -29,8 +31,8 @@ except ImportError:
     logger.error("tensor_preloader_ext not available! Cannot preload tensors.")
 
 
-def cleanup_shared_memory():
-    """Clean up shared memory segments when the program exits"""
+def cleanup_resources():
+    """Clean up resources when the program exits"""
     if PRELOADER_EXT_AVAILABLE:
         try:
             logger.info("Cleaning up shared memory segments...")
@@ -41,13 +43,13 @@ def cleanup_shared_memory():
 
 
 # Register cleanup function for normal termination
-atexit.register(cleanup_shared_memory)
+atexit.register(cleanup_resources)
 
 
 # Signal handler for graceful termination
 def signal_handler(sig, frame):
     logger.info(f"Received signal {sig}, cleaning up...")
-    cleanup_shared_memory()
+    cleanup_resources()
     sys.exit(0)
 
 
@@ -64,17 +66,7 @@ def extract_tensor_metadata(checkpoint_dir: str) -> List[Dict]:
         checkpoint_dir: Path to checkpoint directory
 
     Returns:
-        List of file entries with tensor information:
-        [
-            {
-                'filepath': str,
-                'tensors': [
-                    {'offset': int, 'length': int, 'key': str},
-                    ...
-                ]
-            },
-            ...
-        ]
+        List of file entries with tensor information
     """
     metadata_path = os.path.join(checkpoint_dir, ".metadata")
 
@@ -127,13 +119,24 @@ def extract_tensor_metadata(checkpoint_dir: str) -> List[Dict]:
         raise
 
 
-def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0) -> bool:
+def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0,
+                       rank: int = 0, world_size: int = 1,
+                       redis_host: str = "localhost", redis_port: int = 6379,
+                       run_id: str = None) -> bool:
     """
     Preload checkpoint tensors into shared memory.
+
+    In distributed mode (world_size > 1), the head node (rank 0) reads files
+    and broadcasts them to other nodes.
 
     Args:
         checkpoint_dir: Path to checkpoint directory
         num_threads: Number of threads for parallel loading (0 = auto)
+        rank: Node rank (0 = root/master)
+        world_size: Total number of nodes
+        redis_host: Redis server hostname/IP for coordination
+        redis_port: Redis server port
+        run_id: Unique run ID for coordination (auto-generated if None)
 
     Returns:
         True if successful, False otherwise
@@ -143,17 +146,28 @@ def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0) -> bool:
         return False
 
     try:
-        # First clean up any existing shared memory to prevent leaks/conflicts
-        cleanup_shared_memory()
+        import time
+        import uuid
 
         start_time = time.time()
+
+        # Generate a unique run ID if not provided and in distributed mode
+        if world_size > 1 and run_id is None:
+            run_id = str(uuid.uuid4())[:8]
+        elif run_id is None:
+            run_id = ""
+
+        # First clean up any existing shared memory to prevent leaks/conflicts
+        cleanup_resources()
 
         # Extract tensor metadata
         file_tensors = extract_tensor_metadata(checkpoint_dir)
 
-        # Pass to C++ extension for preloading
-        logger.info(f"Starting tensor preloading with C++ extension using {num_threads} threads")
-        success = tensor_preloader.preload_tensors(file_tensors, num_threads)
+        # Pass to C++ extension for preloading with optional distributed parameters
+        logger.info(f"Starting tensor preloading (rank {rank}/{world_size}) with C++ extension using {num_threads} threads")
+        success = tensor_preloader.preload_tensors(file_tensors, num_threads,
+                                                   rank, world_size,
+                                                   redis_host, redis_port, run_id)
 
         # Check result
         if success:
@@ -161,29 +175,45 @@ def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0) -> bool:
             stats = tensor_preloader.get_preload_stats()
 
             elapsed_time = time.time() - start_time
-            logger.info(f"Successfully preloaded {stats['preloaded_count']} of {stats['total_count']} "
-                       f"tensors ({stats['memory_gb']:.2f} GB) in {elapsed_time:.2f} seconds")
+            logger.info(f"[Rank {rank}] Successfully preloaded {stats['preloaded_count']} of {stats['total_count']} "
+                        f"tensors ({stats['memory_gb']:.2f} GB) in {elapsed_time:.2f} seconds")
             return True
         else:
-            logger.error("Failed to preload tensors")
+            logger.error(f"[Rank {rank}] Failed to preload tensors")
             return False
 
     except Exception as e:
-        logger.error(f"Error during checkpoint preloading: {e}")
+        logger.error(f"[Rank {rank}] Error during checkpoint preloading: {e}")
         return False
 
 
 if __name__ == "__main__":
-    # Simple CLI interface
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <checkpoint_directory> [num_threads]")
-        sys.exit(1)
+    import argparse
 
-    checkpoint_dir = sys.argv[1]
-    num_threads = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    cleanup_shared_memory()
+    parser = argparse.ArgumentParser(description="Checkpoint Preloader")
+    parser.add_argument("checkpoint_dir", type=str, help="Path to checkpoint directory")
+    parser.add_argument("--threads", type=int, default=4, help="Number of threads (0 = auto)")
+    parser.add_argument("--rank", type=int, default=0, help="Node rank (0 = root/master)")
+    parser.add_argument("--world-size", type=int, default=1, help="Total number of nodes")
+    parser.add_argument("--redis-host", type=str, default="localhost", help="Redis server hostname/IP")
+    parser.add_argument("--redis-port", type=int, default=6379, help="Redis server port")
+    parser.add_argument("--run-id", type=str, default=None, help="Unique run ID")
 
-    success = preload_checkpoint(checkpoint_dir, num_threads)
+    args = parser.parse_args()
+
+    # Clean up existing resources
+    cleanup_resources()
+
+    # Attempt to preload the checkpoint
+    success = preload_checkpoint(
+        args.checkpoint_dir,
+        args.threads,
+        args.rank,
+        args.world_size,
+        args.redis_host,
+        args.redis_port,
+        args.run_id
+    )
 
     if success:
         print("Preloading successful. Keeping process alive to maintain shared memory...")
@@ -192,7 +222,7 @@ if __name__ == "__main__":
                 time.sleep(1)
         except KeyboardInterrupt:
             print("Shutting down...")
-            cleanup_shared_memory()
+            cleanup_resources()
     else:
         print("Preloading failed!")
         sys.exit(1)

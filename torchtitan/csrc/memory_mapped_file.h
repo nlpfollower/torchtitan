@@ -1,3 +1,5 @@
+// Updated memory_mapped_file.h
+
 #pragma once
 
 #include <string>
@@ -7,20 +9,36 @@
 #include <sys/stat.h>
 #include "tensor_common.h"
 
+// Forward declaration
+class GlooFileBroadcaster;
+
 class MemoryMappedFile {
 public:
-    MemoryMappedFile(const std::string& path);
-    ~MemoryMappedFile();
-    
-    bool valid() const;
-    const char* data() const;
-    size_t size() const;
-    const char* get_tensor_data(size_t offset, size_t length) const;
-    
-private:
+    // Unified constructor - handles both local and broadcast modes
+    MemoryMappedFile(const std::string& path, GlooFileBroadcaster* broadcaster = nullptr);
+
+    // Virtual destructor for inheritance
+    virtual ~MemoryMappedFile();
+
+    // Interface methods
+    virtual bool valid() const;
+    virtual const char* data() const;
+    virtual size_t size() const;
+    virtual const char* get_tensor_data(size_t offset, size_t length) const;
+
+    // Check if file was loaded via broadcast
+    bool isBroadcastMode() const;
+
+    // Get broadcast performance (0 if not broadcast mode)
+    double getBroadcastBandwidthGBps() const;
+
+protected:
+    // Protected members
     int fd;
     void* mapped_data;
     size_t file_size;
     bool is_valid;
     std::string filepath;
+    double broadcast_bandwidth_gbps;
+    bool is_broadcast_mode;
 };

@@ -1,6 +1,7 @@
 #include "tensor_preloader.h"
 #include <chrono>
 #include <atomic>
+#include <stdexcept>
 
 // Global statistics
 struct PreloadStats {
@@ -21,7 +22,8 @@ inline void atomic_add_seconds(std::atomic<uint64_t>& counter, double seconds) {
 // Primary tensor loading function - broken into manageable steps
 bool preload_file_tensors(const std::string& filepath,
                         const std::vector<py::dict>& tensor_infos,
-                        int num_threads) {
+                        int num_threads,
+                        GlooFileBroadcaster* broadcaster = nullptr) {
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // 1. Initial setup and parameter extraction
@@ -42,10 +44,9 @@ bool preload_file_tensors(const std::string& filepath,
     SharedMemory::cleanup_file_segments(filepath);
 
     // 3. Memory map the file
-    MemoryMappedFile mapped_file(filepath);
+    MemoryMappedFile mapped_file(filepath, broadcaster);
     if (!mapped_file.valid()) {
-        log(ERROR, "Failed to memory map file: " + filepath);
-        return false;
+        throw std::runtime_error("Failed to memory map file: " + filepath);
     }
 
     // 4. Determine thread count and initial shared memory size
@@ -71,15 +72,13 @@ bool preload_file_tensors(const std::string& filepath,
     int tensor_meta_shmid = SharedMemory::create_segment(tensor_meta_key, metadata_size);
 
     if (tensor_meta_shmid == -1) {
-        log(ERROR, "Failed to create tensor metadata shared memory");
-        return false;
+        throw std::runtime_error("Failed to create tensor metadata shared memory");
     }
 
     // 7. Attach to tensor metadata segment
     void* shmaddr = SharedMemory::attach_segment(tensor_meta_shmid);
     if (shmaddr == (void*)-1) {
-        log(ERROR, "Failed to attach to tensor metadata shared memory");
-        return false;
+        throw std::runtime_error("Failed to attach to tensor metadata shared memory");
     }
 
     // 8. Initialize metadata structures
@@ -113,18 +112,15 @@ bool preload_file_tensors(const std::string& filepath,
     int tensor_data_shmid = SharedMemory::create_segment(tensor_data_key, estimated_size, use_huge_pages);
 
     if (tensor_data_shmid == -1) {
-        log(ERROR, "Failed to create tensor data shared memory: " +
-                 std::to_string(errno));
         SharedMemory::detach_segment(shmaddr);
-        return false;
+        throw std::runtime_error("Failed to create tensor data shared memory: " + std::to_string(errno));
     }
 
     // 11. Attach to tensor data segment
     void* tensor_data = SharedMemory::attach_segment(tensor_data_shmid);
     if (tensor_data == (void*)-1) {
-        log(ERROR, "Failed to attach to tensor data shared memory");
         SharedMemory::detach_segment(shmaddr);
-        return false;
+        throw std::runtime_error("Failed to attach to tensor data shared memory");
     }
 
     // 12. Setup for single-pass loading
@@ -137,6 +133,8 @@ bool preload_file_tensors(const std::string& filepath,
     std::atomic<int> active_tasks(0);
     std::condition_variable completion_cv;
     std::mutex completion_mutex;
+    std::vector<std::exception_ptr> thread_exceptions;
+    std::mutex exceptions_mutex;
 
     // 13. Process tensors in a single pass
     std::vector<std::future<void>> futures;
@@ -155,8 +153,7 @@ bool preload_file_tensors(const std::string& filepath,
                 atomic_add_seconds(g_stats.read_time_ns, read_ms / 1000.0);
 
                 if (!tensor_data_ptr) {
-                    log(ERROR, "Failed to access tensor data for tensor " + std::to_string(i));
-                    return;
+                    throw std::runtime_error("Failed to access tensor data for tensor " + std::to_string(i));
                 }
 
                 // CONCURRENT PART: Deserialize the tensor
@@ -169,13 +166,11 @@ bool preload_file_tensors(const std::string& filepath,
                     if (ivalue.isTensor()) {
                         tensor = ivalue.toTensor().cpu();
                     } else {
-                        log(ERROR, "Deserialized data is not a tensor for tensor " + std::to_string(i));
-                        return;
+                        throw std::runtime_error("Deserialized data is not a tensor for tensor " + std::to_string(i));
                     }
                 } catch (const c10::Error& e) {
-                    log(ERROR, "PyTorch error deserializing tensor " + std::to_string(i) +
+                    throw std::runtime_error("PyTorch error deserializing tensor " + std::to_string(i) +
                             ": " + e.what());
-                    return;
                 }
 
                 auto deserialize_end = std::chrono::high_resolution_clock::now();
@@ -183,8 +178,7 @@ bool preload_file_tensors(const std::string& filepath,
                 atomic_add_seconds(g_stats.deserialize_time_ns, deserialize_ms / 1000.0);
 
                 if (!tensor.defined()) {
-                    log(ERROR, "Failed to create tensor from deserialized data for tensor " + std::to_string(i));
-                    return;
+                    throw std::runtime_error("Failed to create tensor from deserialized data for tensor " + std::to_string(i));
                 }
 
                 // Make sure tensor is contiguous
@@ -212,9 +206,8 @@ bool preload_file_tensors(const std::string& filepath,
                     // Check if we have enough space left
                     size_t required_offset = current_offset.load() + tensor_size;
                     if (required_offset > estimated_size) {
-                        log(ERROR, "Not enough shared memory for tensor " + std::to_string(i) +
+                        throw std::runtime_error("Not enough shared memory for tensor " + std::to_string(i) +
                                  ". Consider using a larger initial allocation.");
-                        return;
                     }
 
                     // Get current offset and increment atomically
@@ -239,6 +232,8 @@ bool preload_file_tensors(const std::string& filepath,
                     tensor_metadata[i].is_preloaded = true;
                     success_count.fetch_add(1);
                     task_succeeded = true;
+                } else {
+                    throw std::runtime_error("Tensor data pointer is null for tensor " + std::to_string(i));
                 }
 
                 auto copy_end = std::chrono::high_resolution_clock::now();
@@ -252,11 +247,10 @@ bool preload_file_tensors(const std::string& filepath,
                     log(WARNING, "Slow tensor processing for tensor " + std::to_string(i) +
                                ": " + std::to_string(task_ms) + "ms");
                 }
-            } catch (const std::exception& e) {
-                log(ERROR, "Exception in tensor processing thread for tensor " + std::to_string(i) +
-                         ": " + e.what());
             } catch (...) {
-                log(ERROR, "Unknown exception in tensor processing thread for tensor " + std::to_string(i));
+                // Capture the exception to be rethrown later
+                std::lock_guard<std::mutex> lock(exceptions_mutex);
+                thread_exceptions.push_back(std::current_exception());
             }
 
             // Notify that this task is complete
@@ -279,6 +273,19 @@ bool preload_file_tensors(const std::string& filepath,
     {
         std::unique_lock<std::mutex> lock(completion_mutex);
         completion_cv.wait(lock, [&]() { return active_tasks.load() == 0; });
+    }
+
+    // Check if any thread encountered an exception
+    {
+        std::lock_guard<std::mutex> lock(exceptions_mutex);
+        if (!thread_exceptions.empty()) {
+            // Clean up resources before throwing
+            SharedMemory::detach_segment(shmaddr);
+            SharedMemory::detach_segment(tensor_data);
+
+            // Rethrow the first exception
+            std::rethrow_exception(thread_exceptions[0]);
+        }
     }
 
     // Now safe to check results and clean up
@@ -306,87 +313,110 @@ bool preload_file_tensors(const std::string& filepath,
              std::to_string(elapsed_seconds) + " seconds (" +
              std::to_string(total_success > 0 ? total_success / elapsed_seconds : 0) + " tensors/sec)");
 
-    return total_success > 0;
+    if (total_success == 0) {
+        throw std::runtime_error("Failed to preload any tensors from " + filepath);
+    }
+
+    return true;
 }
 
 // Global preloader function for multiple files
-bool preload_tensors(py::list file_tensors, int num_threads) {
-    try {
-        auto start_time = std::chrono::high_resolution_clock::now();
+bool preload_tensors(py::list file_tensors, int num_threads,
+                    int rank = 0, int world_size = 1,
+                    const std::string& redis_host = "localhost",
+                    int redis_port = 6379,
+                    const std::string& run_id = "") {
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-        // Reset global statistics
-        g_stats.total_count = 0;
-        g_stats.preloaded_count = 0;
-        g_stats.total_memory = 0;
-        g_stats.read_time_ns = 0;
-        g_stats.deserialize_time_ns = 0;
-        g_stats.copy_time_ns = 0;
+    // Reset global statistics
+    g_stats.total_count = 0;
+    g_stats.preloaded_count = 0;
+    g_stats.total_memory = 0;
+    g_stats.read_time_ns = 0;
+    g_stats.deserialize_time_ns = 0;
+    g_stats.copy_time_ns = 0;
 
-        log(INFO, "Starting tensor preloading for " +
-                 std::to_string(file_tensors.size()) + " files");
+    log(INFO, "Starting tensor preloading for " +
+             std::to_string(file_tensors.size()) + " files");
 
-        // Process each file
-        for (auto& item : file_tensors) {
-            py::dict file_entry = py::cast<py::dict>(item);
-            std::string filepath = py::cast<std::string>(file_entry["filepath"]);
-            py::list tensors = py::cast<py::list>(file_entry["tensors"]);
+    std::vector<std::string> failed_files;
+    std::unique_ptr<GlooFileBroadcaster> broadcaster;
+    if (world_size > 1) {
+        log(INFO, "Initializing distributed mode with rank " + std::to_string(rank) +
+                 " of " + std::to_string(world_size));
 
-            // Convert tensors metadata to vector of dicts
-            std::vector<py::dict> tensor_infos;
-            for (auto& tensor_obj : tensors) {
-                tensor_infos.push_back(py::cast<py::dict>(tensor_obj));
-            }
+        broadcaster = std::make_unique<GlooFileBroadcaster>(
+            rank, world_size, redis_host, redis_port, run_id);
 
-            // Determine thread count for this file - scale based on tensor count
-            int file_threads = num_threads;
-            if (file_threads <= 0) {
-                file_threads = std::thread::hardware_concurrency();
-            }
-
-            // Limit threads for small files
-            int tensor_count = tensor_infos.size();
-            if (tensor_count < 100) {
-                file_threads = std::min(file_threads, std::max(1, tensor_count / 10));
-            }
-
-            // Preload tensors for this file
-            if (!preload_file_tensors(filepath, tensor_infos, file_threads)) {
-                log(WARNING, "Failed to preload tensors for " + filepath);
-                // Continue with next file
-            }
+        if (!broadcaster->initialize()) {
+            throw std::runtime_error("Failed to initialize GlooFileBroadcaster");
         }
-
-        auto end_time = std::chrono::high_resolution_clock::now();
-        double elapsed_seconds = std::chrono::duration<double>(end_time - start_time).count();
-
-        log(INFO, "Completed tensor preloading: " +
-                 std::to_string(g_stats.preloaded_count) + "/" +
-                 std::to_string(g_stats.total_count) + " tensors, " +
-                 std::to_string(g_stats.total_memory / (1024.0 * 1024.0 * 1024.0)) +
-                 "GB shared memory in " + std::to_string(elapsed_seconds) + " seconds");
-
-        // Performance breakdown
-        log(INFO, "Performance breakdown:");
-
-        double read_seconds = g_stats.read_time_ns.load() / 1e9;
-        double deserialize_seconds = g_stats.deserialize_time_ns.load() / 1e9;
-        double copy_seconds = g_stats.copy_time_ns.load() / 1e9;
-
-        log(INFO, "  Read time: " + std::to_string(read_seconds) + " seconds");
-        log(INFO, "  Deserialize time: " + std::to_string(deserialize_seconds) + " seconds");
-        log(INFO, "  Copy time: " + std::to_string(copy_seconds) + " seconds");
-
-        if (g_stats.preloaded_count > 0) {
-            double avg_tensor_time = elapsed_seconds / g_stats.preloaded_count;
-            log(INFO, "Average time per tensor: " + std::to_string(avg_tensor_time * 1000) + " ms");
-        }
-
-        return g_stats.preloaded_count > 0;
-
-    } catch (const std::exception& e) {
-        log(ERROR, "Error in preload_tensors: " + std::string(e.what()));
-        return false;
     }
+
+    // Process each file
+    for (auto& item : file_tensors) {
+        py::dict file_entry = py::cast<py::dict>(item);
+        std::string filepath = py::cast<std::string>(file_entry["filepath"]);
+        py::list tensors = py::cast<py::list>(file_entry["tensors"]);
+
+        // Convert tensors metadata to vector of dicts
+        std::vector<py::dict> tensor_infos;
+        for (auto& tensor_obj : tensors) {
+            tensor_infos.push_back(py::cast<py::dict>(tensor_obj));
+        }
+
+        // Determine thread count for this file - scale based on tensor count
+        int file_threads = num_threads;
+        if (file_threads <= 0) {
+            file_threads = std::thread::hardware_concurrency();
+        }
+
+        // Limit threads for small files
+        int tensor_count = tensor_infos.size();
+        if (tensor_count < 100) {
+            file_threads = std::min(file_threads, std::max(1, tensor_count / 10));
+        }
+
+        // Preload tensors for this file
+        try {
+            preload_file_tensors(filepath, tensor_infos, file_threads, broadcaster.get());
+        } catch (const std::exception& e) {
+            // Collect the failed file and propagate the exception
+            failed_files.push_back(filepath);
+            throw std::runtime_error("Failed to preload tensors for " + filepath + ": " + e.what());
+        }
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double elapsed_seconds = std::chrono::duration<double>(end_time - start_time).count();
+
+    log(INFO, "Completed tensor preloading: " +
+             std::to_string(g_stats.preloaded_count) + "/" +
+             std::to_string(g_stats.total_count) + " tensors, " +
+             std::to_string(g_stats.total_memory / (1024.0 * 1024.0 * 1024.0)) +
+             "GB shared memory in " + std::to_string(elapsed_seconds) + " seconds");
+
+    // Performance breakdown
+    log(INFO, "Performance breakdown:");
+
+    double read_seconds = g_stats.read_time_ns.load() / 1e9;
+    double deserialize_seconds = g_stats.deserialize_time_ns.load() / 1e9;
+    double copy_seconds = g_stats.copy_time_ns.load() / 1e9;
+
+    log(INFO, "  Read time: " + std::to_string(read_seconds) + " seconds");
+    log(INFO, "  Deserialize time: " + std::to_string(deserialize_seconds) + " seconds");
+    log(INFO, "  Copy time: " + std::to_string(copy_seconds) + " seconds");
+
+    if (g_stats.preloaded_count > 0) {
+        double avg_tensor_time = elapsed_seconds / g_stats.preloaded_count;
+        log(INFO, "Average time per tensor: " + std::to_string(avg_tensor_time * 1000) + " ms");
+    }
+
+    if (g_stats.preloaded_count == 0) {
+        throw std::runtime_error("Failed to preload any tensors");
+    }
+
+    return true;
 }
 
 // Get preloading statistics as a Python dictionary
@@ -404,10 +434,23 @@ py::dict get_preload_stats() {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Main function to preload tensors
-    m.def("preload_tensors", &preload_tensors,
-          "Preload tensors from checkpoint files into shared memory",
+    m.def("preload_tensors",
+          [](py::list file_tensors, int num_threads,
+             int rank, int world_size,
+             const std::string& redis_host, int redis_port,
+             const std::string& run_id) {
+              return preload_tensors(file_tensors, num_threads,
+                                    rank, world_size,
+                                    redis_host, redis_port, run_id);
+          },
+          "Preload tensors from checkpoint files into shared memory with optional broadcast",
           py::arg("file_tensors"),
-          py::arg("num_threads") = 0);
+          py::arg("num_threads") = 0,
+          py::arg("rank") = 0,
+          py::arg("world_size") = 1,
+          py::arg("redis_host") = "localhost",
+          py::arg("redis_port") = 6379,
+          py::arg("run_id") = "");
 
     // Get preloading statistics
     m.def("get_preload_stats", &get_preload_stats,
