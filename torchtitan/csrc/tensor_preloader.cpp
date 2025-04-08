@@ -1,3 +1,4 @@
+#include "gloo_file_broadcast.h"
 #include "tensor_preloader.h"
 #include <chrono>
 #include <atomic>
@@ -23,7 +24,7 @@ inline void atomic_add_seconds(std::atomic<uint64_t>& counter, double seconds) {
 bool preload_file_tensors(const std::string& filepath,
                         const std::vector<py::dict>& tensor_infos,
                         int num_threads,
-                        GlooFileBroadcaster* broadcaster = nullptr) {
+                        GlooFileBroadcast* broadcaster = nullptr) {
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // 1. Initial setup and parameter extraction
@@ -340,16 +341,16 @@ bool preload_tensors(py::list file_tensors, int num_threads,
              std::to_string(file_tensors.size()) + " files");
 
     std::vector<std::string> failed_files;
-    std::unique_ptr<GlooFileBroadcaster> broadcaster;
+    std::unique_ptr<GlooFileBroadcast> broadcaster;
     if (world_size > 1) {
         log(INFO, "Initializing distributed mode with rank " + std::to_string(rank) +
                  " of " + std::to_string(world_size));
 
-        broadcaster = std::make_unique<GlooFileBroadcaster>(
+        broadcaster = std::make_unique<GlooFileBroadcast>(
             rank, world_size, redis_host, redis_port, run_id);
 
         if (!broadcaster->initialize()) {
-            throw std::runtime_error("Failed to initialize GlooFileBroadcaster");
+            throw std::runtime_error("Failed to initialize GlooFileBroadcast");
         }
     }
 

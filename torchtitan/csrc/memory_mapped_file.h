@@ -10,12 +10,12 @@
 #include "tensor_common.h"
 
 // Forward declaration
-class GlooFileBroadcaster;
+class GlooFileBroadcast;
 
 class MemoryMappedFile {
 public:
     // Unified constructor - handles both local and broadcast modes
-    MemoryMappedFile(const std::string& path, GlooFileBroadcaster* broadcaster = nullptr);
+    MemoryMappedFile(const std::string& path, GlooFileBroadcast* broadcaster = nullptr);
 
     // Virtual destructor for inheritance
     virtual ~MemoryMappedFile();

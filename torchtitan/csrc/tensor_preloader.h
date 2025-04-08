@@ -40,7 +40,7 @@ bool load_tensor_to_shared_memory(const char* tensor_data, size_t length,
 bool preload_file_tensors(const std::string& filepath,
                         const std::vector<py::dict>& tensor_infos,
                         int num_threads,
-                        GlooFileBroadcaster* broadcaster)
+                        GlooFileBroadcast* broadcaster);
 
 // Global preloader function
 bool preload_tensors(py::list file_tensors, int num_threads,

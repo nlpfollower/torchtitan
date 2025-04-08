@@ -1,4 +1,4 @@
-#include "gloo_file_broadcaster.h"
+#include "gloo_file_broadcast.h"
 
 #include <iostream>
 #include <memory>
@@ -28,47 +28,47 @@ std::string getCurrentTimestamp() {
 }
 
 // Constructor
-GlooFileBroadcaster::GlooFileBroadcaster(int rank, int worldSize,
+GlooFileBroadcast::GlooFileBroadcast(int rank, int worldSize,
                                          const std::string& redisHost, int redisPort,
                                          const std::string& runId)
-    : rank_(rank),
-      worldSize_(worldSize),
-      redisHost_(redisHost),
-      redisPort_(redisPort),
-      runId_(runId),
-      initialized_(false),
-      lastBroadcastDuration_(0),
-      lastBroadcastBandwidthGBs_(0.0)
+    : rank(rank),
+      worldSize(worldSize),
+      redisHost(redisHost),
+      redisPort(redisPort),
+      runId(runId),
+      initialized(false),
+      lastBroadcastDuration(0),
+      lastBroadcastBandwidthGBs(0.0)
 {
     // Set up the prefix for this run
-    prefix_ = "gloo_broadcast_" + runId;
+    prefix = "gloo_broadcast_" + runId;
 }
 
 // Destructor
-GlooFileBroadcaster::~GlooFileBroadcaster() {
-    if (initialized_) {
+GlooFileBroadcast::~GlooFileBroadcast() {
+    if (initialized) {
         destroy();
     }
 }
 
 // Initialize the broadcaster
-bool GlooFileBroadcaster::initialize() {
-    if (initialized_) {
+bool GlooFileBroadcast::initialize() {
+    if (initialized) {
         log("Already initialized");
         return true;
     }
 
-    log("Initializing with Redis host: " + redisHost_ + ", port: " + std::to_string(redisPort_));
+    log("Initializing with Redis host: " + redisHost + ", port: " + std::to_string(redisPort));
 
     try {
         // Create Redis store for rendezvous
-        auto redisStore = std::make_shared<gloo::rendezvous::RedisStore>(redisHost_, redisPort_);
-        store_ = std::make_shared<gloo::rendezvous::PrefixStore>(prefix_, redisStore);
+        auto redisStore = std::make_shared<gloo::rendezvous::RedisStore>(redisHost, redisPort);
+        store = std::make_shared<gloo::rendezvous::PrefixStore>(prefix, redisStore);
 
         // If rank 0, clean up any existing keys with this prefix
-        if (rank_ == 0) {
+        if (rank == 0) {
             log("Initializing Redis store");
-            store_->set("cleanup_complete", stringToVector("done"));
+            store->set("cleanup_complete", stringToVector("done"));
         }
 
         // Simple barrier using the store to synchronize initialization
@@ -78,8 +78,8 @@ bool GlooFileBroadcaster::initialize() {
         }
 
         // Discover available network interfaces
-        usableInterfaces_ = discoverNetworkInterfaces();
-        if (usableInterfaces_.empty()) {
+        usableInterfaces = discoverNetworkInterfaces();
+        if (usableInterfaces.empty()) {
             log("No usable network interfaces found");
             return false;
         }
@@ -102,8 +102,8 @@ bool GlooFileBroadcaster::initialize() {
             return false;
         }
 
-        initialized_ = true;
-        log("Initialization complete with " + std::to_string(contexts_.size()) + " active interfaces");
+        initialized = true;
+        log("Initialization complete with " + std::to_string(contexts.size()) + " active interfaces");
         return true;
     }
     catch (const std::exception& e) {
@@ -113,23 +113,23 @@ bool GlooFileBroadcaster::initialize() {
 }
 
 // Clean up resources
-void GlooFileBroadcaster::destroy() {
-    if (!initialized_) return;
+void GlooFileBroadcast::destroy() {
+    if (!initialized) return;
 
     log("Cleaning up resources");
 
     // Clear contexts
-    contexts_.clear();
+    contexts.clear();
 
     // Clear store
-    store_.reset();
+    store.reset();
 
-    initialized_ = false;
+    initialized = false;
 }
 
 // Broadcast a file from rank 0 to all ranks
-void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& outDataSize) {
-    if (!initialized_) {
+void* GlooFileBroadcast::broadcastFile(const std::string& filePath, size_t& outDataSize) {
+    if (!initialized) {
         log("Cannot broadcast file: not initialized");
         return nullptr;
     }
@@ -138,7 +138,7 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
     size_t fileSize = 0;
 
     // Only rank 0 reads the file
-    if (rank_ == 0) {
+    if (rank == 0) {
         log("Opening file for broadcast: " + filePath);
 
         // Open the file
@@ -177,7 +177,7 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
     // Wait at broadcast barrier
     if (!executeBarrier("pre_broadcast")) {
         log("Failed at pre-broadcast barrier");
-        if (rank_ == 0 && fileData != nullptr) {
+        if (rank == 0 && fileData != nullptr) {
             munmap(fileData, fileSize);
         }
         return nullptr;
@@ -187,7 +187,7 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
     log("Broadcasting file size");
 
     // All ranks create broadcast opts for file size
-    gloo::BroadcastOptions sizeOpts(contexts_[0]);
+    gloo::BroadcastOptions sizeOpts(contexts[0]);
     sizeOpts.setRoot(0);
     sizeOpts.setTag(1);
     sizeOpts.setOutput(&fileSize, sizeof(fileSize));
@@ -201,7 +201,7 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
     }
 
     // Non-root ranks allocate memory to receive the file
-    if (rank_ != 0) {
+    if (rank != 0) {
         log("Allocating " + std::to_string(fileSize / (1024 * 1024)) + " MB to receive file");
         fileData = mmap(NULL, fileSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (fileData == MAP_FAILED) {
@@ -216,12 +216,12 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
     auto broadcastStartTime = std::chrono::high_resolution_clock::now();
 
     try {
-        if (contexts_.size() > 1) {
+        if (contexts.size() > 1) {
             // Multi-flow broadcast
-            log("Using multi-flow broadcast across " + std::to_string(contexts_.size()) + " interfaces");
+            log("Using multi-flow broadcast across " + std::to_string(contexts.size()) + " interfaces");
 
-            // Calculate chunk size (capped at maxChunkSizeBytes_)
-            size_t chunkSize = std::min(maxChunkSizeBytes_, fileSize / contexts_.size());
+            // Calculate chunk size (capped at maxChunkSizeBytes)
+            size_t chunkSize = std::min(maxChunkSizeBytes, fileSize / contexts.size());
 
             // Calculate number of chunks needed
             size_t numChunks = (fileSize + chunkSize - 1) / chunkSize; // Ceiling division
@@ -231,15 +231,15 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
                 std::to_string(chunkSize / (1024.0 * 1024 * 1024)) + "GB per chunk)");
 
             // Calculate chunks per context (some contexts may get one more chunk than others)
-            size_t chunksPerContext = numChunks / contexts_.size();
-            size_t extraChunks = numChunks % contexts_.size();
+            size_t chunksPerContext = numChunks / contexts.size();
+            size_t extraChunks = numChunks % contexts.size();
 
-            std::vector<std::exception_ptr> exceptions(contexts_.size());
+            std::vector<std::exception_ptr> exceptions(contexts.size());
             std::atomic<bool> error_occurred(false);
             std::vector<std::thread> broadcastThreads;
 
             // Create one thread per context, each handling multiple chunks
-            for (size_t contextIdx = 0; contextIdx < contexts_.size(); contextIdx++) {
+            for (size_t contextIdx = 0; contextIdx < contexts.size(); contextIdx++) {
                 broadcastThreads.emplace_back([this, contextIdx, chunksPerContext, extraChunks, numChunks, chunkSize, fileSize, fileData, &exceptions, &error_occurred]() {
                     try {
                         // Calculate how many chunks this context handles
@@ -250,7 +250,7 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
                             // Calculate the chunk index in round-robin fashion
                             // Context 0 gets chunks 0, contexts_size, 2*contexts_size...
                             // Context 1 gets chunks 1, contexts_size+1, ...
-                            size_t chunkIdx = contextIdx + (i * contexts_.size());
+                            size_t chunkIdx = contextIdx + (i * contexts.size());
                             if (chunkIdx >= numChunks) break; // Safety check
 
                             size_t offset = chunkIdx * chunkSize;
@@ -263,7 +263,7 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
                             log(ss.str());
 
                             // Configure broadcast for this chunk
-                            gloo::BroadcastOptions opts(contexts_[contextIdx]);
+                            gloo::BroadcastOptions opts(contexts[contextIdx]);
                             opts.setRoot(0);
                             opts.setTag(static_cast<uint64_t>(chunkIdx) + 2); // +2 because tag 1 was used for size
                             opts.setOutput(static_cast<uint8_t*>(fileData) + offset, thisChunkSize);
@@ -285,7 +285,7 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
 
             // Check for any exceptions in the broadcast threads
             if (error_occurred.load()) {
-                for (size_t i = 0; i < contexts_.size(); i++) {
+                for (size_t i = 0; i < contexts.size(); i++) {
                     if (exceptions[i]) {
                         try {
                             std::rethrow_exception(exceptions[i]);
@@ -305,7 +305,7 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
             // Single-flow broadcast
             log("Using single-flow broadcast");
 
-            gloo::BroadcastOptions opts(contexts_[0]);
+            gloo::BroadcastOptions opts(contexts[0]);
             opts.setRoot(0);
             opts.setTag(2);
             opts.setOutput(fileData, fileSize);
@@ -314,13 +314,13 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
         }
 
         auto endTime = std::chrono::high_resolution_clock::now();
-        lastBroadcastDuration_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+        lastBroadcastDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
             endTime - broadcastStartTime);
-        lastBroadcastBandwidthGBs_ = (fileSize / (1024.0 * 1024 * 1024)) /
-                                    (lastBroadcastDuration_.count() / 1000.0);
+        lastBroadcastBandwidthGBs = (fileSize / (1024.0 * 1024 * 1024)) /
+                                    (lastBroadcastDuration.count() / 1000.0);
 
-        log("Broadcast complete in " + std::to_string(lastBroadcastDuration_.count()) +
-            "ms (" + std::to_string(lastBroadcastBandwidthGBs_) + " GB/s)");
+        log("Broadcast complete in " + std::to_string(lastBroadcastDuration.count()) +
+            "ms (" + std::to_string(lastBroadcastBandwidthGBs) + " GB/s)");
 
         // Set output size
         outDataSize = fileSize;
@@ -337,33 +337,33 @@ void* GlooFileBroadcaster::broadcastFile(const std::string& filePath, size_t& ou
     }
 }
 
-int getWorldSize() const {
-  return worldSize_;
+int GlooFileBroadcast::getWorldSize() const {
+    return worldSize;
 }
 
 // Get last broadcast bandwidth
-double GlooFileBroadcaster::getLastBroadcastBandwidthGBs() const {
-    return lastBroadcastBandwidthGBs_;
+double GlooFileBroadcast::getLastBroadcastBandwidthGBs() const {
+    return lastBroadcastBandwidthGBs;
 }
 
 // Log helper
-void GlooFileBroadcaster::log(const std::string& message) {
-    std::cout << "[" << getCurrentTimestamp() << "] Rank " << rank_
+void GlooFileBroadcast::log(const std::string& message) {
+    std::cout << "[" << getCurrentTimestamp() << "] Rank " << rank
               << ": " << message << std::endl;
 }
 
 // Convert string to vector for store API
-std::vector<char> GlooFileBroadcaster::stringToVector(const std::string& str) {
+std::vector<char> GlooFileBroadcast::stringToVector(const std::string& str) {
     return std::vector<char>(str.begin(), str.end());
 }
 
 // Convert vector to string for store API
-std::string GlooFileBroadcaster::vectorToString(const std::vector<char>& vec) {
+std::string GlooFileBroadcast::vectorToString(const std::vector<char>& vec) {
     return std::string(vec.data(), vec.size());
 }
 
 // Discover network interfaces
-std::vector<std::pair<std::string, std::string>> GlooFileBroadcaster::discoverNetworkInterfaces() {
+std::vector<std::pair<std::string, std::string>> GlooFileBroadcast::discoverNetworkInterfaces() {
     std::vector<std::pair<std::string, std::string>> results;
 
     log("Discovering network interfaces");
@@ -408,29 +408,29 @@ std::vector<std::pair<std::string, std::string>> GlooFileBroadcaster::discoverNe
 }
 
 // Coordinate on interfaces
-bool GlooFileBroadcaster::coordinateInterfaces() {
+bool GlooFileBroadcast::coordinateInterfaces() {
     log("Coordinating on number of interfaces to use");
 
     // First, publish how many interfaces we have
-    std::string interfaceCountKey = prefix_ + "_num_interfaces_rank_" + std::to_string(rank_);
-    store_->set(interfaceCountKey, stringToVector(std::to_string(usableInterfaces_.size())));
+    std::string interfaceCountKey = prefix + "_num_interfaces_rank_" + std::to_string(rank);
+    store->set(interfaceCountKey, stringToVector(std::to_string(usableInterfaces.size())));
 
     // Wait for all ranks to publish their interface counts
     log("Waiting for all ranks to publish their interface counts");
-    std::vector<int> rankInterfaceCounts(worldSize_);
-    rankInterfaceCounts[rank_] = usableInterfaces_.size();
+    std::vector<int> rankInterfaceCounts(worldSize);
+    rankInterfaceCounts[rank] = usableInterfaces.size();
 
-    for (int r = 0; r < worldSize_; r++) {
-        if (r == rank_) continue;
+    for (int r = 0; r < worldSize; r++) {
+        if (r == rank) continue;
 
-        std::string countKey = prefix_ + "_num_interfaces_rank_" + std::to_string(r);
+        std::string countKey = prefix + "_num_interfaces_rank_" + std::to_string(r);
         std::string countStr;
         auto startWait = std::chrono::high_resolution_clock::now();
 
         do {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             try {
-                countStr = vectorToString(store_->get(countKey));
+                countStr = vectorToString(store->get(countKey));
             } catch (const std::exception&) {
                 countStr = "";
             }
@@ -452,33 +452,33 @@ bool GlooFileBroadcaster::coordinateInterfaces() {
     log("Minimum interfaces across all ranks: " + std::to_string(minInterfaces));
 
     // Trim our usableInterfaces to the minimum
-    if (usableInterfaces_.size() > minInterfaces) {
-        usableInterfaces_.resize(minInterfaces);
+    if (usableInterfaces.size() > minInterfaces) {
+        usableInterfaces.resize(minInterfaces);
         log("Limiting to " + std::to_string(minInterfaces) + " interfaces for consistency");
     }
 
     // Share IPs for each interface
-    for (size_t i = 0; i < usableInterfaces_.size(); i++) {
-        std::string interfaceKey = prefix_ + "_interface_" + std::to_string(i) + "_rank_" + std::to_string(rank_);
-        store_->set(interfaceKey, stringToVector(usableInterfaces_[i].second));
-        log("Published interface " + std::to_string(i) + " IP: " + usableInterfaces_[i].second);
+    for (size_t i = 0; i < usableInterfaces.size(); i++) {
+        std::string interfaceKey = prefix + "_interface_" + std::to_string(i) + "_rank_" + std::to_string(rank);
+        store->set(interfaceKey, stringToVector(usableInterfaces[i].second));
+        log("Published interface " + std::to_string(i) + " IP: " + usableInterfaces[i].second);
     }
 
     // Wait for all ranks to publish their interface IPs
     log("Waiting for all ranks to publish their interface IPs");
-    for (int r = 0; r < worldSize_; r++) {
-        if (r == rank_) continue;
+    for (int r = 0; r < worldSize; r++) {
+        if (r == rank) continue;
 
         // Get IPs for each interface from remote rank
         for (size_t i = 0; i < minInterfaces; i++) {
-            std::string interfaceKey = prefix_ + "_interface_" + std::to_string(i) + "_rank_" + std::to_string(r);
+            std::string interfaceKey = prefix + "_interface_" + std::to_string(i) + "_rank_" + std::to_string(r);
             std::string ip;
             auto startWait = std::chrono::high_resolution_clock::now();
 
             do {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 try {
-                    ip = vectorToString(store_->get(interfaceKey));
+                    ip = vectorToString(store->get(interfaceKey));
                 } catch (const std::exception&) {
                     ip = "";
                 }
@@ -501,42 +501,42 @@ bool GlooFileBroadcaster::coordinateInterfaces() {
 }
 
 // Setup contexts
-bool GlooFileBroadcaster::setupContexts() {
-    log("Setting up contexts for " + std::to_string(usableInterfaces_.size()) + " interfaces");
+bool GlooFileBroadcast::setupContexts() {
+    log("Setting up contexts for " + std::to_string(usableInterfaces.size()) + " interfaces");
 
     // Create contexts for each interface
-    for (size_t i = 0; i < usableInterfaces_.size(); i++) {
+    for (size_t i = 0; i < usableInterfaces.size(); i++) {
         log("Creating context for interface " + std::to_string(i) + " (" +
-            usableInterfaces_[i].first + ", " + usableInterfaces_[i].second + ")");
+            usableInterfaces[i].first + ", " + usableInterfaces[i].second + ")");
 
         try {
             // Create device for this interface
             gloo::transport::tcp::attr attr;
-            attr.iface = usableInterfaces_[i].first;
-            attr.hostname = usableInterfaces_[i].second;
+            attr.iface = usableInterfaces[i].first;
+            attr.hostname = usableInterfaces[i].second;
 
             auto device = gloo::transport::tcp::CreateDevice(attr);
 
             // Create context for this interface
-            auto context = std::make_shared<gloo::rendezvous::Context>(rank_, worldSize_);
+            auto context = std::make_shared<gloo::rendezvous::Context>(rank, worldSize);
 
             // Signal readiness to connect for this interface
-            std::string readyKey = prefix_ + "_ready_iface_" + std::to_string(i) + "_rank_" + std::to_string(rank_);
-            store_->set(readyKey, stringToVector("true"));
+            std::string readyKey = prefix + "_ready_iface_" + std::to_string(i) + "_rank_" + std::to_string(rank);
+            store->set(readyKey, stringToVector("true"));
 
             // Wait for all ranks to be ready for connection
             log("Waiting for all ranks to be ready for interface " + std::to_string(i) + " connection");
-            for (int r = 0; r < worldSize_; r++) {
-                if (r == rank_) continue;
+            for (int r = 0; r < worldSize; r++) {
+                if (r == rank) continue;
 
-                std::string remoteReadyKey = prefix_ + "_ready_iface_" + std::to_string(i) + "_rank_" + std::to_string(r);
+                std::string remoteReadyKey = prefix + "_ready_iface_" + std::to_string(i) + "_rank_" + std::to_string(r);
                 std::string readyVal;
                 auto startWait = std::chrono::high_resolution_clock::now();
 
                 do {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     try {
-                        readyVal = vectorToString(store_->get(remoteReadyKey));
+                        readyVal = vectorToString(store->get(remoteReadyKey));
                     } catch (const std::exception&) {
                         readyVal = "";
                     }
@@ -554,56 +554,56 @@ bool GlooFileBroadcaster::setupContexts() {
             log("All ranks ready for interface " + std::to_string(i) + " connection");
 
             // Add a staggered delay to prevent connection storms
-            std::this_thread::sleep_for(std::chrono::milliseconds(rank_ * 20 + i * 10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(rank * 20 + i * 10));
 
             // Connect to the mesh for this interface
             log("Connecting interface " + std::to_string(i) + " to the mesh");
             auto connectStore = std::make_shared<gloo::rendezvous::PrefixStore>(
-                prefix_ + "_conn_iface_" + std::to_string(i), store_);
+                prefix + "_conn_iface_" + std::to_string(i), store);
 
             context->connectFullMesh(connectStore, device);
-            contexts_.push_back(context);
+            contexts.push_back(context);
             log("Successfully connected interface " + std::to_string(i) + " to the mesh");
         } catch (const std::exception& e) {
             log("Failed to connect interface " + std::to_string(i) + " to the mesh: " + std::string(e.what()));
         }
     }
 
-    if (contexts_.empty()) {
+    if (contexts.empty()) {
         log("ERROR: No interfaces could be connected");
         return false;
     }
 
-    log("Successfully connected " + std::to_string(contexts_.size()) + " interfaces");
+    log("Successfully connected " + std::to_string(contexts.size()) + " interfaces");
     return true;
 }
 
 // Execute a barrier
-bool GlooFileBroadcaster::executeBarrier(const std::string& barrierName) {
+bool GlooFileBroadcast::executeBarrier(const std::string& barrierName) {
     log("Executing barrier: " + barrierName);
 
     // Use direct Redis approach - each rank signals arrival with its own key
-    std::string barrierKey = prefix_ + "_barrier_" + barrierName + "_rank_" + std::to_string(rank_);
-    store_->set(barrierKey, stringToVector("arrived"));
+    std::string barrierKey = prefix + "_barrier_" + barrierName + "_rank_" + std::to_string(rank);
+    store->set(barrierKey, stringToVector("arrived"));
 
     // Wait for all ranks to arrive
     log("Waiting for all ranks at barrier: " + barrierName);
-    std::vector<bool> rankArrived(worldSize_, false);
-    rankArrived[rank_] = true;  // We're already here
+    std::vector<bool> rankArrived(worldSize, false);
+    rankArrived[rank] = true;  // We're already here
 
     auto startWait = std::chrono::high_resolution_clock::now();
     int arrivedCount = 1;  // Start with ourselves
 
-    while (arrivedCount < worldSize_) {
+    while (arrivedCount < worldSize) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         // Check each rank
-        for (int r = 0; r < worldSize_; r++) {
+        for (int r = 0; r < worldSize; r++) {
             if (rankArrived[r]) continue;  // Already counted
 
             try {
-                std::string arrivalKey = prefix_ + "_barrier_" + barrierName + "_rank_" + std::to_string(r);
-                std::string arrived = vectorToString(store_->get(arrivalKey));
+                std::string arrivalKey = prefix + "_barrier_" + barrierName + "_rank_" + std::to_string(r);
+                std::string arrived = vectorToString(store->get(arrivalKey));
 
                 if (arrived == "arrived") {
                     log("Rank " + std::to_string(r) + " arrived at barrier: " + barrierName);
@@ -620,13 +620,13 @@ bool GlooFileBroadcaster::executeBarrier(const std::string& barrierName) {
         auto waitingTime = std::chrono::duration_cast<std::chrono::seconds>(currentTime - startWait);
         if (waitingTime.count() >= 5 && waitingTime.count() % 5 == 0) {
             log("Waiting at barrier " + barrierName + ": " + std::to_string(arrivedCount) + "/" +
-                std::to_string(worldSize_) + " ranks arrived (" +
+                std::to_string(worldSize) + " ranks arrived (" +
                 std::to_string(waitingTime.count()) + "s)");
         }
     }
 
     // Add staggered delay before proceeding
-    std::this_thread::sleep_for(std::chrono::milliseconds(rank_ * 10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(rank * 10));
 
     log("Passed barrier: " + barrierName);
     return true;

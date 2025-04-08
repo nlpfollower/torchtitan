@@ -16,15 +16,15 @@
 #include <functional>
 
 // Simple broadcaster class that memory maps a file on rank 0 and distributes it to all other ranks
-class GlooFileBroadcaster {
+class GlooFileBroadcast {
 public:
     // Constructor
-    GlooFileBroadcaster(int rank, int worldSize,
+    GlooFileBroadcast(int rank, int worldSize,
                         const std::string& redisHost, int redisPort,
                         const std::string& runId);
 
     // Destructor
-    ~GlooFileBroadcaster();
+    ~GlooFileBroadcast();
 
     // Initialize the broadcaster (discover interfaces, setup contexts)
     bool initialize();
@@ -44,27 +44,27 @@ public:
 
 private:
     // Configuration
-    int rank_;
-    int worldSize_;
-    std::string redisHost_;
-    int redisPort_;
-    std::string runId_;
-    std::string prefix_;
-    bool initialized_;
+    int rank;
+    int worldSize;
+    std::string redisHost;
+    int redisPort;
+    std::string runId;
+    std::string prefix;
+    bool initialized;
 
     // Store and contexts
-    std::shared_ptr<gloo::rendezvous::Store> store_;
-    std::vector<std::shared_ptr<gloo::rendezvous::Context>> contexts_;
+    std::shared_ptr<gloo::rendezvous::Store> store;
+    std::vector<std::shared_ptr<gloo::rendezvous::Context>> contexts;
 
     // Network interfaces
-    std::vector<std::pair<std::string, std::string>> usableInterfaces_;
+    std::vector<std::pair<std::string, std::string>> usableInterfaces;
 
     // Performance metrics
-    std::chrono::milliseconds lastBroadcastDuration_;
-    double lastBroadcastBandwidthGBs_;
+    std::chrono::milliseconds lastBroadcastDuration;
+    double lastBroadcastBandwidthGBs;
 
     // Default optimal chunk size 1GB
-    size_t maxChunkSizeBytes_ = 1ULL * 1024 * 1024 * 1024;
+    size_t maxChunkSizeBytes = 1ULL * 1024 * 1024 * 1024;
 
     // Helper methods
     void log(const std::string& message);

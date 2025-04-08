@@ -1,9 +1,9 @@
 // Updated memory_mapped_file.cpp
 
 #include "memory_mapped_file.h"
-#include "gloo_file_broadcaster.h"
+#include "gloo_file_broadcast.h"
 
-MemoryMappedFile::MemoryMappedFile(const std::string& path, GlooFileBroadcaster* broadcaster)
+MemoryMappedFile::MemoryMappedFile(const std::string& path, GlooFileBroadcast* broadcaster)
     : fd(-1), mapped_data(nullptr), file_size(0), is_valid(false),
       filepath(path), broadcast_bandwidth_gbps(0.0), is_broadcast_mode(false) {
 
