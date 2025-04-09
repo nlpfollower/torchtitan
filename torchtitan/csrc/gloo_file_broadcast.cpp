@@ -175,7 +175,7 @@ void* GlooFileBroadcast::broadcastFile(const std::string& filePath, size_t& outD
     }
 
     // Wait at broadcast barrier
-    if (!executeBarrier("pre_broadcast")) {
+    if (!executeBarrier(getUniqueBarrierName("pre_broadcast", filePath))) {
         log("Failed at pre-broadcast barrier");
         if (rank == 0 && fileData != nullptr) {
             munmap(fileData, fileSize);
@@ -578,55 +578,58 @@ bool GlooFileBroadcast::setupContexts() {
     return true;
 }
 
-// Execute a barrier
+std::string GlooFileBroadcast::getUniqueBarrierName(const std::string& baseName, const std::string& filePath) const {
+    if (filePath.empty()) {
+        return baseName;
+    }
+
+    // Extract just the filename part to keep keys manageable
+    size_t lastSlash = filePath.find_last_of("/\\");
+    std::string fileName = (lastSlash != std::string::npos) ?
+                           filePath.substr(lastSlash + 1) :
+                           filePath;
+
+    // Return combined name
+    return baseName + "_" + fileName;
+}
+
 bool GlooFileBroadcast::executeBarrier(const std::string& barrierName) {
     log("Executing barrier: " + barrierName);
 
-    // Use direct Redis approach - each rank signals arrival with its own key
-    std::string barrierKey = prefix + "_barrier_" + barrierName + "_rank_" + std::to_string(rank);
-    store->set(barrierKey, stringToVector("arrived"));
+    // Simplify the barrier to match the working code
+    if (rank == 0) {
+        // Only rank 0 sets the barrier key
+        std::string barrierKey = prefix + "_barrier_" + barrierName;
+        store->set(barrierKey, stringToVector("ready"));
+        log("Set barrier key: " + barrierKey);
+    }
 
-    // Wait for all ranks to arrive
-    log("Waiting for all ranks at barrier: " + barrierName);
-    std::vector<bool> rankArrived(worldSize, false);
-    rankArrived[rank] = true;  // We're already here
+    // All ranks (including 0) wait for the barrier key
+    if (rank == 0) {
+        // Give a short delay for the key to propagate in Redis
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    std::string barrierKey = prefix + "_barrier_" + barrierName;
+    std::string value;
+    log("Waiting for barrier: " + barrierName);
 
     auto startWait = std::chrono::high_resolution_clock::now();
-    int arrivedCount = 1;  // Start with ourselves
-
-    while (arrivedCount < worldSize) {
+    do {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-        // Check each rank
-        for (int r = 0; r < worldSize; r++) {
-            if (rankArrived[r]) continue;  // Already counted
-
-            try {
-                std::string arrivalKey = prefix + "_barrier_" + barrierName + "_rank_" + std::to_string(r);
-                std::string arrived = vectorToString(store->get(arrivalKey));
-
-                if (arrived == "arrived") {
-                    log("Rank " + std::to_string(r) + " arrived at barrier: " + barrierName);
-                    rankArrived[r] = true;
-                    arrivedCount++;
-                }
-            } catch (const std::exception&) {
-                // Key not set yet, ignore
-            }
+        try {
+            value = vectorToString(store->get(barrierKey));
+        } catch (const std::exception&) {
+            value = "";
         }
 
-        // Report progress if waiting too long
+        // Report if waiting too long
         auto currentTime = std::chrono::high_resolution_clock::now();
         auto waitingTime = std::chrono::duration_cast<std::chrono::seconds>(currentTime - startWait);
         if (waitingTime.count() >= 5 && waitingTime.count() % 5 == 0) {
-            log("Waiting at barrier " + barrierName + ": " + std::to_string(arrivedCount) + "/" +
-                std::to_string(worldSize) + " ranks arrived (" +
-                std::to_string(waitingTime.count()) + "s)");
+            log("Still waiting for barrier " + barrierName + " (" + std::to_string(waitingTime.count()) + "s)");
         }
-    }
-
-    // Add staggered delay before proceeding
-    std::this_thread::sleep_for(std::chrono::milliseconds(rank * 10));
+    } while (value != "ready");
 
     log("Passed barrier: " + barrierName);
     return true;

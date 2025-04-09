@@ -64,13 +64,17 @@ private:
     double lastBroadcastBandwidthGBs;
 
     // Default optimal chunk size 1GB
-    size_t maxChunkSizeBytes = 1ULL * 1024 * 1024 * 1024;
+    size_t maxChunkSizeBytes = 1.1 * 1024 * 1024 * 1024;
 
     // Helper methods
     void log(const std::string& message);
     std::vector<std::pair<std::string, std::string>> discoverNetworkInterfaces();
     bool coordinateInterfaces();
     bool setupContexts();
+
+    // Helper to generate a unique barrier name based on current file
+    std::string getUniqueBarrierName(const std::string& baseName, const std::string& filePath = "") const;
+
     bool executeBarrier(const std::string& barrierName);
     
     // Helpers for store communication

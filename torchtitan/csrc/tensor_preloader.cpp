@@ -436,22 +436,15 @@ py::dict get_preload_stats() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Main function to preload tensors
     m.def("preload_tensors",
-          [](py::list file_tensors, int num_threads,
-             int rank, int world_size,
-             const std::string& redis_host, int redis_port,
-             const std::string& run_id) {
-              return preload_tensors(file_tensors, num_threads,
-                                    rank, world_size,
-                                    redis_host, redis_port, run_id);
-          },
-          "Preload tensors from checkpoint files into shared memory with optional broadcast",
-          py::arg("file_tensors"),
-          py::arg("num_threads") = 0,
-          py::arg("rank") = 0,
-          py::arg("world_size") = 1,
-          py::arg("redis_host") = "localhost",
-          py::arg("redis_port") = 6379,
-          py::arg("run_id") = "");
+      &preload_tensors,  // Use direct function reference instead of lambda
+      "Preload tensors from checkpoint files into shared memory with optional broadcast",
+      py::arg("file_tensors"),
+      py::arg("num_threads") = 0,
+      py::arg("rank") = 0,
+      py::arg("world_size") = 1,
+      py::arg("redis_host") = "localhost",
+      py::arg("redis_port") = 6379,
+      py::arg("run_id") = "");
 
     // Get preloading statistics
     m.def("get_preload_stats", &get_preload_stats,
