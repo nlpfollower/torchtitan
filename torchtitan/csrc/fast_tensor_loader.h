@@ -57,5 +57,6 @@ private:
 // Function that loads and copies tensors directly to their destination
 bool load_and_copy_tensors_parallel(
     std::vector<TensorCopyRequest>& requests,
-    int num_threads = -1
+    int num_threads,
+    int streams_per_device
 );

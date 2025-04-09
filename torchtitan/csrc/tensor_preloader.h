@@ -39,10 +39,15 @@ bool load_tensor_to_shared_memory(const char* tensor_data, size_t length,
 // Primary tensor loading function
 bool preload_file_tensors(const std::string& filepath,
                         const std::vector<py::dict>& tensor_infos,
-                        int num_threads);
+                        int num_threads,
+                        GlooFileBroadcast* broadcaster);
 
 // Global preloader function
-bool preload_tensors(py::list file_tensors, int num_threads);
+bool preload_tensors(py::list file_tensors, int num_threads,
+                    int rank, int world_size,
+                    const std::string& redis_host,
+                    int redis_port,
+                    const std::string& run_id);
 
 // Get preloading statistics
 py::dict get_preload_stats();
