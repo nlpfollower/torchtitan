@@ -25,3 +25,4 @@ tests/output/
 /torchtitan/csrc/fast_tensor_loader.so
 /torchtitan/csrc/tensor_preloader.so
 /torchtitan/csrc/distributed_tensor_loader.so
+/test_dataset.csv

@@ -30,7 +30,6 @@ from torch.utils.data import DataLoader
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.logging import init_logger, logger
 from torchtitan.models.file_reader import OptimizedFileSystemReader
-from torchtitan.models.multi_file_reader import create_optimized_reader
 from torchtitan.optimizer import LRSchedulersContainer, OptimizersContainer
 from torchtitan.utils import GarbageCollection
 
@@ -157,6 +156,11 @@ class CheckpointManager:
         ckpt_config = job_config.checkpoint
         self.enable_checkpoint = ckpt_config.enable_checkpoint
         self.keep_latest_k = ckpt_config.keep_latest_k
+
+        # New tensor preload options
+        self.use_tensor_preload = ckpt_config.use_tensor_preload
+        self.preload_timeout = ckpt_config.preload_timeout
+        self.preload_run_id = ckpt_config.preload_run_id or str(uuid.uuid4())
 
         if not self.enable_checkpoint:
             return
@@ -462,6 +466,24 @@ class CheckpointManager:
         for exclude_key in self.exclude_from_loading:
             if exclude_key not in states:
                 raise ValueError(f"{exclude_key} not found in state_dict.")
+        if self.use_tensor_preload:
+            complete_file = f"/tmp/tensor_preload_{self.preload_run_id}_complete"
+
+            # Wait for file to exist
+            max_wait = self.preload_timeout
+            wait_time = 0
+            while not os.path.exists(complete_file) and (max_wait == 0 or wait_time < max_wait):
+                time.sleep(1)
+                wait_time += 1
+                if wait_time % 10 == 0:
+                    logger.info(f"Still waiting for tensor preload (run_id: {self.preload_run_id}) after {wait_time}s")
+
+            if os.path.exists(complete_file):
+                logger.info("Tensor preload complete, using optimized reader")
+                reader = OptimizedFileSystemReader(checkpoint_id)
+            else:
+                logger.info("Tensor preload not complete, using standard reader")
+                reader = None
         dcp.load(
             states_to_load,
             checkpoint_id=checkpoint_id,

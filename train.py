@@ -142,7 +142,8 @@ def main(job_config: JobConfig):
             dp_rank,
             device_type,
             mode=job_config.training.dataset_mode,
-            packing=job_config.training.dataset_packing
+            packing=job_config.training.dataset_packing,
+            system_prompt=job_config.training.system_prompt
         )
         if job_config.evaluation.enabled:
             eval_data_loader = build_custom_data_loader(
@@ -156,7 +157,8 @@ def main(job_config: JobConfig):
                 dp_rank,
                 device_type,
                 mode=job_config.training.dataset_mode,
-                packing=job_config.training.dataset_packing
+                packing=job_config.training.dataset_packing,
+                system_prompt=job_config.training.system_prompt
             )
     else:
         raise ValueError(f"Unsupported dataset type: {job_config.training.dataset_type}")

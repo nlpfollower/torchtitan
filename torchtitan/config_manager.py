@@ -355,6 +355,12 @@ class JobConfig:
             """,
         )
         self.parser.add_argument(
+            "--training.system_prompt",
+            type=str,
+            default="You are a helpful assistant.",
+            help="System prompt to prepend to each conversation for file datasets",
+        )
+        self.parser.add_argument(
             "--reference_model.enabled",
             action="store_true",
             help="Enable the float16 reference model for training objectives"
@@ -660,6 +666,23 @@ class JobConfig:
                 Provide a comma-separated list of keys to exclude, e.g. 'optimizer,lr_scheduler,dataloader'.
                 This will load the model only, excluding the specified keys.
             """,
+        )
+        self.parser.add_argument(
+            "--checkpoint.use_tensor_preload",
+            action="store_true",
+            help="Whether to use tensor preloading for checkpoint loading"
+        )
+        self.parser.add_argument(
+            "--checkpoint.preload_timeout",
+            type=int,
+            default=600,
+            help="Maximum time to wait for preloading (0 = wait forever)"
+        )
+        self.parser.add_argument(
+            "--checkpoint.preload_run_id",
+            type=str,
+            default="",
+            help="Run ID for tensor preloading"
         )
         # activation checkpointing configs
         self.parser.add_argument(

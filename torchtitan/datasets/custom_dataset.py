@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any, Optional
 
 import torch
@@ -8,6 +9,7 @@ from torch.distributed import broadcast
 from torch.utils.data import DataLoader, IterableDataset
 from torchdata.nodes import Stateful
 
+from torchtitan.datasets.file_dataset import FileDataset
 from torchtitan.datasets.hh_dataset import build_hh_data_loader, HHDataset
 from torchtitan.datasets.mmlu_dataset import MMLUDataset
 from torchtitan.datasets.tokenizer import Tokenizer
@@ -102,20 +104,22 @@ class DummyDataset(IterableDataset):
     def load_state_dict(self, state_dict):
         pass
 
+
 def build_custom_data_loader(
-    data_dir: str,
-    dataset: str,
-    split: str,
-    tokenizer: Tokenizer,
-    batch_size: int,
-    seq_len: int,
-    world_size: int,
-    rank: int,
-    device_type: str,
-    num_workers: int = 0,
-    shuffle: bool = False,
-    mode: str = "align",
-    packing: bool = False,
+        data_dir: str,
+        dataset: str,
+        split: str,
+        tokenizer: Tokenizer,
+        batch_size: int,
+        seq_len: int,
+        world_size: int,
+        rank: int,
+        device_type: str,
+        num_workers: int = 0,
+        shuffle: bool = False,
+        mode: str = "align",
+        packing: bool = False,
+        system_prompt: str = "You are a helpful assistant.",
 ) -> 'DistributedDataLoader':
     if dataset == "mmlu":
         dataset = MMLUDataset(data_dir, split, tokenizer)
@@ -129,6 +133,28 @@ def build_custom_data_loader(
             packing=packing,
             world_size=world_size,
             rank=rank
+        )
+    elif dataset == "file":
+        if not data_dir:
+            raise ValueError("data_dir must be provided when using 'file' dataset")
+
+        # Use standardized file naming convention based on split
+        file_path = os.path.join(data_dir, f"file_{split}.csv")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File dataset not found at {file_path}. Expected 'file_{split}.csv' in data_dir.")
+
+        from torchtitan.datasets.file_dataset import FileDataset
+        dataset = FileDataset(
+            tokenizer=tokenizer,
+            file_path=file_path,
+            split=split,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            packing=packing,
+            world_size=world_size,
+            rank=rank,
+            system_prompt=system_prompt,
+            mode=mode
         )
     else:
         raise ValueError(f"Unsupported custom dataset: {dataset}")

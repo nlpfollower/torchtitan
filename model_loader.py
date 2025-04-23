@@ -153,9 +153,12 @@ def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0,
 
         # Generate a unique run ID if not provided and in distributed mode
         if world_size > 1 and run_id is None:
-            run_id = str(uuid.uuid4())[:8]
+            logger.error("Run ID is required in distributed mode")
+            return False
         elif run_id is None:
             run_id = ""
+
+        PRELOAD_COMPLETE_FILE = "/tmp/tensor_preload_{run_id}_complete"
 
         # First clean up any existing shared memory to prevent leaks/conflicts
         cleanup_resources()
@@ -177,6 +180,9 @@ def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0,
             elapsed_time = time.time() - start_time
             logger.info(f"[Rank {rank}] Successfully preloaded {stats['preloaded_count']} of {stats['total_count']} "
                         f"tensors ({stats['memory_gb']:.2f} GB) in {elapsed_time:.2f} seconds")
+
+            with open(PRELOAD_COMPLETE_FILE.format(run_id=run_id), 'w') as f:
+                pass
             return True
         else:
             logger.error(f"[Rank {rank}] Failed to preload tensors")
