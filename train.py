@@ -50,9 +50,9 @@ def main(job_config: JobConfig):
     local_rank = int(os.environ.get("LOCAL_RANK"))
     rank = int(os.environ.get("RANK"))
     logger.info(f"rank {rank} and local rank {local_rank}")
-    if rank == 0:
-        print("Hello from rank 0")
-        pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
+    # if rank == 0:
+    #     print("Hello from rank 0")
+    #     pydevd_pycharm.settrace('localhost', port=6789, stdoutToServer=True, stderrToServer=True)
     # if rank == 1:
     #     print("Hello from rank 1")
     #     pydevd_pycharm.settrace('localhost', port=6792, stdoutToServer=True, stderrToServer=True)
