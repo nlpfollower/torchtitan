@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
 from multiprocessing import get_context
@@ -484,11 +485,17 @@ class CheckpointManager:
             else:
                 logger.info("Tensor preload not complete, using standard reader")
                 reader = None
-        dcp.load(
-            states_to_load,
-            checkpoint_id=checkpoint_id,
-            storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
-        )
+            dcp.load(
+                states_to_load,
+                checkpoint_id=checkpoint_id,
+                storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
+            )
+        else:
+            logger.info("Using standard reader")
+            dcp.load(
+                states,
+                checkpoint_id=checkpoint_id,
+            )
         states.update(states_to_load)
         logger.info(
             f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."
