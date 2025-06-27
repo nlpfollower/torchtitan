@@ -34,6 +34,7 @@ class TransformerModelArgs(BaseModelArgs):
     rope_theta: float = 10000
 
     max_seq_len: int = 2048
+    max_possible_seq_len: int = 131072
     # If `True`, then each transformer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
@@ -429,7 +430,7 @@ class Transformer(nn.Module, ModelProtocol):
             # Need to compute until at least the max token limit for generation
             # TODO: explain in docs/composability.md why we removed the 2x
             # relaxing in our CP enablement PR
-            self.model_args.max_seq_len,
+            self.model_args.max_possible_seq_len,
             self.model_args.rope_theta,
         )
 
