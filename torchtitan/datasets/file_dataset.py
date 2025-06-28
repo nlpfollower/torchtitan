@@ -71,6 +71,24 @@ class FileDataset(IterableDataset):
 
         print(f'Dataset loaded with {len(full_dataset)} samples. Processing...')
 
+        # If dataset is smaller than world_size, repeat samples to ensure at least world_size samples
+        if len(full_dataset) < world_size:
+            print(f'Dataset size ({len(full_dataset)}) is smaller than world_size ({world_size}). Repeating samples...')
+
+            # We need at least world_size samples total
+            samples_needed = world_size - len(full_dataset)
+
+            # Repeat samples cyclically to reach exactly world_size
+            repeated_rows = []
+            for i in range(samples_needed):
+                repeated_rows.append(df.iloc[i % len(df)])
+
+            # Combine original with repeated samples
+            repeated_df = pd.concat([df] + repeated_rows, ignore_index=True)
+
+            full_dataset = Dataset.from_pandas(repeated_df)
+            print(f'Dataset expanded to {len(full_dataset)} samples')
+
         # Split the dataset by node using Hugging Face's split_dataset_by_node
         self.dataset = split_dataset_by_node(full_dataset, rank, world_size)
 
