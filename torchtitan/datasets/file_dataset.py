@@ -78,13 +78,14 @@ class FileDataset(IterableDataset):
             # We need at least world_size samples total
             samples_needed = world_size - len(full_dataset)
 
-            # Repeat samples cyclically to reach exactly world_size
-            repeated_rows = []
+            # Create a list of repeated dataframes (single rows)
+            repeated_dfs = [df]  # Start with original dataframe
             for i in range(samples_needed):
-                repeated_rows.append(df.iloc[i % len(df)])
+                # Use iloc[[i]] to get a DataFrame instead of Series
+                repeated_dfs.append(df.iloc[[i % len(df)]])
 
-            # Combine original with repeated samples
-            repeated_df = pd.concat([df] + repeated_rows, ignore_index=True)
+            # Combine all dataframes
+            repeated_df = pd.concat(repeated_dfs, ignore_index=True)
 
             full_dataset = Dataset.from_pandas(repeated_df)
             print(f'Dataset expanded to {len(full_dataset)} samples')
@@ -161,14 +162,36 @@ class FileDataset(IterableDataset):
 
     def process_sample(self, prompt: str, response: str) -> Dict[str, List[int]]:
         """Process a prompt-response pair into tokens for SFT training"""
+        # Handle None values
+        if prompt is None or response is None:
+            print(f"Warning: Found None value in data (prompt: {prompt}, response: {response}). Skipping sample.")
+            return {
+                "input_ids": [self.tokenizer.pad_id],
+                "labels": [-100],
+                "document_ids": [-1]
+            }
+
+        # Convert to string and strip
+        prompt = str(prompt).strip()
+        response = str(response).strip()
+
+        # Skip empty samples
+        if not prompt or not response:
+            print(f"Warning: Found empty prompt or response. Skipping sample.")
+            return {
+                "input_ids": [self.tokenizer.pad_id],
+                "labels": [-100],
+                "document_ids": [-1]
+            }
+
         # Create system message
         system_message = RawMessage(role="system", content=self.system_prompt)
 
         # Create user message from prompt
-        user_message = RawMessage(role="user", content=prompt.strip())
+        user_message = RawMessage(role="user", content=prompt)
 
         # Create assistant message from response
-        assistant_message = RawMessage(role="assistant", content=response.strip())
+        assistant_message = RawMessage(role="assistant", content=response)
 
         # Tokenize messages
         prompt_tokens = [self.tokenizer.bos_id]
