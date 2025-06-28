@@ -75,19 +75,3 @@ llama3_configs = {
         rope_theta=500000,
     ),
 }
-
-
-register_train_spec(
-    TrainSpec(
-        name="llama3",
-        cls=Transformer,
-        config=llama3_configs,
-        parallelize_fn=parallelize_llama,
-        pipelining_fn=pipeline_llama,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_hf_data_loader,
-        tokenizer_cls=TikTokenizer,
-        loss_fn=cross_entropy_loss,
-    )
-)

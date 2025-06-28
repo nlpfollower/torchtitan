@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan import state
 from torchtitan.models.llama.attention_utils import sdpa_or_flex_attention
 from torchtitan.models.norms import build_norm
 from torchtitan.train_spec import BaseModelArgs, ModelProtocol
