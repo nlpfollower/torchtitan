@@ -121,6 +121,33 @@ def save_with_gc(state, checkpoint_id, planner=None):
     dcp.save(state, checkpoint_id=checkpoint_id, planner=planner)
     GarbageCollection.collect("GC collection invoked by checkpointer.")
 
+@torch.no_grad()
+def save_with_gc_with_custom_writer(state, checkpoint_id, job_config):
+    """Save using custom storage writer that handles node 0 correctly."""
+    is_infra_node0 = getattr(job_config.checkpoint, 'is_infra_node0', False)
+
+    # Create custom storage writer
+    storage_writer = InfraNode0StorageWriter(
+        path=checkpoint_id,
+        is_infra_node0=is_infra_node0,
+        ranks_per_node=8
+    )
+
+    # Use the dynamic planner
+    planner = DynamicNode0CheckpointPlanner(
+        ranks_per_node=8,
+        is_infra_node0=is_infra_node0,
+    )
+
+    # Save with custom writer and planner
+    dcp.save(
+        state,
+        storage_writer=storage_writer,
+        planner=planner
+    )
+
+    GarbageCollection.collect("GC collection invoked by checkpointer.")
+
 def _get_save_planner(job_config):
     """Get the appropriate save planner based on configuration."""
     # Check if we should use the dynamic node 0 planner
@@ -317,9 +344,11 @@ class CheckpointManager:
             logger.info(f"Saving a full checkpoint at {'final' if is_final else 'last'} step, step {curr_step}.")
 
         # Get the appropriate planner
-        planner = _get_save_planner(self.job_config)
-
-        save_with_gc(self.states, checkpoint_id=self._create_checkpoint_id(curr_step, is_final), planner=planner)
+        save_with_gc_with_custom_writer(
+            self.states,
+            checkpoint_id=self._create_checkpoint_id(curr_step, is_final),
+            job_config=self.job_config
+        )
         self.reset()
 
     def _should_save(self, curr_step: int, force: bool = False) -> bool:
@@ -423,8 +452,11 @@ class CheckpointManager:
             )
         else:
             # Get the planner for regular save
-            planner = _get_save_planner(self.job_config)
-            save_with_gc(self.states, checkpoint_id=checkpoint_id, planner=planner)
+            save_with_gc_with_custom_writer(
+                self.states,
+                checkpoint_id=checkpoint_id,
+                job_config=self.job_config
+            )
         self.reset()
         self._purge_stale_checkpoints()
 
@@ -739,3 +771,53 @@ class CompleteCheckpointPlanner(DefaultSavePlanner):
 
         return redistributed_plans, metadata
 
+
+class InfraNode0StorageWriter(torch.distributed.checkpoint.FileSystemWriter):
+    """
+    Custom storage writer that ensures metadata is written on infrastructure node 0.
+    """
+
+    def __init__(self, path: str, is_infra_node0: bool = False, ranks_per_node: int = 8):
+        super().__init__(path)
+        self.is_infra_node0 = is_infra_node0
+        self.ranks_per_node = ranks_per_node
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Determine save ranks
+        self._determine_save_ranks()
+
+    def _determine_save_ranks(self):
+        """Determine which ranks are on infrastructure node 0."""
+        if not dist.is_initialized():
+            self.save_ranks = [0]
+            self.should_save = True
+            return
+
+        # Gather node 0 information
+        node0_indicator = torch.tensor(1 if self.is_infra_node0 else 0, dtype=torch.int32).cuda()
+        world_size = dist.get_world_size()
+
+        all_indicators = [torch.zeros(1, dtype=torch.int32).cuda() for _ in range(world_size)]
+        dist.all_gather(all_indicators, node0_indicator)
+
+        self.save_ranks = []
+        for rank, indicator in enumerate(all_indicators):
+            if indicator.item() == 1:
+                self.save_ranks.append(rank)
+
+        self.should_save = self.rank in self.save_ranks
+
+        # The first rank in save_ranks will handle metadata
+        self.metadata_rank = self.save_ranks[0] if self.save_ranks else 0
+
+        logger.info(f"InfraNode0StorageWriter: rank={self.rank}, save_ranks={self.save_ranks}, "
+                    f"metadata_rank={self.metadata_rank}, should_save={self.should_save}")
+
+    def finish(self, metadata: Metadata, results: List[List[Any]]) -> None:
+        """Override finish to ensure metadata is written on infrastructure node 0."""
+        # Only the designated metadata rank writes the metadata file
+        if self.rank == self.metadata_rank:
+            logger.info(f"Rank {self.rank}: Writing metadata file as designated metadata rank")
+            super().finish(metadata, results)
+        else:
+            logger.info(f"Rank {self.rank}: Skipping metadata write (metadata_rank={self.metadata_rank})")
