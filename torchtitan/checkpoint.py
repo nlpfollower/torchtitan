@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.checkpoint import DefaultSavePlanner, SavePlan, Metadata, WriteItem
+from torch.distributed.checkpoint import DefaultSavePlanner, SavePlan, Metadata, WriteItem, FileSystemWriter
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     set_model_state_dict,
@@ -772,7 +772,7 @@ class CompleteCheckpointPlanner(DefaultSavePlanner):
         return redistributed_plans, metadata
 
 
-class InfraNode0StorageWriter(torch.distributed.checkpoint.FileSystemWriter):
+class InfraNode0StorageWriter(FileSystemWriter):
     """
     Custom storage writer that ensures metadata is written on infrastructure node 0.
     """
@@ -791,6 +791,7 @@ class InfraNode0StorageWriter(torch.distributed.checkpoint.FileSystemWriter):
         if not dist.is_initialized():
             self.save_ranks = [0]
             self.should_save = True
+            self.metadata_rank = 0
             return
 
         # Gather node 0 information
@@ -813,11 +814,74 @@ class InfraNode0StorageWriter(torch.distributed.checkpoint.FileSystemWriter):
         logger.info(f"InfraNode0StorageWriter: rank={self.rank}, save_ranks={self.save_ranks}, "
                     f"metadata_rank={self.metadata_rank}, should_save={self.should_save}")
 
+    def prepare_local_plan(self, plan):
+        """Only prepare plans for ranks that should save."""
+        if not self.should_save:
+            # Return empty plan for non-saving ranks
+            from torch.distributed.checkpoint.planner import SavePlan
+            return SavePlan(items=[])
+        return super().prepare_local_plan(plan)
+
+    def write_data(self, plan, planner):
+        """Only write data on ranks that should save."""
+        if not self.should_save:
+            # Return empty future for non-saving ranks
+            from torch.futures import Future
+            future = Future()
+            future.set_result([])
+            return future
+        return super().write_data(plan, planner)
+
     def finish(self, metadata: Metadata, results: List[List[Any]]) -> None:
-        """Override finish to ensure metadata is written on infrastructure node 0."""
-        # Only the designated metadata rank writes the metadata file
-        if self.rank == self.metadata_rank:
+        """Ensure metadata is written by the designated metadata rank."""
+        # The coordinator rank (rank 0) will call this, but we want
+        # the metadata to be written by a rank on infrastructure node 0
+
+        if self.rank == 0 and self.rank not in self.save_ranks:
+            # Rank 0 is not on infra node 0, so we need to relay the metadata
+            # to the metadata rank for writing
+            logger.info(f"Rank 0: Relaying metadata to rank {self.metadata_rank} for writing")
+
+            # Send metadata to the metadata rank
+            # First send the size of the pickled metadata
+            import pickle
+            metadata_bytes = pickle.dumps(metadata)
+            size_tensor = torch.tensor(len(metadata_bytes), dtype=torch.int64).cuda()
+
+            # Send size and then metadata
+            dist.send(size_tensor, dst=self.metadata_rank)
+
+            # Convert bytes to tensor for sending
+            metadata_tensor = torch.frombuffer(metadata_bytes, dtype=torch.uint8).cuda()
+            dist.send(metadata_tensor, dst=self.metadata_rank)
+
+            logger.info(f"Rank 0: Metadata relayed to rank {self.metadata_rank}")
+
+        elif self.rank == self.metadata_rank:
+            # This rank should write the metadata
+            if self.rank != 0:
+                # We need to receive the metadata from rank 0
+                logger.info(f"Rank {self.rank}: Receiving metadata from rank 0")
+
+                # Receive size first
+                size_tensor = torch.zeros(1, dtype=torch.int64).cuda()
+                dist.recv(size_tensor, src=0)
+                metadata_size = size_tensor.item()
+
+                # Receive metadata
+                metadata_tensor = torch.zeros(metadata_size, dtype=torch.uint8).cuda()
+                dist.recv(metadata_tensor, src=0)
+
+                # Unpickle metadata
+                import pickle
+                metadata_bytes = metadata_tensor.cpu().numpy().tobytes()
+                metadata = pickle.loads(metadata_bytes)
+
+                logger.info(f"Rank {self.rank}: Received metadata from rank 0")
+
+            # Now write the metadata
             logger.info(f"Rank {self.rank}: Writing metadata file as designated metadata rank")
             super().finish(metadata, results)
         else:
-            logger.info(f"Rank {self.rank}: Skipping metadata write (metadata_rank={self.metadata_rank})")
+            # Other ranks don't write metadata
+            logger.info(f"Rank {self.rank}: Skipping metadata write")
