@@ -58,17 +58,23 @@ signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
 signal.signal(signal.SIGTERM, signal_handler)  # termination request
 
 
-def extract_tensor_metadata(checkpoint_dir: str) -> List[Dict]:
+def extract_tensor_metadata(checkpoint_dir: str, metadata_path: Optional[str] = None) -> List[Dict]:
     """
     Extract tensor location metadata from checkpoint directory.
 
     Args:
         checkpoint_dir: Path to checkpoint directory
+        metadata_path: Optional path to metadata file. If None, defaults to checkpoint_dir/.metadata
 
     Returns:
         List of file entries with tensor information
     """
-    metadata_path = os.path.join(checkpoint_dir, ".metadata")
+    if metadata_path is None:
+        metadata_path = os.path.join(checkpoint_dir, ".metadata")
+
+    # Ensure metadata path is absolute for consistent file operations
+    if not os.path.isabs(metadata_path):
+        metadata_path = os.path.abspath(metadata_path)
 
     try:
         # Load the metadata file
@@ -110,19 +116,22 @@ def extract_tensor_metadata(checkpoint_dir: str) -> List[Dict]:
         # Count total tensors
         total_tensors = sum(len(entry['tensors']) for entry in file_tensors)
         logger.info(f"Extracted metadata for {total_tensors} tensors "
-                   f"across {len(file_tensors)} files")
+                   f"across {len(file_tensors)} files from {metadata_path}")
 
         return file_tensors
 
+    except FileNotFoundError:
+        logger.error(f"Metadata file not found: {metadata_path}")
+        raise
     except Exception as e:
-        logger.error(f"Failed to extract tensor metadata: {e}")
+        logger.error(f"Failed to extract tensor metadata from {metadata_path}: {e}")
         raise
 
 
 def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0,
                        rank: int = 0, world_size: int = 1,
                        redis_host: str = "localhost", redis_port: int = 6379,
-                       run_id: str = None) -> bool:
+                       run_id: str = None, metadata_path: Optional[str] = None) -> bool:
     """
     Preload checkpoint tensors into shared memory.
 
@@ -137,6 +146,7 @@ def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0,
         redis_host: Redis server hostname/IP for coordination
         redis_port: Redis server port
         run_id: Unique run ID for coordination (auto-generated if None)
+        metadata_path: Optional path to metadata file. If None, defaults to checkpoint_dir/.metadata
 
     Returns:
         True if successful, False otherwise
@@ -163,8 +173,8 @@ def preload_checkpoint(checkpoint_dir: str, num_threads: int = 0,
         # First clean up any existing shared memory to prevent leaks/conflicts
         cleanup_resources()
 
-        # Extract tensor metadata
-        file_tensors = extract_tensor_metadata(checkpoint_dir)
+        # Extract tensor metadata with optional custom metadata path
+        file_tensors = extract_tensor_metadata(checkpoint_dir, metadata_path)
 
         # Pass to C++ extension for preloading with optional distributed parameters
         logger.info(f"Starting tensor preloading (rank {rank}/{world_size}) with C++ extension using {num_threads} threads")
@@ -204,6 +214,8 @@ if __name__ == "__main__":
     parser.add_argument("--redis-host", type=str, default="localhost", help="Redis server hostname/IP")
     parser.add_argument("--redis-port", type=int, default=6379, help="Redis server port")
     parser.add_argument("--run-id", type=str, default=None, help="Unique run ID")
+    parser.add_argument("--metadata-path", type=str, default=None,
+                       help="Path to metadata file (defaults to checkpoint_dir/.metadata)")
 
     args = parser.parse_args()
 
@@ -218,7 +230,8 @@ if __name__ == "__main__":
         args.world_size,
         args.redis_host,
         args.redis_port,
-        args.run_id
+        args.run_id,
+        args.metadata_path
     )
 
     if success:
