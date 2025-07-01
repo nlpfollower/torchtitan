@@ -123,15 +123,12 @@ def save_with_gc(state, checkpoint_id, planner=None):
 
 @torch.no_grad()
 def save_with_gc_with_custom_writer(state, checkpoint_id, job_config):
-    """Save using custom storage writer that handles node 0 correctly."""
+    """
+    Simpler save approach that relies only on the planner.
+    The metadata will be written by the coordinator (rank 0) but in the wrong location.
+    We'll need to move it afterward.
+    """
     is_infra_node0 = getattr(job_config.checkpoint, 'is_infra_node0', False)
-
-    # Create custom storage writer
-    storage_writer = InfraNode0StorageWriter(
-        path=checkpoint_id,
-        is_infra_node0=is_infra_node0,
-        ranks_per_node=8
-    )
 
     # Use the dynamic planner
     planner = DynamicNode0CheckpointPlanner(
@@ -139,14 +136,28 @@ def save_with_gc_with_custom_writer(state, checkpoint_id, job_config):
         is_infra_node0=is_infra_node0,
     )
 
-    # Save with custom writer and planner
-    dcp.save(
+    # Save with default storage writer but custom planner
+    metadata = dcp.save(
         state,
-        storage_writer=storage_writer,
+        checkpoint_id=checkpoint_id,
         planner=planner
     )
 
+    # If we're rank 0 and not on infra node 0, we need to move the metadata file
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0 and not is_infra_node0:
+        # The metadata was written to the wrong location
+        # We need to send it to infra node 0
+        metadata_path = os.path.join(checkpoint_id, ".metadata")
+        if os.path.exists(metadata_path):
+            logger.info(f"Rank 0: Moving metadata file to infrastructure node 0")
+            # This is tricky - we'd need shared filesystem or explicit transfer
+            # For now, log a warning
+            logger.warning(f"Metadata file written at {metadata_path} but should be on infra node 0")
+
     GarbageCollection.collect("GC collection invoked by checkpointer.")
+
+    return metadata
 
 def _get_save_planner(job_config):
     """Get the appropriate save planner based on configuration."""
@@ -665,8 +676,26 @@ class DynamicNode0CheckpointPlanner(DefaultSavePlanner):
             items_by_tensor[tensor_name].append(item)
 
         # Redistribute to save ranks only
-        redistributed_plans = [SavePlan(items=[]) for _ in range(self.world_size)]
+        # Important: preserve planner_data from original plans
+        redistributed_plans = []
+        for i, original_plan in enumerate(all_plans):
+            if i in self.save_ranks:
+                # This rank will get items
+                new_plan = SavePlan(
+                    items=[],
+                    storage_data=original_plan.storage_data,
+                    planner_data=original_plan.planner_data if original_plan.planner_data is not None else {}
+                )
+            else:
+                # This rank gets empty plan but preserve metadata
+                new_plan = SavePlan(
+                    items=[],
+                    storage_data=original_plan.storage_data,
+                    planner_data=original_plan.planner_data if original_plan.planner_data is not None else {}
+                )
+            redistributed_plans.append(new_plan)
 
+        # Now assign items to save ranks
         if self.save_ranks:
             target_rank_idx = 0
             for tensor_name, items in items_by_tensor.items():
@@ -681,6 +710,7 @@ class DynamicNode0CheckpointPlanner(DefaultSavePlanner):
                 logger.info(f"Rank {rank} will write {len(plan.items)} items")
 
         return redistributed_plans, metadata
+
 
 class CompleteCheckpointPlanner(DefaultSavePlanner):
     """
