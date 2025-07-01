@@ -14,18 +14,20 @@ import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
 from multiprocessing import get_context
-from typing import Any, Dict, List, Union, Optional
+from typing import Any, Dict, List, Union, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+from torch.distributed.checkpoint import DefaultSavePlanner, SavePlan, Metadata, WriteItem
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     set_model_state_dict,
     StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
@@ -111,7 +113,8 @@ class SaveDone:
 
 @torch.no_grad()
 def save_with_gc(state, checkpoint_id):
-    dcp.save(state, checkpoint_id=checkpoint_id)
+    planner = Node0CompleteSavePlanner(ranks_per_node=8, save_complete_model=True)
+    dcp.save(state, checkpoint_id=checkpoint_id, planner=planner)
     GarbageCollection.collect("GC collection invoked by checkpointer.")
 
 
@@ -424,55 +427,128 @@ class CheckpointManager:
             self.staging = False
 
     def load(self, step: int = -1, checkpoint_path: Optional[str] = None) -> bool:
+        logger.info(f"Starting checkpoint load: step={step}, checkpoint_path={checkpoint_path}")
+
+        # Check if checkpointing is enabled
+        logger.debug(f"Checking if checkpointing is enabled: {self.enable_checkpoint}")
         if not self.enable_checkpoint:
+            logger.info("Checkpointing is disabled, returning False")
             return False
+        logger.debug("Checkpointing is enabled, proceeding")
+
+        # Check if checkpoint folder exists
+        logger.debug(f"Checking if checkpoint folder exists: {self.folder}")
         if not os.path.isdir(self.folder):
+            logger.warning(f"Checkpoint folder does not exist: {self.folder}")
             return False
+        logger.debug(f"Checkpoint folder exists: {self.folder}")
 
         if checkpoint_path is not None:
+            logger.info(f"Using provided checkpoint path: {checkpoint_path}")
             checkpoint_id = checkpoint_path
             step = 0
         else:
-            if step != -1 and not os.path.isdir(self._create_checkpoint_id(step)):
-                return False
+            logger.debug("No checkpoint path provided, determining step and checkpoint_id")
+
+            if step != -1:
+                logger.debug(f"Checking if specific step directory exists: step={step}")
+                step_checkpoint_id = self._create_checkpoint_id(step)
+                logger.debug(f"Generated checkpoint_id for step {step}: {step_checkpoint_id}")
+                if not os.path.isdir(step_checkpoint_id):
+                    logger.warning(f"Checkpoint directory for step {step} does not exist: {step_checkpoint_id}")
+                    return False
+                logger.debug(f"Checkpoint directory for step {step} exists")
 
             if step == -1:
+                logger.debug("Auto-discovering latest checkpoint step")
                 step_counts = []
-                for filename in os.listdir(self.folder):
-                    match = re.search(r"step-(\d+)", filename)
-                    metadata_probe = os.path.join(self.folder, filename, ".metadata")
-                    if match and os.path.isfile(metadata_probe):
-                        step_counts.append(int(match.group(1)))
-                if not step_counts:
-                    return False
-                step = max(step_counts)
-            checkpoint_id = self._create_checkpoint_id(step)
+                logger.debug(f"Scanning folder for checkpoints: {self.folder}")
 
+                try:
+                    folder_contents = os.listdir(self.folder)
+                    logger.debug(f"Found {len(folder_contents)} items in checkpoint folder")
+
+                    for filename in folder_contents:
+                        logger.debug(f"Examining file/directory: {filename}")
+                        match = re.search(r"step-(\d+)", filename)
+                        if match:
+                            step_num = int(match.group(1))
+                            metadata_probe = os.path.join(self.folder, filename, ".metadata")
+                            logger.debug(f"Found step pattern {step_num}, checking metadata at: {metadata_probe}")
+
+                            if os.path.isfile(metadata_probe):
+                                step_counts.append(step_num)
+                                logger.debug(f"Valid checkpoint found for step {step_num}")
+                            else:
+                                logger.debug(f"No metadata file found for step {step_num}, skipping")
+                        else:
+                            logger.debug(f"No step pattern found in: {filename}")
+
+                    logger.info(f"Found {len(step_counts)} valid checkpoints: {sorted(step_counts)}")
+
+                except Exception as e:
+                    logger.error(f"Error scanning checkpoint folder: {e}")
+                    return False
+
+                if not step_counts:
+                    logger.warning("No valid checkpoints found in folder")
+                    return False
+
+                step = max(step_counts)
+                logger.info(f"Selected latest checkpoint step: {step}")
+
+            checkpoint_id = self._create_checkpoint_id(step)
+            logger.info(f"Final checkpoint_id: {checkpoint_id}")
+
+        # Determine which states to load
+        logger.debug(f"Determining states to load for step {step}")
         # We won't have optimizer states to load, if we are loading a seed checkpoint
         states = {"model": self.states["model"]} if step == 0 else self.states
+        logger.debug(f"Using states: {list(states.keys())} (seed checkpoint: {step == 0})")
+
         # PyTorch bug: (pytorch/pytorch#138575)
         # dcp.load() replaces the values of stateful elements in `states` with new objects
         # from loading the checkpoint, in addition to updating the states of the original
         # objects from `states` in-place. This is a problem because the state_dict no longer
         # refers to the objects being used in the train loop, meaning any future checkpoints
         # will not include updates to these objects (such as updated optimizer states, etc.)
+        logger.debug("Preserving original stateful states for PyTorch bug workaround")
         original_stateful_states = {
             k: v for k, v in states.items() if isinstance(v, Stateful)
         }
+        logger.debug(
+            f"Preserved {len(original_stateful_states)} stateful states: {list(original_stateful_states.keys())}")
+
         logger.info(f"Loading the checkpoint at step {step}.")
         begin = time.monotonic()
+
+        # Filter states to exclude from loading
+        logger.debug(f"Filtering states to exclude: {self.exclude_from_loading}")
         states_to_load = {
             k: v for k, v in states.items() if k not in self.exclude_from_loading
         }
+        logger.debug(f"States to load after filtering: {list(states_to_load.keys())}")
+
+        # Validate excluded keys exist
+        logger.debug("Validating excluded keys exist in states")
         for exclude_key in self.exclude_from_loading:
             if exclude_key not in states:
+                logger.error(
+                    f"Excluded key '{exclude_key}' not found in state_dict. Available keys: {list(states.keys())}")
                 raise ValueError(f"{exclude_key} not found in state_dict.")
+        logger.debug("All excluded keys validated successfully")
+
+        # Handle tensor preloading
         if self.use_tensor_preload:
+            logger.info(f"Tensor preloading enabled with run_id: {self.preload_run_id}")
             complete_file = f"/tmp/tensor_preload_{self.preload_run_id}_complete"
+            logger.debug(f"Looking for preload completion file: {complete_file}")
 
             # Wait for file to exist
             max_wait = self.preload_timeout
             wait_time = 0
+            logger.debug(f"Starting wait for tensor preload completion (max_wait: {max_wait}s)")
+
             while not os.path.exists(complete_file) and (max_wait == 0 or wait_time < max_wait):
                 time.sleep(1)
                 wait_time += 1
@@ -482,28 +558,53 @@ class CheckpointManager:
             if os.path.exists(complete_file):
                 logger.info("Tensor preload complete, using optimized reader")
                 reader = OptimizedFileSystemReader(checkpoint_id)
+                logger.debug(f"Created OptimizedFileSystemReader for: {checkpoint_id}")
             else:
-                logger.info("Tensor preload not complete, using standard reader")
+                logger.warning(f"Tensor preload not complete after {wait_time}s, using standard reader")
                 reader = None
-            dcp.load(
-                states_to_load,
-                checkpoint_id=checkpoint_id,
-                storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
-            )
+
+            logger.debug("Starting dcp.load with optimized reader")
+            try:
+                dcp.load(
+                    states_to_load,
+                    checkpoint_id=checkpoint_id,
+                    storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
+                )
+                logger.debug("dcp.load with optimized reader completed successfully")
+            except Exception as e:
+                logger.error(f"Error during dcp.load with optimized reader: {e}")
+                raise
         else:
-            logger.info("Using standard reader")
-            dcp.load(
-                states,
-                checkpoint_id=checkpoint_id,
-            )
+            logger.info("Tensor preloading disabled, using standard reader")
+            logger.debug("Starting dcp.load with standard reader")
+            try:
+                dcp.load(
+                    states,
+                    checkpoint_id=checkpoint_id,
+                )
+                logger.debug("dcp.load with standard reader completed successfully")
+            except Exception as e:
+                logger.error(f"Error during dcp.load with standard reader: {e}")
+                raise
+
+        # Update states
+        logger.debug("Updating states with loaded states")
         states.update(states_to_load)
-        logger.info(
-            f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."
-        )
+
+        load_time = time.monotonic() - begin
+        logger.info(f"Finished loading the checkpoint in {load_time:.2f} seconds.")
+
         # bugfix from above: restore the original stateful objects,
         # whose states were already updated in-place by dcp.load()
+        logger.debug("Restoring original stateful objects (PyTorch bug workaround)")
         states.update(original_stateful_states)
+        logger.debug(f"Restored {len(original_stateful_states)} original stateful objects")
+
+        logger.debug("Starting garbage collection for checkpoint loading")
         GarbageCollection.collect("GC collection for checkpoint loading.")
+        logger.debug("Garbage collection completed")
+
+        logger.info(f"Checkpoint load completed successfully: step={step}, time={load_time:.2f}s")
         return True
 
     def _purge_stale_checkpoints(self):
@@ -523,3 +624,94 @@ class CheckpointManager:
             for _, path in to_delete:
                 logger.info(f"Deleting old checkpoint {path}")
                 shutil.rmtree(path, ignore_errors=True)
+
+
+class Node0CompleteSavePlanner(DefaultSavePlanner):
+    """
+    Custom save planner that gathers all model shards to node 0 and saves a complete checkpoint.
+    Only ranks on node 0 participate in the actual save operation.
+    """
+
+    def __init__(
+            self,
+            flatten_state_dict: bool = True,
+            flatten_sharded_tensors: bool = True,
+            ranks_per_node: int = 8,
+            save_complete_model: bool = True,
+            **kwargs
+    ):
+        super().__init__(
+            flatten_state_dict=flatten_state_dict,
+            flatten_sharded_tensors=flatten_sharded_tensors,
+            **kwargs
+        )
+        self.ranks_per_node = ranks_per_node
+        self.save_complete_model = save_complete_model
+
+        # Determine node information
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.node_id = self.rank // self.ranks_per_node
+        self.is_node0 = self.node_id == 0
+        self.node0_ranks = list(range(min(self.ranks_per_node, self.world_size)))
+
+        logger.info(
+            f"Node0CompleteSavePlanner initialized: rank={self.rank}, node={self.node_id}, is_node0={self.is_node0}")
+
+    def create_local_plan(self) -> SavePlan:
+        """Create local plan - only node 0 ranks create write items."""
+        if not self.is_node0:
+            # Non-node0 ranks return empty plan
+            logger.info(f"Rank {self.rank} on node {self.node_id}: Returning empty local plan (not node 0)")
+            return SavePlan(items=[])
+
+        # Node 0 ranks create the normal local plan
+        logger.info(f"Rank {self.rank} on node {self.node_id}: Creating local save plan")
+        return super().create_local_plan()
+
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        """
+        Create global plan that assigns all writes to node 0 ranks.
+        This is called only on the coordinator rank.
+        """
+        logger.info(f"Coordinator creating global plan with {len(all_plans)} local plans")
+
+        # Filter out empty plans from non-node0 ranks
+        node0_plans = [plan for i, plan in enumerate(all_plans) if i in self.node0_ranks and plan.items]
+
+        if not node0_plans:
+            logger.warning("No valid plans from node 0 ranks!")
+            return all_plans, Metadata({})
+
+        # Create global plan using only node0 plans
+        global_plans, metadata = super().create_global_plan(node0_plans)
+
+        # Pad the global plans to match world size
+        # Non-node0 ranks get empty plans
+        final_plans = []
+        global_plan_idx = 0
+
+        for rank in range(self.world_size):
+            if rank in self.node0_ranks and global_plan_idx < len(global_plans):
+                final_plans.append(global_plans[global_plan_idx])
+                global_plan_idx += 1
+            else:
+                final_plans.append(SavePlan(items=[]))
+
+        logger.info(f"Global plan created: {len([p for p in final_plans if p.items])} ranks will save")
+
+        return final_plans, metadata
+
+    def resolve_data(self, write_item: WriteItem) -> torch.Tensor:
+        """
+        Resolve data for writing. If save_complete_model is True,
+        convert DTensors to complete tensors.
+        """
+        obj = self.lookup_object(write_item.index)
+
+        if self.save_complete_model and isinstance(obj, DTensor):
+            # Get the complete tensor instead of just the local shard
+            logger.debug(f"Converting DTensor {write_item.index.fqn} to complete tensor")
+            obj = obj.full_tensor()
+
+        return self.transform_object(write_item, obj)
