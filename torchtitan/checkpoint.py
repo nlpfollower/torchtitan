@@ -112,10 +112,32 @@ class SaveDone:
 
 
 @torch.no_grad()
-def save_with_gc(state, checkpoint_id):
-    planner = Node0CompleteSavePlanner(ranks_per_node=8, save_complete_model=True)
+def save_with_gc(state, checkpoint_id, planner=None):
+    if planner is None:
+        planner = CompleteCheckpointPlanner(
+            ranks_per_node=8,
+            target_node=0,
+        )
     dcp.save(state, checkpoint_id=checkpoint_id, planner=planner)
     GarbageCollection.collect("GC collection invoked by checkpointer.")
+
+def _get_save_planner(job_config):
+    """Get the appropriate save planner based on configuration."""
+    # Check if we should use the dynamic node 0 planner
+    logger.info("Determining save planner based on job configuration.")
+    if hasattr(job_config.checkpoint, 'is_infra_node0'):
+        logger.info("Using DynamicNode0CheckpointPlanner for save planning.")
+        return DynamicNode0CheckpointPlanner(
+            ranks_per_node=8,  # You might want to make this configurable too
+            is_infra_node0=job_config.checkpoint.is_infra_node0,
+        )
+    else:
+        logger.info("Using default CompleteCheckpointPlanner for save planning.")
+        # Default behavior - use the CompleteCheckpointPlanner
+        return CompleteCheckpointPlanner(
+            ranks_per_node=8,
+            target_node=0,
+        )
 
 
 def checkpoint_mp(recv, send):
@@ -157,6 +179,7 @@ class CheckpointManager:
         states: Dict[str, Any],
         job_config: JobConfig,
     ) -> None:
+        self.job_config = job_config
         ckpt_config = job_config.checkpoint
         self.enable_checkpoint = ckpt_config.enable_checkpoint
         self.keep_latest_k = ckpt_config.keep_latest_k
@@ -293,7 +316,10 @@ class CheckpointManager:
         else:
             logger.info(f"Saving a full checkpoint at {'final' if is_final else 'last'} step, step {curr_step}.")
 
-        save_with_gc(self.states, checkpoint_id=self._create_checkpoint_id(curr_step, is_final))
+        # Get the appropriate planner
+        planner = _get_save_planner(self.job_config)
+
+        save_with_gc(self.states, checkpoint_id=self._create_checkpoint_id(curr_step, is_final), planner=planner)
         self.reset()
 
     def _should_save(self, curr_step: int, force: bool = False) -> bool:
@@ -396,7 +422,9 @@ class CheckpointManager:
                 self.states, checkpoint_id=checkpoint_id, process_group=self.pg
             )
         else:
-            save_with_gc(self.states, checkpoint_id=checkpoint_id)
+            # Get the planner for regular save
+            planner = _get_save_planner(self.job_config)
+            save_with_gc(self.states, checkpoint_id=checkpoint_id, planner=planner)
         self.reset()
         self._purge_stale_checkpoints()
 
@@ -427,128 +455,55 @@ class CheckpointManager:
             self.staging = False
 
     def load(self, step: int = -1, checkpoint_path: Optional[str] = None) -> bool:
-        logger.info(f"Starting checkpoint load: step={step}, checkpoint_path={checkpoint_path}")
-
-        # Check if checkpointing is enabled
-        logger.debug(f"Checking if checkpointing is enabled: {self.enable_checkpoint}")
         if not self.enable_checkpoint:
-            logger.info("Checkpointing is disabled, returning False")
             return False
-        logger.debug("Checkpointing is enabled, proceeding")
-
-        # Check if checkpoint folder exists
-        logger.debug(f"Checking if checkpoint folder exists: {self.folder}")
         if not os.path.isdir(self.folder):
-            logger.warning(f"Checkpoint folder does not exist: {self.folder}")
             return False
-        logger.debug(f"Checkpoint folder exists: {self.folder}")
 
         if checkpoint_path is not None:
-            logger.info(f"Using provided checkpoint path: {checkpoint_path}")
             checkpoint_id = checkpoint_path
             step = 0
         else:
-            logger.debug("No checkpoint path provided, determining step and checkpoint_id")
-
-            if step != -1:
-                logger.debug(f"Checking if specific step directory exists: step={step}")
-                step_checkpoint_id = self._create_checkpoint_id(step)
-                logger.debug(f"Generated checkpoint_id for step {step}: {step_checkpoint_id}")
-                if not os.path.isdir(step_checkpoint_id):
-                    logger.warning(f"Checkpoint directory for step {step} does not exist: {step_checkpoint_id}")
-                    return False
-                logger.debug(f"Checkpoint directory for step {step} exists")
+            if step != -1 and not os.path.isdir(self._create_checkpoint_id(step)):
+                return False
 
             if step == -1:
-                logger.debug("Auto-discovering latest checkpoint step")
                 step_counts = []
-                logger.debug(f"Scanning folder for checkpoints: {self.folder}")
-
-                try:
-                    folder_contents = os.listdir(self.folder)
-                    logger.debug(f"Found {len(folder_contents)} items in checkpoint folder")
-
-                    for filename in folder_contents:
-                        logger.debug(f"Examining file/directory: {filename}")
-                        match = re.search(r"step-(\d+)", filename)
-                        if match:
-                            step_num = int(match.group(1))
-                            metadata_probe = os.path.join(self.folder, filename, ".metadata")
-                            logger.debug(f"Found step pattern {step_num}, checking metadata at: {metadata_probe}")
-
-                            if os.path.isfile(metadata_probe):
-                                step_counts.append(step_num)
-                                logger.debug(f"Valid checkpoint found for step {step_num}")
-                            else:
-                                logger.debug(f"No metadata file found for step {step_num}, skipping")
-                        else:
-                            logger.debug(f"No step pattern found in: {filename}")
-
-                    logger.info(f"Found {len(step_counts)} valid checkpoints: {sorted(step_counts)}")
-
-                except Exception as e:
-                    logger.error(f"Error scanning checkpoint folder: {e}")
-                    return False
-
+                for filename in os.listdir(self.folder):
+                    match = re.search(r"step-(\d+)", filename)
+                    metadata_probe = os.path.join(self.folder, filename, ".metadata")
+                    if match and os.path.isfile(metadata_probe):
+                        step_counts.append(int(match.group(1)))
                 if not step_counts:
-                    logger.warning("No valid checkpoints found in folder")
                     return False
-
                 step = max(step_counts)
-                logger.info(f"Selected latest checkpoint step: {step}")
-
             checkpoint_id = self._create_checkpoint_id(step)
-            logger.info(f"Final checkpoint_id: {checkpoint_id}")
 
-        # Determine which states to load
-        logger.debug(f"Determining states to load for step {step}")
         # We won't have optimizer states to load, if we are loading a seed checkpoint
         states = {"model": self.states["model"]} if step == 0 else self.states
-        logger.debug(f"Using states: {list(states.keys())} (seed checkpoint: {step == 0})")
-
         # PyTorch bug: (pytorch/pytorch#138575)
         # dcp.load() replaces the values of stateful elements in `states` with new objects
         # from loading the checkpoint, in addition to updating the states of the original
         # objects from `states` in-place. This is a problem because the state_dict no longer
         # refers to the objects being used in the train loop, meaning any future checkpoints
         # will not include updates to these objects (such as updated optimizer states, etc.)
-        logger.debug("Preserving original stateful states for PyTorch bug workaround")
         original_stateful_states = {
             k: v for k, v in states.items() if isinstance(v, Stateful)
         }
-        logger.debug(
-            f"Preserved {len(original_stateful_states)} stateful states: {list(original_stateful_states.keys())}")
-
         logger.info(f"Loading the checkpoint at step {step}.")
         begin = time.monotonic()
-
-        # Filter states to exclude from loading
-        logger.debug(f"Filtering states to exclude: {self.exclude_from_loading}")
         states_to_load = {
             k: v for k, v in states.items() if k not in self.exclude_from_loading
         }
-        logger.debug(f"States to load after filtering: {list(states_to_load.keys())}")
-
-        # Validate excluded keys exist
-        logger.debug("Validating excluded keys exist in states")
         for exclude_key in self.exclude_from_loading:
             if exclude_key not in states:
-                logger.error(
-                    f"Excluded key '{exclude_key}' not found in state_dict. Available keys: {list(states.keys())}")
                 raise ValueError(f"{exclude_key} not found in state_dict.")
-        logger.debug("All excluded keys validated successfully")
-
-        # Handle tensor preloading
         if self.use_tensor_preload:
-            logger.info(f"Tensor preloading enabled with run_id: {self.preload_run_id}")
             complete_file = f"/tmp/tensor_preload_{self.preload_run_id}_complete"
-            logger.debug(f"Looking for preload completion file: {complete_file}")
 
             # Wait for file to exist
             max_wait = self.preload_timeout
             wait_time = 0
-            logger.debug(f"Starting wait for tensor preload completion (max_wait: {max_wait}s)")
-
             while not os.path.exists(complete_file) and (max_wait == 0 or wait_time < max_wait):
                 time.sleep(1)
                 wait_time += 1
@@ -558,53 +513,22 @@ class CheckpointManager:
             if os.path.exists(complete_file):
                 logger.info("Tensor preload complete, using optimized reader")
                 reader = OptimizedFileSystemReader(checkpoint_id)
-                logger.debug(f"Created OptimizedFileSystemReader for: {checkpoint_id}")
             else:
-                logger.warning(f"Tensor preload not complete after {wait_time}s, using standard reader")
+                logger.info("Tensor preload not complete, using standard reader")
                 reader = None
-
-            logger.debug("Starting dcp.load with optimized reader")
-            try:
-                dcp.load(
-                    states_to_load,
-                    checkpoint_id=checkpoint_id,
-                    storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
-                )
-                logger.debug("dcp.load with optimized reader completed successfully")
-            except Exception as e:
-                logger.error(f"Error during dcp.load with optimized reader: {e}")
-                raise
-        else:
-            logger.info("Tensor preloading disabled, using standard reader")
-            logger.debug("Starting dcp.load with standard reader")
-            try:
-                dcp.load(
-                    states,
-                    checkpoint_id=checkpoint_id,
-                )
-                logger.debug("dcp.load with standard reader completed successfully")
-            except Exception as e:
-                logger.error(f"Error during dcp.load with standard reader: {e}")
-                raise
-
-        # Update states
-        logger.debug("Updating states with loaded states")
+        dcp.load(
+            states_to_load,
+            checkpoint_id=checkpoint_id,
+            storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
+        )
         states.update(states_to_load)
-
-        load_time = time.monotonic() - begin
-        logger.info(f"Finished loading the checkpoint in {load_time:.2f} seconds.")
-
+        logger.info(
+            f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."
+        )
         # bugfix from above: restore the original stateful objects,
         # whose states were already updated in-place by dcp.load()
-        logger.debug("Restoring original stateful objects (PyTorch bug workaround)")
         states.update(original_stateful_states)
-        logger.debug(f"Restored {len(original_stateful_states)} original stateful objects")
-
-        logger.debug("Starting garbage collection for checkpoint loading")
         GarbageCollection.collect("GC collection for checkpoint loading.")
-        logger.debug("Garbage collection completed")
-
-        logger.info(f"Checkpoint load completed successfully: step={step}, time={load_time:.2f}s")
         return True
 
     def _purge_stale_checkpoints(self):
@@ -626,10 +550,10 @@ class CheckpointManager:
                 shutil.rmtree(path, ignore_errors=True)
 
 
-class Node0CompleteSavePlanner(DefaultSavePlanner):
+class DynamicNode0CheckpointPlanner(DefaultSavePlanner):
     """
-    Custom save planner that gathers all model shards to node 0 and saves a complete checkpoint.
-    Only ranks on node 0 participate in the actual save operation.
+    Custom planner that dynamically determines which node should save based on a flag.
+    The node with the special flag (e.g., access to /mnt/cold) becomes the save node.
     """
 
     def __init__(
@@ -637,7 +561,7 @@ class Node0CompleteSavePlanner(DefaultSavePlanner):
             flatten_state_dict: bool = True,
             flatten_sharded_tensors: bool = True,
             ranks_per_node: int = 8,
-            save_complete_model: bool = True,
+            is_infra_node0: bool = False,  # Set via CLI flag
             **kwargs
     ):
         super().__init__(
@@ -646,72 +570,172 @@ class Node0CompleteSavePlanner(DefaultSavePlanner):
             **kwargs
         )
         self.ranks_per_node = ranks_per_node
-        self.save_complete_model = save_complete_model
+        self.is_infra_node0 = is_infra_node0
+
+        # Get basic rank info
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        # Determine which ranks belong to the infrastructure node 0
+        self._determine_save_ranks()
+
+    def _determine_save_ranks(self):
+        """Determine which ranks should save based on infrastructure node 0 flag."""
+        # Create a tensor to gather node 0 information from all ranks
+        node0_indicator = torch.tensor(1 if self.is_infra_node0 else 0, dtype=torch.int32).cuda()
+
+        # Gather from all ranks
+        all_indicators = [torch.zeros(1, dtype=torch.int32).cuda() for _ in range(self.world_size)]
+        dist.all_gather(all_indicators, node0_indicator)
+
+        # Find which ranks are on infrastructure node 0
+        self.save_ranks = []
+        for rank, indicator in enumerate(all_indicators):
+            if indicator.item() == 1:
+                self.save_ranks.append(rank)
+
+        # Verify we found exactly ranks_per_node ranks
+        if len(self.save_ranks) != self.ranks_per_node:
+            logger.warning(f"Expected {self.ranks_per_node} ranks on infra node 0, found {len(self.save_ranks)}")
+
+        self.should_save = self.rank in self.save_ranks
+
+        logger.info(f"Rank {self.rank}: is_infra_node0={self.is_infra_node0}, "
+                    f"save_ranks={self.save_ranks}, should_save={self.should_save}")
+
+    def create_local_plan(self) -> SavePlan:
+        """Create local plan - all ranks create plans for complete metadata."""
+        plan = super().create_local_plan()
+        logger.info(f"Rank {self.rank}: Created local plan with {len(plan.items)} items")
+        return plan
+
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        """Redistribute writes to only infrastructure node 0 ranks."""
+        logger.info(f"Coordinator creating global plan from {len(all_plans)} local plans")
+
+        # Create global plan with all plans for complete metadata
+        global_plans, metadata = super().create_global_plan(all_plans)
+
+        # Collect all write items
+        all_write_items = []
+        for plan in global_plans:
+            all_write_items.extend(plan.items)
+
+        logger.info(f"Total write items collected: {len(all_write_items)}")
+
+        # Group items by tensor name
+        items_by_tensor = {}
+        for item in all_write_items:
+            tensor_name = item.index.fqn
+            if tensor_name not in items_by_tensor:
+                items_by_tensor[tensor_name] = []
+            items_by_tensor[tensor_name].append(item)
+
+        # Redistribute to save ranks only
+        redistributed_plans = [SavePlan(items=[]) for _ in range(self.world_size)]
+
+        if self.save_ranks:
+            target_rank_idx = 0
+            for tensor_name, items in items_by_tensor.items():
+                # Round-robin assignment to save ranks
+                target_rank = self.save_ranks[target_rank_idx % len(self.save_ranks)]
+                redistributed_plans[target_rank].items.extend(items)
+                target_rank_idx += 1
+
+        # Log redistribution
+        for rank, plan in enumerate(redistributed_plans):
+            if plan.items:
+                logger.info(f"Rank {rank} will write {len(plan.items)} items")
+
+        return redistributed_plans, metadata
+
+class CompleteCheckpointPlanner(DefaultSavePlanner):
+    """
+    Custom planner that collects all tensor shards and saves complete checkpoint on node 0.
+    This planner ensures all ranks contribute their shards to the plan, but only node 0 writes.
+    """
+
+    def __init__(
+            self,
+            flatten_state_dict: bool = True,
+            flatten_sharded_tensors: bool = True,
+            ranks_per_node: int = 8,
+            target_node: int = 0,
+            **kwargs
+    ):
+        super().__init__(
+            flatten_state_dict=flatten_state_dict,
+            flatten_sharded_tensors=flatten_sharded_tensors,
+            **kwargs
+        )
+        self.ranks_per_node = ranks_per_node
+        self.target_node = target_node
 
         # Determine node information
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.node_id = self.rank // self.ranks_per_node
-        self.is_node0 = self.node_id == 0
-        self.node0_ranks = list(range(min(self.ranks_per_node, self.world_size)))
+        self.is_target_node = self.node_id == self.target_node
+        self.target_node_ranks = list(range(
+            self.target_node * self.ranks_per_node,
+            min((self.target_node + 1) * self.ranks_per_node, self.world_size)
+        ))
 
-        logger.info(
-            f"Node0CompleteSavePlanner initialized: rank={self.rank}, node={self.node_id}, is_node0={self.is_node0}")
+        logger.info(f"CompleteCheckpointPlanner: rank={self.rank}, node={self.node_id}, "
+                    f"is_target_node={self.is_target_node}, target_ranks={self.target_node_ranks}")
 
     def create_local_plan(self) -> SavePlan:
-        """Create local plan - only node 0 ranks create write items."""
-        if not self.is_node0:
-            # Non-node0 ranks return empty plan
-            logger.info(f"Rank {self.rank} on node {self.node_id}: Returning empty local plan (not node 0)")
-            return SavePlan(items=[])
-
-        # Node 0 ranks create the normal local plan
-        logger.info(f"Rank {self.rank} on node {self.node_id}: Creating local save plan")
-        return super().create_local_plan()
+        """
+        Create local plan. ALL ranks create their write items so we can collect
+        all tensor shards in the global plan.
+        """
+        # All ranks create their local plan normally
+        plan = super().create_local_plan()
+        logger.info(f"Rank {self.rank}: Created local plan with {len(plan.items)} items")
+        return plan
 
     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
         """
-        Create global plan that assigns all writes to node 0 ranks.
-        This is called only on the coordinator rank.
+        Create global plan that collects all shards but assigns writes only to target node ranks.
+        This ensures we have complete tensor metadata from all ranks.
         """
-        logger.info(f"Coordinator creating global plan with {len(all_plans)} local plans")
+        logger.info(f"Coordinator creating global plan from {len(all_plans)} local plans")
 
-        # Filter out empty plans from non-node0 ranks
-        node0_plans = [plan for i, plan in enumerate(all_plans) if i in self.node0_ranks and plan.items]
+        # First, create the global plan with ALL plans to get complete metadata
+        global_plans, metadata = super().create_global_plan(all_plans)
 
-        if not node0_plans:
-            logger.warning("No valid plans from node 0 ranks!")
-            return all_plans, Metadata({})
+        # Now redistribute the write items to only target node ranks
+        # Collect all write items
+        all_write_items = []
+        for plan in global_plans:
+            all_write_items.extend(plan.items)
 
-        # Create global plan using only node0 plans
-        global_plans, metadata = super().create_global_plan(node0_plans)
+        logger.info(f"Total write items collected: {len(all_write_items)}")
 
-        # Pad the global plans to match world size
-        # Non-node0 ranks get empty plans
-        final_plans = []
-        global_plan_idx = 0
+        # Group items by tensor name
+        items_by_tensor = {}
+        for item in all_write_items:
+            tensor_name = item.index.fqn
+            if tensor_name not in items_by_tensor:
+                items_by_tensor[tensor_name] = []
+            items_by_tensor[tensor_name].append(item)
 
-        for rank in range(self.world_size):
-            if rank in self.node0_ranks and global_plan_idx < len(global_plans):
-                final_plans.append(global_plans[global_plan_idx])
-                global_plan_idx += 1
-            else:
-                final_plans.append(SavePlan(items=[]))
+        # Redistribute items to target node ranks using round-robin
+        redistributed_plans = [SavePlan(items=[]) for _ in range(self.world_size)]
 
-        logger.info(f"Global plan created: {len([p for p in final_plans if p.items])} ranks will save")
+        target_rank_idx = 0
+        for tensor_name, items in items_by_tensor.items():
+            # Assign all shards of a tensor to one rank on the target node
+            if self.target_node_ranks:
+                target_rank = self.target_node_ranks[target_rank_idx % len(self.target_node_ranks)]
+                redistributed_plans[target_rank].items.extend(items)
+                target_rank_idx += 1
 
-        return final_plans, metadata
+        # Log redistribution results
+        for rank, plan in enumerate(redistributed_plans):
+            if plan.items:
+                logger.info(f"Rank {rank} will write {len(plan.items)} items")
 
-    def resolve_data(self, write_item: WriteItem) -> torch.Tensor:
-        """
-        Resolve data for writing. If save_complete_model is True,
-        convert DTensors to complete tensors.
-        """
-        obj = self.lookup_object(write_item.index)
+        return redistributed_plans, metadata
 
-        if self.save_complete_model and isinstance(obj, DTensor):
-            # Get the complete tensor instead of just the local shard
-            logger.debug(f"Converting DTensor {write_item.index.fqn} to complete tensor")
-            obj = obj.full_tensor()
-
-        return self.transform_object(write_item, obj)

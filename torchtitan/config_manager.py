@@ -684,6 +684,11 @@ class JobConfig:
             default="",
             help="Run ID for tensor preloading"
         )
+        self.parser.add_argument(
+            "--checkpoint.is_infra_node0",
+            action="store_true",
+            help="Indicates this is infrastructure node 0 (the node with storage access like /mnt/cold)",
+        )
         # activation checkpointing configs
         self.parser.add_argument(
             "--activation_checkpoint.mode",
