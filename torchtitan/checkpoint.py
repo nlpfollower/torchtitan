@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+import dataclasses
 import enum
 import functools
 import os
@@ -21,6 +21,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint import DefaultSavePlanner, SavePlan, Metadata, WriteItem, FileSystemWriter
+from torch.distributed.checkpoint.default_planner import create_default_global_save_plan
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     set_model_state_dict,
@@ -121,14 +122,18 @@ def save_with_gc(state, checkpoint_id, planner=None):
     dcp.save(state, checkpoint_id=checkpoint_id, planner=planner)
     GarbageCollection.collect("GC collection invoked by checkpointer.")
 
+
 @torch.no_grad()
 def save_with_gc_with_custom_writer(state, checkpoint_id, job_config):
-    """
-    Simpler save approach that relies only on the planner.
-    The metadata will be written by the coordinator (rank 0) but in the wrong location.
-    We'll need to move it afterward.
-    """
+    """Save using custom storage writer that handles node 0 correctly."""
     is_infra_node0 = getattr(job_config.checkpoint, 'is_infra_node0', False)
+
+    # Create custom storage writer
+    storage_writer = InfraNode0StorageWriter(
+        path=checkpoint_id,
+        is_infra_node0=is_infra_node0,
+        ranks_per_node=8
+    )
 
     # Use the dynamic planner
     planner = DynamicNode0CheckpointPlanner(
@@ -136,28 +141,17 @@ def save_with_gc_with_custom_writer(state, checkpoint_id, job_config):
         is_infra_node0=is_infra_node0,
     )
 
-    # Save with default storage writer but custom planner
+    # Save with custom writer and planner
     metadata = dcp.save(
         state,
-        checkpoint_id=checkpoint_id,
+        storage_writer=storage_writer,
         planner=planner
     )
-
-    # If we're rank 0 and not on infra node 0, we need to move the metadata file
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank == 0 and not is_infra_node0:
-        # The metadata was written to the wrong location
-        # We need to send it to infra node 0
-        metadata_path = os.path.join(checkpoint_id, ".metadata")
-        if os.path.exists(metadata_path):
-            logger.info(f"Rank 0: Moving metadata file to infrastructure node 0")
-            # This is tricky - we'd need shared filesystem or explicit transfer
-            # For now, log a warning
-            logger.warning(f"Metadata file written at {metadata_path} but should be on infra node 0")
 
     GarbageCollection.collect("GC collection invoked by checkpointer.")
 
     return metadata
+
 
 def _get_save_planner(job_config):
     """Get the appropriate save planner based on configuration."""
@@ -326,37 +320,38 @@ class CheckpointManager:
         return os.path.join(self.folder, f"step-{step}")
 
     def _save_last_step(self, curr_step: int, is_final: bool = False) -> None:
-        # We only consider saving weights only at the end of the training. So
-        # this won't affect preemption and training resume. We also only allow
-        # dtype conversion when we are checkpoint model weights only and the
-        # current dtype is not the same as the export dtype at the end of the training.
         if self.model_weights_only:
-            # We update self.states to keep the model only.
-            # After this update, self.states = {
-            #      'tok_embeddings.weight':...,
-            #      'layers.0.attention.wq.weight': ...
-            # }.
-            self.states = self.states["model"].state_dict()
+            # Instead of replacing self.states entirely, we create a new dict
+            # that preserves the "model." prefix in the keys
+            model_state_dict = self.states["model"].state_dict()
 
-            # For now, we will manually pop the freqs_cis buffer, as we made this permanent
-            # temporarily and we don't want to include it in the exported state_dict.
-            # Context: https://github.com/pytorch/torchtitan/blob/main/torchtitan/models/llama/model.py#L348
-            self.states.pop("freqs_cis")
+            # Create new states dict with "model." prefix preserved
+            prefixed_state_dict = {
+                f"model.{k}": v for k, v in model_state_dict.items()
+            }
+
+            # Remove the freqs_cis buffer with the correct prefixed key
+            prefixed_state_dict.pop("model.freqs_cis", None)
 
             if self.export_dtype != torch.float32:
-                self.states = {
-                    k: v.to(self.export_dtype) for k, v in self.states.items()
+                prefixed_state_dict = {
+                    k: v.to(self.export_dtype) for k, v in prefixed_state_dict.items()
                 }
+
+            # Now save the prefixed state dict
+            states_to_save = prefixed_state_dict
+
             logger.info(
                 f"Saving a model weights only checkpoint in {self.export_dtype} "
                 f"at last step, step {curr_step}."
             )
         else:
+            states_to_save = self.states
             logger.info(f"Saving a full checkpoint at {'final' if is_final else 'last'} step, step {curr_step}.")
 
         # Get the appropriate planner
         save_with_gc_with_custom_writer(
-            self.states,
+            states_to_save,
             checkpoint_id=self._create_checkpoint_id(curr_step, is_final),
             job_config=self.job_config
         )
@@ -595,25 +590,17 @@ class CheckpointManager:
 
 class DynamicNode0CheckpointPlanner(DefaultSavePlanner):
     """
-    Custom planner that dynamically determines which node should save based on a flag.
-    The node with the special flag (e.g., access to /mnt/cold) becomes the save node.
+    Custom planner that ensures all data is saved only on infrastructure node 0.
+    This planner maintains proper metadata while redirecting actual writes.
     """
 
-    def __init__(
-            self,
-            flatten_state_dict: bool = True,
-            flatten_sharded_tensors: bool = True,
-            ranks_per_node: int = 8,
-            is_infra_node0: bool = False,  # Set via CLI flag
-            **kwargs
-    ):
-        super().__init__(
-            flatten_state_dict=flatten_state_dict,
-            flatten_sharded_tensors=flatten_sharded_tensors,
-            **kwargs
-        )
-        self.ranks_per_node = ranks_per_node
-        self.is_infra_node0 = is_infra_node0
+    def __init__(self, *args, **kwargs):
+        # Extract our custom args before passing to parent
+        self.ranks_per_node = kwargs.pop('ranks_per_node', 8)
+        self.is_infra_node0 = kwargs.pop('is_infra_node0', False)
+
+        # Initialize parent with remaining args
+        super().__init__(*args, **kwargs)
 
         # Get basic rank info
         self.rank = dist.get_rank() if dist.is_initialized() else 0
@@ -625,6 +612,11 @@ class DynamicNode0CheckpointPlanner(DefaultSavePlanner):
 
     def _determine_save_ranks(self):
         """Determine which ranks should save based on infrastructure node 0 flag."""
+        if not dist.is_initialized():
+            self.save_ranks = [0]
+            self.should_save = True
+            return
+
         # Create a tensor to gather node 0 information from all ranks
         node0_indicator = torch.tensor(1 if self.is_infra_node0 else 0, dtype=torch.int32).cuda()
 
@@ -647,27 +639,37 @@ class DynamicNode0CheckpointPlanner(DefaultSavePlanner):
         logger.info(f"Rank {self.rank}: is_infra_node0={self.is_infra_node0}, "
                     f"save_ranks={self.save_ranks}, should_save={self.should_save}")
 
-    def create_local_plan(self) -> SavePlan:
-        """Create local plan - all ranks create plans for complete metadata."""
-        plan = super().create_local_plan()
-        logger.info(f"Rank {self.rank}: Created local plan with {len(plan.items)} items")
-        return plan
-
     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
-        """Redistribute writes to only infrastructure node 0 ranks."""
+        """
+        Create global plan that maintains metadata integrity while redistributing writes.
+        """
         logger.info(f"Coordinator creating global plan from {len(all_plans)} local plans")
 
-        # Create global plan with all plans for complete metadata
-        global_plans, metadata = super().create_global_plan(all_plans)
+        # Use the default global plan creation to ensure proper metadata
+        # This is essentially what super().create_global_plan() does
+        from torch.distributed.checkpoint._dedup_save_plans import dedup_save_plans
 
-        # Collect all write items
+        # Apply deduplication if configured
+        all_plans = dedup_save_plans(all_plans, self.dedup_save_to_lowest_rank)
+
+        # Create the actual global plan and metadata
+        global_plans, metadata = create_default_global_save_plan(all_plans)
+
+        # Handle flattened state dict mappings if needed
+        if self.flatten_state_dict:
+            from collections import ChainMap
+            planner_data_dict = [p.planner_data for p in global_plans]
+            merged_mappings = dict(ChainMap(*planner_data_dict))
+            metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+
+        # Now redistribute the write items while keeping metadata intact
         all_write_items = []
         for plan in global_plans:
             all_write_items.extend(plan.items)
 
         logger.info(f"Total write items collected: {len(all_write_items)}")
 
-        # Group items by tensor name
+        # Group items by tensor name for better distribution
         items_by_tensor = {}
         for item in all_write_items:
             tensor_name = item.index.fqn
@@ -675,129 +677,34 @@ class DynamicNode0CheckpointPlanner(DefaultSavePlanner):
                 items_by_tensor[tensor_name] = []
             items_by_tensor[tensor_name].append(item)
 
-        # Redistribute to save ranks only
-        # Important: preserve planner_data from original plans
+        # Create redistributed plans
         redistributed_plans = []
-        for i, original_plan in enumerate(all_plans):
-            if i in self.save_ranks:
-                # This rank will get items
-                new_plan = SavePlan(
-                    items=[],
-                    storage_data=original_plan.storage_data,
-                    planner_data=original_plan.planner_data if original_plan.planner_data is not None else {}
-                )
-            else:
-                # This rank gets empty plan but preserve metadata
-                new_plan = SavePlan(
-                    items=[],
-                    storage_data=original_plan.storage_data,
-                    planner_data=original_plan.planner_data if original_plan.planner_data is not None else {}
-                )
+        for i in range(len(global_plans)):
+            # Keep the original plan structure but with empty items initially
+            new_plan = SavePlan(
+                items=[],
+                storage_data=global_plans[i].storage_data,
+                planner_data=global_plans[i].planner_data
+            )
             redistributed_plans.append(new_plan)
 
-        # Now assign items to save ranks
+        # Assign items only to save ranks using round-robin
         if self.save_ranks:
             target_rank_idx = 0
-            for tensor_name, items in items_by_tensor.items():
-                # Round-robin assignment to save ranks
+            for tensor_name, items in sorted(items_by_tensor.items()):  # Sort for deterministic assignment
+                # All shards of a tensor go to the same rank for efficiency
                 target_rank = self.save_ranks[target_rank_idx % len(self.save_ranks)]
                 redistributed_plans[target_rank].items.extend(items)
                 target_rank_idx += 1
+        else:
+            logger.error("No save ranks identified! This should not happen.")
 
-        # Log redistribution
+        # Log the redistribution results
         for rank, plan in enumerate(redistributed_plans):
             if plan.items:
                 logger.info(f"Rank {rank} will write {len(plan.items)} items")
-
-        return redistributed_plans, metadata
-
-
-class CompleteCheckpointPlanner(DefaultSavePlanner):
-    """
-    Custom planner that collects all tensor shards and saves complete checkpoint on node 0.
-    This planner ensures all ranks contribute their shards to the plan, but only node 0 writes.
-    """
-
-    def __init__(
-            self,
-            flatten_state_dict: bool = True,
-            flatten_sharded_tensors: bool = True,
-            ranks_per_node: int = 8,
-            target_node: int = 0,
-            **kwargs
-    ):
-        super().__init__(
-            flatten_state_dict=flatten_state_dict,
-            flatten_sharded_tensors=flatten_sharded_tensors,
-            **kwargs
-        )
-        self.ranks_per_node = ranks_per_node
-        self.target_node = target_node
-
-        # Determine node information
-        self.rank = dist.get_rank() if dist.is_initialized() else 0
-        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        self.node_id = self.rank // self.ranks_per_node
-        self.is_target_node = self.node_id == self.target_node
-        self.target_node_ranks = list(range(
-            self.target_node * self.ranks_per_node,
-            min((self.target_node + 1) * self.ranks_per_node, self.world_size)
-        ))
-
-        logger.info(f"CompleteCheckpointPlanner: rank={self.rank}, node={self.node_id}, "
-                    f"is_target_node={self.is_target_node}, target_ranks={self.target_node_ranks}")
-
-    def create_local_plan(self) -> SavePlan:
-        """
-        Create local plan. ALL ranks create their write items so we can collect
-        all tensor shards in the global plan.
-        """
-        # All ranks create their local plan normally
-        plan = super().create_local_plan()
-        logger.info(f"Rank {self.rank}: Created local plan with {len(plan.items)} items")
-        return plan
-
-    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
-        """
-        Create global plan that collects all shards but assigns writes only to target node ranks.
-        This ensures we have complete tensor metadata from all ranks.
-        """
-        logger.info(f"Coordinator creating global plan from {len(all_plans)} local plans")
-
-        # First, create the global plan with ALL plans to get complete metadata
-        global_plans, metadata = super().create_global_plan(all_plans)
-
-        # Now redistribute the write items to only target node ranks
-        # Collect all write items
-        all_write_items = []
-        for plan in global_plans:
-            all_write_items.extend(plan.items)
-
-        logger.info(f"Total write items collected: {len(all_write_items)}")
-
-        # Group items by tensor name
-        items_by_tensor = {}
-        for item in all_write_items:
-            tensor_name = item.index.fqn
-            if tensor_name not in items_by_tensor:
-                items_by_tensor[tensor_name] = []
-            items_by_tensor[tensor_name].append(item)
-
-        # Redistribute items to target node ranks using round-robin
-        redistributed_plans = [SavePlan(items=[]) for _ in range(self.world_size)]
-
-        target_rank_idx = 0
-        for tensor_name, items in items_by_tensor.items():
-            # Assign all shards of a tensor to one rank on the target node
-            if self.target_node_ranks:
-                target_rank = self.target_node_ranks[target_rank_idx % len(self.target_node_ranks)]
-                redistributed_plans[target_rank].items.extend(items)
-                target_rank_idx += 1
-
-        # Log redistribution results
-        for rank, plan in enumerate(redistributed_plans):
-            if plan.items:
-                logger.info(f"Rank {rank} will write {len(plan.items)} items")
+            else:
+                logger.debug(f"Rank {rank} will write 0 items")
 
         return redistributed_plans, metadata
 
@@ -844,24 +751,6 @@ class InfraNode0StorageWriter(FileSystemWriter):
         logger.info(f"InfraNode0StorageWriter: rank={self.rank}, save_ranks={self.save_ranks}, "
                     f"metadata_rank={self.metadata_rank}, should_save={self.should_save}")
 
-    def prepare_local_plan(self, plan):
-        """Only prepare plans for ranks that should save."""
-        if not self.should_save:
-            # Return empty plan for non-saving ranks
-            from torch.distributed.checkpoint.planner import SavePlan
-            return SavePlan(items=[])
-        return super().prepare_local_plan(plan)
-
-    def write_data(self, plan, planner):
-        """Only write data on ranks that should save."""
-        if not self.should_save:
-            # Return empty future for non-saving ranks
-            from torch.futures import Future
-            future = Future()
-            future.set_result([])
-            return future
-        return super().write_data(plan, planner)
-
     def finish(self, metadata: Metadata, results: List[List[Any]]) -> None:
         """Ensure metadata is written by the designated metadata rank."""
         # The coordinator rank (rank 0) will call this, but we want
@@ -873,7 +762,6 @@ class InfraNode0StorageWriter(FileSystemWriter):
             logger.info(f"Rank 0: Relaying metadata to rank {self.metadata_rank} for writing")
 
             # Send metadata to the metadata rank
-            # First send the size of the pickled metadata
             import pickle
             metadata_bytes = pickle.dumps(metadata)
             size_tensor = torch.tensor(len(metadata_bytes), dtype=torch.int64).cuda()
@@ -915,3 +803,57 @@ class InfraNode0StorageWriter(FileSystemWriter):
         else:
             # Other ranks don't write metadata
             logger.info(f"Rank {self.rank}: Skipping metadata write")
+
+
+class CompleteCheckpointPlanner(DefaultSavePlanner):
+    """
+    Checkpoint planner that consolidates all shards onto specific target nodes.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.ranks_per_node = kwargs.pop('ranks_per_node', 8)
+        self.target_node = kwargs.pop('target_node', 0)
+        super().__init__(*args, **kwargs)
+
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        """
+        Override to consolidate all writes to ranks on the target node.
+        """
+        # Get the default global plan
+        global_plans, metadata = super().create_global_plan(all_plans)
+
+        # Determine target ranks (ranks on the target node)
+        target_ranks = list(range(
+            self.target_node * self.ranks_per_node,
+            (self.target_node + 1) * self.ranks_per_node
+        ))
+
+        # Collect all write items
+        all_items = []
+        for plan in global_plans:
+            all_items.extend(plan.items)
+
+        # Create new plans with consolidated items
+        consolidated_plans = []
+        for i, orig_plan in enumerate(global_plans):
+            if i in target_ranks:
+                # This rank will handle writes
+                items_start = (i % self.ranks_per_node) * len(all_items) // self.ranks_per_node
+                items_end = ((i % self.ranks_per_node) + 1) * len(all_items) // self.ranks_per_node
+                items = all_items[items_start:items_end] if i == target_ranks[-1] else all_items[items_start:items_end]
+
+                new_plan = SavePlan(
+                    items=items,
+                    storage_data=orig_plan.storage_data,
+                    planner_data=orig_plan.planner_data
+                )
+            else:
+                # This rank won't write anything
+                new_plan = SavePlan(
+                    items=[],
+                    storage_data=orig_plan.storage_data,
+                    planner_data=orig_plan.planner_data
+                )
+            consolidated_plans.append(new_plan)
+
+        return consolidated_plans, metadata
