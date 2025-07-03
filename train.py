@@ -305,9 +305,9 @@ def main(job_config: JobConfig):
     checkpoint.load(step=job_config.checkpoint.load_step)
     metric_logger = build_metric_logger(job_config, parallel_dims)
 
-    if not parallel_dims.pp_enabled:
-        real_checksum, _ = checksum_model(model, world_mesh)
-        logger.info(f"Start Checkpoint checksum: {real_checksum}")
+    # if not parallel_dims.pp_enabled:
+    #     real_checksum, _ = checksum_model(model, world_mesh)
+    #     logger.info(f"Start Checkpoint checksum: {real_checksum}")
     if job_config.reference_model.enabled:
         reference_model = build_reference_model(job_config, tokenizer)
 
@@ -643,9 +643,9 @@ def main(job_config: JobConfig):
             logger.info("Saving final checkpoint...")
             checkpoint.save(train_state.step, force=True, is_final=True)
 
-            if not parallel_dims.pp_enabled:
-                real_checksum, _ = checksum_model(model, world_mesh)
-                logger.info(f"Checkpoint - Checkpoint checksum: {real_checksum}")
+            # if not parallel_dims.pp_enabled:
+            #     real_checksum, _ = checksum_model(model, world_mesh)
+            #     logger.info(f"Checkpoint - Checkpoint checksum: {real_checksum}")
 
 
 
