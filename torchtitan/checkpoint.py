@@ -548,17 +548,14 @@ class CheckpointManager:
                 if wait_time % 10 == 0:
                     logger.info(f"Still waiting for tensor preload (run_id: {self.preload_run_id}) after {wait_time}s")
 
-            if os.path.exists(complete_file):
-                logger.info("Tensor preload complete, using optimized reader")
-                reader = OptimizedFileSystemReader(checkpoint_id)
-            else:
-                logger.info("Tensor preload not complete, using standard reader")
-                reader = None
-        dcp.load(
-            states_to_load,
-            checkpoint_id=checkpoint_id,
-            storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
-        )
+            dcp.load(
+                states_to_load,
+                checkpoint_id=checkpoint_id,
+                storage_reader=OptimizedFileSystemReader(checkpoint_id, num_threads=16, cuda_streams=16),
+            )
+        else:
+            logger.info("Loading checkpoint without tensor preloading.")
+            dcp.load(states_to_load, checkpoint_id=checkpoint_id)
         states.update(states_to_load)
         logger.info(
             f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."
