@@ -334,10 +334,9 @@ class CheckpointManager:
             logger.info(f"Saving a full checkpoint at {'final' if is_final else 'last'} step, step {curr_step}.")
 
         # Save with custom writer
-        save_with_gc_with_custom_writer(
+        save_with_gc(
             states_to_save,
             checkpoint_id=self._create_checkpoint_id(curr_step, is_final),
-            job_config=self.job_config
         )
         self.reset()
 
@@ -442,10 +441,9 @@ class CheckpointManager:
             )
         else:
             # Get the planner for regular save
-            save_with_gc_with_custom_writer(
+            save_with_gc(
                 self.states,
                 checkpoint_id=checkpoint_id,
-                job_config=self.job_config
             )
         self.reset()
         self._purge_stale_checkpoints()
